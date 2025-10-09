@@ -3,6 +3,10 @@ name = "bevy_mod_scripting_quakec"
 version = "0.1.0"
 edition = "2024"
 
+license = "GPL-2.0"
+homepage = "https://github.com/eira-fransham/bevy_mod_scripting_quakec"
+repository = "https://github.com/eira-fransham/bevy_mod_scripting_quakec"
+
 [dependencies]
 anyhow = "1.0"
 arrayvec = "0.7"
