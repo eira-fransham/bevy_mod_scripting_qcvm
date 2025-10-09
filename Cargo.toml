@@ -3,23 +3,24 @@ name = "bevy_mod_scripting_quakec"
 version = "0.1.0"
 edition = "2024"
 
-[workspace]
-members = ["seismon-vm"]
-
 [dependencies]
-beef = "0.5"
-bevy_ecs = { version = "0.16", default-features = false, features = [] }
-bevy_asset = { version = "0.16", default-features = false, features = [] }
-bevy_app = { version = "0.16", default-features = false, features = [] }
-bevy_log = { version = "0.16", default-features = false, features = [] }
-bevy_platform = { version = "0.16", default-features = false, features = [] }
+anyhow = "1.0"
+arrayvec = "0.7"
+bevy_ecs = "0.16"
+bevy_asset = "0.16"
+bevy_app = "0.16"
+bevy_log = "0.16"
+bevy_math = "0.16"
+bevy_platform = "0.16"
+bevy_reflect = "0.16"
 bevy_mod_scripting_core = "0.16"
 bevy_mod_scripting_display = "0.16"
 bevy_mod_scripting_bindings = "0.16"
 bevy_mod_scripting_asset = "0.16"
-parking_lot = "0.12"
-
-[workspace.dependencies]
+byteorder = "1.5"
 hashbrown = "0.16"
-bevy_ecs = "0.17"
-bevy_reflect = { version = "0.17", features = ["functions"] }
+indexmap = "2.11"
+num = "0.4"
+num-traits = "0.2"
+num-derive = "0.4"
+snafu = "0.8"
