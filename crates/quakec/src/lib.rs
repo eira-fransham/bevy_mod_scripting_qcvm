@@ -24,7 +24,7 @@ use crate::{
         },
         globals::GlobalRegistry,
     },
-    userdata::{Context, ErasedContext, ErasedFunction, FnCall, QuakeCType},
+    userdata::{ErasedContext, ErasedFunction, FnCall, QuakeCType},
 };
 
 pub use crate::progs::{EntityRef, ScalarCastError};

@@ -1,7 +1,6 @@
 use arrayvec::ArrayVec;
 #[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
-use bump_scope::BumpScope;
 use glam::Vec3;
 use itertools::Either;
 use num_derive::FromPrimitive;
@@ -9,12 +8,12 @@ use std::{ffi::CStr, fmt, num::NonZeroIsize};
 use tracing::{debug, error};
 
 use crate::{
-    ARG_ADDRS, ArgType, CallArgs, ExecutionCtx, OpResult, ScopedAlloc,
+    ARG_ADDRS, ArgType, ExecutionCtx, OpResult,
     progs::{
-        EntityRef, FieldPtr, FunctionRef, StringRef, Type, VmScalar, VmValue,
+        EntityRef, FieldPtr, FunctionRef, StringRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
     },
-    userdata::{Context, Entity as _, ErasedContext, ErasedFunction, FnCall, Function as _},
+    userdata::{Context, Entity as _, ErasedFunction, FnCall, Function as _},
 };
 
 #[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq)]
