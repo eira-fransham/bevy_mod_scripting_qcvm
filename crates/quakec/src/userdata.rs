@@ -1,19 +1,53 @@
 use std::{
     any::Any,
     fmt::{self, Display},
+    sync::Arc,
 };
 
 use anyhow::bail;
 
 use crate::{
-    entity::ScalarFieldInfo,
-    progs::{FieldDef, Scalar, ScalarType, Value},
+    entity::ScalarFieldDef,
+    progs::{FieldDef, Scalar, ScalarType, Type, Value, functions::BuiltinDef},
 };
 
 pub trait Environment: 'static {
     type Function: Builtin<Env = Self>;
     type Context<'a>;
     type Entity;
+}
+
+pub trait Context {
+    type Error: Display + std::error::Error + Send + Sync + 'static;
+    type Builtin: Builtin + PartialEq;
+
+    fn builtin(&self, def: &BuiltinDef) -> Result<Arc<Self::Builtin>, Self::Error>;
+}
+
+pub trait ErasedContext: Any {
+    fn dyn_builtin(&self, def: &BuiltinDef) -> anyhow::Result<Arc<dyn ErasedBuiltin>>;
+}
+
+impl fmt::Debug for &'_ mut dyn ErasedContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        <&dyn ErasedContext>::fmt(&&**self, f)
+    }
+}
+
+impl fmt::Debug for &'_ dyn ErasedContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "..")
+    }
+}
+
+impl<T> ErasedContext for T
+where
+    T: Any + Context,
+    T::Builtin: Any,
+{
+    fn dyn_builtin(&self, def: &BuiltinDef) -> anyhow::Result<Arc<dyn ErasedBuiltin>> {
+        Ok(self.builtin(def)?)
+    }
 }
 
 pub trait QuakeCType: fmt::Debug {
@@ -48,7 +82,7 @@ pub trait Entity: QuakeCType {
     fn get_scalar(
         &self,
         context: &<Self::Env as Environment>::Context<'_>,
-        field: &ScalarFieldInfo,
+        field: &ScalarFieldDef,
     ) -> Result<Scalar, Self::Error>;
 
     fn get(
@@ -70,7 +104,7 @@ pub trait Entity: QuakeCType {
     fn set_scalar(
         &self,
         context: &mut <Self::Env as Environment>::Context<'_>,
-        field: &ScalarFieldInfo,
+        field: &ScalarFieldDef,
         value: Scalar,
     ) -> Result<(), Self::Error>;
 
@@ -104,7 +138,7 @@ pub trait Entity: QuakeCType {
 }
 
 pub trait ErasedEntity: QuakeCType + DynEq {
-    fn get_scalar(&self, context: &dyn Any, field: &ScalarFieldInfo) -> anyhow::Result<Scalar>;
+    fn get_scalar(&self, context: &dyn Any, field: &ScalarFieldDef) -> anyhow::Result<Scalar>;
     fn get(&self, context: &dyn Any, field: &FieldDef) -> anyhow::Result<Value> {
         match field.to_scalar() {
             Ok(scalar) => Ok(self.get_scalar(context, &scalar)?.into()),
@@ -120,7 +154,7 @@ pub trait ErasedEntity: QuakeCType + DynEq {
     fn set_scalar(
         &self,
         context: &mut dyn Any,
-        field: &ScalarFieldInfo,
+        field: &ScalarFieldDef,
         value: Scalar,
     ) -> anyhow::Result<()>;
 
@@ -150,9 +184,9 @@ pub trait ErasedEntity: QuakeCType + DynEq {
 
 impl<T> ErasedEntity for T
 where
-    T: Entity + Any + DynEq,
+    T: Entity + PartialEq + Any,
 {
-    fn get_scalar(&self, context: &dyn Any, field: &ScalarFieldInfo) -> anyhow::Result<Scalar> {
+    fn get_scalar(&self, context: &dyn Any, field: &ScalarFieldDef) -> anyhow::Result<Scalar> {
         match context.downcast_ref() {
             Some(context) => Ok(self.get_scalar(context, field)?),
             None => bail!(
@@ -177,7 +211,7 @@ where
     fn set_scalar(
         &self,
         context: &mut dyn Any,
-        field: &ScalarFieldInfo,
+        field: &ScalarFieldDef,
         value: Scalar,
     ) -> anyhow::Result<()> {
         match context.downcast_mut() {
@@ -205,36 +239,44 @@ where
 pub trait Builtin: QuakeCType {
     type Env: Environment;
     type Error: Display + std::error::Error + Send + Sync + 'static;
+    type Output: Into<Value>;
 
+    fn signature(&self) -> Result<&[Type], Self::Error>;
     fn call<I>(
         &self,
         context: &mut <Self::Env as Environment>::Context<'_>,
         args: I,
-    ) -> Result<Scalar, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         I: IntoIterator<Item = Value>,
         I::IntoIter: ExactSizeIterator;
 }
 
 pub trait ErasedBuiltin: QuakeCType + Any + DynEq {
+    fn dyn_signature(&self) -> anyhow::Result<&[Type]>;
+
     fn dyn_call(
         &self,
         context: &mut dyn Any,
         args: &mut dyn ExactSizeIterator<Item = Value>,
-    ) -> anyhow::Result<Scalar>;
+    ) -> anyhow::Result<Value>;
 }
 
 impl<T> ErasedBuiltin for T
 where
-    T: Builtin + DynEq,
+    T: Builtin + PartialEq + Any,
 {
+    fn dyn_signature(&self) -> anyhow::Result<&[Type]> {
+        Ok(self.signature()?)
+    }
+
     fn dyn_call(
         &self,
         context: &mut dyn Any,
         args: &mut dyn ExactSizeIterator<Item = Value>,
-    ) -> anyhow::Result<Scalar> {
+    ) -> anyhow::Result<Value> {
         match context.downcast_mut() {
-            Some(context) => Ok(self.call(context, args)?),
+            Some(context) => Ok(self.call(context, args)?.into()),
             None => bail!(
                 "Type mismatch for builtin context: expected {}, found {}",
                 std::any::type_name::<<T::Env as Environment>::Context<'static>>(),

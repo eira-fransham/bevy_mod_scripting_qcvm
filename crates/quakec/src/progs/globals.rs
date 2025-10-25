@@ -1,80 +1,9 @@
-use std::{error::Error, ffi::CStr, fmt, sync::Arc};
+use std::{ffi::CStr, sync::Arc};
 
 use hashbrown::HashMap;
 use itertools::Either;
 
-use crate::progs::{FieldName, GlobalDef, Ptr, Scalar, ScalarType};
-
-pub const GLOBAL_STATIC_START: usize = 28;
-pub const GLOBAL_DYNAMIC_START: usize = 64;
-
-pub const GLOBAL_STATIC_COUNT: usize = GLOBAL_DYNAMIC_START - GLOBAL_STATIC_START;
-
-pub const GLOBAL_ADDR_RETURN: usize = 1;
-pub const GLOBAL_ADDR_ARG_START: usize = 4;
-
-#[derive(Debug)]
-pub enum GlobalsError {
-    Io(::std::io::Error),
-    Address(isize),
-    Other(String),
-}
-
-impl GlobalsError {
-    pub fn with_msg<S>(msg: S) -> Self
-    where
-        S: AsRef<str>,
-    {
-        GlobalsError::Other(msg.as_ref().to_owned())
-    }
-}
-
-impl fmt::Display for GlobalsError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            GlobalsError::Io(ref err) => {
-                write!(f, "I/O error: ")?;
-                err.fmt(f)
-            }
-            GlobalsError::Address(val) => write!(f, "Invalid address ({val})"),
-            GlobalsError::Other(ref msg) => write!(f, "{msg}"),
-        }
-    }
-}
-
-impl Error for GlobalsError {}
-
-impl From<::std::io::Error> for GlobalsError {
-    fn from(error: ::std::io::Error) -> Self {
-        GlobalsError::Io(error)
-    }
-}
-
-pub trait GlobalAddr {
-    /// The type of value referenced by this address.
-    type Value;
-
-    /// Loads the value at this address.
-    fn load(&self, globals: &GlobalRegistry) -> Result<Self::Value, GlobalsError>;
-
-    /// Stores a value at this address.
-    fn store(&self, globals: &mut GlobalRegistry, value: Self::Value) -> Result<(), GlobalsError>;
-}
-
-pub enum Access {
-    ReadOnly,
-    ReadWrite,
-}
-
-pub enum External {
-    ReadExt,
-    ReadWriteExt,
-    WriteExt,
-}
-
-pub struct GlobalValue {
-    value: Scalar,
-}
+use crate::progs::{FieldName, GlobalDef, Scalar, ScalarType};
 
 #[derive(Clone, Debug)]
 pub struct Global {
@@ -86,14 +15,14 @@ pub struct Global {
 }
 
 impl Global {
-    fn new(def: &GlobalDef) -> Result<Self, [Self; 3]> {
+    fn new(def: &GlobalDef) -> Either<Self, [Self; 3]> {
         match ScalarType::try_from(def.type_) {
-            Ok(type_) => Ok(Global {
+            Ok(type_) => Either::Left(Global {
                 name: def.name.clone().into(),
                 type_,
                 value: Scalar::Void,
             }),
-            Err(tys_and_offsets) => Err(tys_and_offsets.map(|(type_, offset)| Global {
+            Err(tys_and_offsets) => Either::Right(tys_and_offsets.map(|(type_, offset)| Global {
                 name: FieldName {
                     name: def.name.clone(),
                     offset: Some(offset),
@@ -114,12 +43,14 @@ impl Global {
 #[derive(Debug)]
 pub struct GlobalRegistry {
     globals: HashMap<u16, Global>,
+    // TODO: Expose this.
+    #[expect(dead_code)]
     infos: HashMap<Arc<CStr>, u16>,
 }
 
 impl GlobalRegistry {
     /// Constructs a new `Globals` object.
-    pub fn new<'a, I>(defs: I, values: &[u8]) -> anyhow::Result<Self>
+    pub fn new<I>(defs: I, values: &[u8]) -> anyhow::Result<Self>
     where
         I: IntoIterator<Item = GlobalDef>,
     {
@@ -129,7 +60,7 @@ impl GlobalRegistry {
                 let value = values.get(def.offset as usize * 4..).unwrap_or(&[0; 12]);
 
                 match Global::new(&def) {
-                    Ok(scalar) => {
+                    Either::Left(scalar) => {
                         let name = def.name.clone();
 
                         Either::Left(std::iter::once(
@@ -144,7 +75,7 @@ impl GlobalRegistry {
                                 .map(|scalar| ((def.offset, scalar), (name, def.offset))),
                         ))
                     }
-                    Err(vector) => match value
+                    Either::Right(vector) => match value
                         .get(..12)
                         // A kinda-janky way of making this fail if there
                         // are less than 12 elements left.
@@ -176,7 +107,7 @@ impl GlobalRegistry {
     pub fn get_with_index(&self, index: u16) -> anyhow::Result<&Global> {
         self.globals
             .get(&index)
-            .ok_or_else(|| anyhow::Error::msg(format!("No global with index {index}")))
+            .ok_or_else(|| anyhow::format_err!("No global with index {index}"))
     }
 
     #[inline]

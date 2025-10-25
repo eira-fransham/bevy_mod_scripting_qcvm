@@ -4,15 +4,16 @@ use std::{fmt, ops::Range, sync::Arc};
 use arc_slice::ArcSlice;
 use arrayvec::ArrayVec;
 #[cfg(feature = "reflect")]
-use bevy_reflect::{Reflect, reflect_remote};
+use bevy_reflect::Reflect;
 use bump_scope::{BumpAllocatorScopeExt, FixedBumpVec};
 use hashbrown::HashMap;
 use num::FromPrimitive as _;
 use num_derive::FromPrimitive;
 
+use crate::load::LoadFn;
 use crate::ops::Opcode;
-use crate::progs::{LoadFn, ProgsError, Scalar};
-use crate::{ARG_ADDRS, quake1};
+use crate::progs::Scalar;
+use crate::{ARG_ADDRS, QuakeCMemory, quake1};
 
 pub const MAX_ARGS: usize = 8;
 
@@ -81,8 +82,12 @@ impl FunctionExecutionCtx<'_> {
             .get(index)
             .ok_or_else(|| anyhow::Error::msg("Out-of-bounds instruction access"))?)
     }
+}
 
-    pub fn get(&self, index: usize) -> anyhow::Result<Option<Scalar>> {
+impl QuakeCMemory for FunctionExecutionCtx<'_> {
+    type Scalar = Option<Scalar>;
+
+    fn get(&self, index: usize) -> anyhow::Result<Option<Scalar>> {
         const LOCAL_STORAGE_ERR: &str =
             "Programmer error: `local_storage` was too small for `local_range`. This is a bug!";
 
@@ -102,11 +107,9 @@ impl FunctionExecutionCtx<'_> {
                 .cloned()
         }
     }
+}
 
-    pub fn get_vector(&self, index: usize) -> anyhow::Result<[Option<Scalar>; 3]> {
-        Ok([self.get(index)?, self.get(index + 1)?, self.get(index + 2)?])
-    }
-
+impl FunctionExecutionCtx<'_> {
     pub fn set(&mut self, index: usize, value: Scalar) -> anyhow::Result<()> {
         const LOCAL_STORAGE_ERR: &str =
             "Programmer error: `local_storage` was too small for `local_range`. This is a bug!";
@@ -161,10 +164,10 @@ pub enum FunctionBody {
 }
 
 impl FunctionBody {
-    pub fn as_quakec(self) -> Option<QuakeCFunctionBody> {
+    pub fn try_into_quakec(self) -> Result<QuakeCFunctionBody, Builtin> {
         match self {
-            Self::Progs(quakec) => Some(quakec),
-            Self::Builtin => None,
+            Self::Progs(quakec) => Ok(quakec),
+            Self::Builtin => Err(Builtin),
         }
     }
 }
@@ -182,15 +185,29 @@ pub struct FunctionDef<T = FunctionBody> {
     pub body: T,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Builtin;
+
+pub type BuiltinDef = FunctionDef<Builtin>;
+
 impl FunctionDef {
-    pub fn as_quakec(self) -> Option<QuakeCFunctionDef> {
-        Some(QuakeCFunctionDef {
-            idx: self.idx,
-            name: self.name,
-            source: self.source,
-            args: self.args,
-            body: self.body.as_quakec()?,
-        })
+    pub fn try_into_quakec(self) -> Result<QuakeCFunctionDef, FunctionDef<Builtin>> {
+        match self.body.try_into_quakec() {
+            Ok(quakec) => Ok(QuakeCFunctionDef {
+                idx: self.idx,
+                name: self.name,
+                source: self.source,
+                args: self.args,
+                body: quakec,
+            }),
+            Err(builtin) => Err(FunctionDef {
+                idx: self.idx,
+                name: self.name,
+                source: self.source,
+                args: self.args,
+                body: builtin,
+            }),
+        }
     }
 }
 
@@ -221,12 +238,14 @@ impl QuakeCFunctionDef {
 #[derive(Debug, Clone)]
 pub struct FunctionRegistry {
     by_index: HashMap<i32, FunctionDef>,
+    // TODO
+    #[expect(dead_code)]
     by_name: HashMap<Arc<CStr>, FunctionDef>,
 }
 
 impl FunctionRegistry {
     /// `iter` should be sorted by `offset`
-    pub fn new<I>(statements: ArcSlice<[Statement]>, iter: I) -> anyhow::Result<Self>
+    pub(crate) fn new<I>(statements: ArcSlice<[Statement]>, iter: I) -> anyhow::Result<Self>
     where
         I: IntoIterator<Item = LoadFn>,
     {
@@ -279,6 +298,6 @@ impl FunctionRegistry {
 
         self.by_index
             .get(&func)
-            .ok_or_else(|| ProgsError::with_msg(format!("Function {func} does not exist")).into())
+            .ok_or_else(|| anyhow::format_err!("Function {func} does not exist"))
     }
 }
