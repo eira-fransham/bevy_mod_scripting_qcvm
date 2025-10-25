@@ -15,7 +15,7 @@ first and efficiency second, and this VM adopts the same mindset.
 
 #### Why did you make this
 
-Because I want a VM that is resiliant enough that hobbyist game developers and modders
+Because I want a VM that is resilient enough that hobbyist game developers and modders
 can mess around with a repl, override functions, just generally treat the code like
 it's a rockstar's hotel room and still have the game engine generally respond in a
 reasonable way.
@@ -23,7 +23,7 @@ reasonable way.
 #### Is this a meme
 
 No, I actually have a goal in mind and am taking this project seriously. You could
-use this to write a web server in QuakeC though and I do think that's very funny.
+use this to write a web server in QuakeC, though, and I do think that's very funny.
 
 #### Should I write my game in QuakeC then?
 
