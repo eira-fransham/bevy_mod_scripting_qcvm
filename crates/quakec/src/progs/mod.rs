@@ -1,13 +1,7 @@
 pub mod functions;
 pub mod globals;
 
-use std::{
-    cmp::Ordering,
-    ffi::CStr,
-    fmt,
-    ops::Deref,
-    sync::Arc,
-};
+use std::{cmp::Ordering, ffi::CStr, fmt, ops::Deref, sync::Arc};
 
 #[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
@@ -18,7 +12,6 @@ use num_derive::FromPrimitive;
 
 use crate::{
     entity::ScalarFieldDef,
-    progs::functions::QuakeCFunctionDef,
     userdata::{ErasedBuiltin, ErasedEntity},
 };
 
@@ -64,8 +57,7 @@ impl StringTable {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Ptr(pub(crate) i32);
 
 impl fmt::Display for Ptr {
@@ -73,7 +65,6 @@ impl fmt::Display for Ptr {
         write!(f, "*{}", self.0)
     }
 }
-
 
 impl Ptr {
     pub const NULL: Self = Self(0);
@@ -351,11 +342,6 @@ impl PartialEq for FunctionRef {
     }
 }
 
-pub enum FunctionKind {
-    QuakeC(QuakeCFunctionDef),
-    Extern(Arc<dyn ErasedBuiltin>),
-}
-
 impl FunctionRef {
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Ptr(Ptr::NULL))
@@ -401,6 +387,8 @@ impl StringRef {
 }
 
 #[derive(Default, Clone, PartialEq, Eq)]
+// TODO: Implement pointer opcodes
+#[expect(dead_code)]
 pub struct GlobalPtr(pub Ptr);
 
 impl Deref for GlobalPtr {
@@ -593,8 +581,8 @@ impl Scalar {
                 i32::from_le_bytes(bytes),
             )))),
 
-            ScalarType::FieldRef => Ok(Scalar::Field(Ptr(i32::from_le_bytes(bytes).try_into()?))),
-            ScalarType::GlobalRef => Ok(Scalar::Global(Ptr(i32::from_le_bytes(bytes).try_into()?))),
+            ScalarType::FieldRef => Ok(Scalar::Field(Ptr(i32::from_le_bytes(bytes)))),
+            ScalarType::GlobalRef => Ok(Scalar::Global(Ptr(i32::from_le_bytes(bytes)))),
         }
     }
 }
