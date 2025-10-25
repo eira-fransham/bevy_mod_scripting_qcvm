@@ -2,25 +2,32 @@
 #![feature(iter_map_windows, array_try_map)]
 
 use std::{
+    any::Any,
     ffi::CStr,
     fmt,
     num::NonZeroIsize,
     ops::{ControlFlow, Range},
+    sync::Arc,
 };
 
-use bump_scope::{Bump, BumpAllocatorScopeExt, BumpScope};
+use arrayvec::ArrayVec;
+use bump_scope::{Bump, BumpScope};
 use glam::Vec3;
 
 use crate::{
     entity::EntityTypeDef,
     load::Progs,
     progs::{
-        Scalar, StringTable,
-        functions::{FunctionExecutionCtx, FunctionRegistry, QuakeCFunctionDef, Statement},
+        FunctionRef, ScalarType, StringRef, StringTable, VmScalar, VmValue,
+        functions::{
+            ArgSize, FunctionExecutionCtx, FunctionRegistry, MAX_ARGS, QuakeCFunctionDef, Statement,
+        },
         globals::GlobalRegistry,
     },
-    userdata::{Context, ErasedContext},
+    userdata::{Context, ErasedContext, ErasedFunction, FnCall, QuakeCType},
 };
+
+pub use crate::progs::{EntityRef, ScalarCastError};
 
 mod entity;
 pub mod load;
@@ -28,25 +35,134 @@ mod ops;
 mod progs;
 pub mod userdata;
 
-pub use userdata::Builtin;
-
 #[cfg(feature = "quake1")]
 pub mod quake1;
 
 pub struct CallArgs<T>(T);
 
+impl QuakeCMemory for CallArgs<ArrayVec<VmScalar, MAX_ARGS>> {
+    type Scalar = Option<VmScalar>;
+
+    fn get(&self, index: usize) -> anyhow::Result<Self::Scalar> {
+        if !ARG_ADDRS.contains(&index) {
+            return Ok(None);
+        }
+
+        let arg_offset = index
+            .checked_sub(ARG_ADDRS.start)
+            .expect("Programmer error - index out of range for args");
+
+        Ok(Some(
+            self.0.get(arg_offset).unwrap_or(&VmScalar::Void).clone(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Void,
+    Entity(EntityRef),
+    Function(Arc<dyn ErasedFunction>),
+    Float(f32),
+    Vector(Vec3),
+    String(Arc<CStr>),
+}
+
+impl Value {
+    pub fn type_(&self) -> ArgType {
+        match self {
+            Value::Void => ArgType::Void,
+            Value::Entity(_) => ArgType::Entity,
+            Value::Function(_) => ArgType::Function,
+            Value::Float(_) => ArgType::Float,
+            Value::Vector(_) => ArgType::Vector,
+            Value::String(_) => ArgType::String,
+        }
+    }
+}
+
+impl TryFrom<Value> for EntityRef {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Entity(entity_ref) => Ok(entity_ref),
+            _ => anyhow::bail!("Expected {}, found {}", ArgType::Entity, value.type_()),
+        }
+    }
+}
+
+impl TryFrom<Value> for Arc<dyn ErasedFunction> {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Function(func) => Ok(func),
+            _ => anyhow::bail!("Expected {}, found {}", ArgType::Function, value.type_()),
+        }
+    }
+}
+
+impl TryFrom<Value> for f32 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Float(f) => Ok(f),
+            _ => anyhow::bail!("Expected {}, found {}", ArgType::Float, value.type_()),
+        }
+    }
+}
+
+impl TryFrom<Value> for Vec3 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Vector(vec) => Ok(vec),
+            _ => anyhow::bail!("Expected {}, found {}", ArgType::Vector, value.type_()),
+        }
+    }
+}
+
+impl TryFrom<Value> for Arc<CStr> {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::String(str) => Ok(str),
+            _ => anyhow::bail!("Expected {}, found {}", ArgType::String, value.type_()),
+        }
+    }
+}
+
+impl From<Value> for VmValue {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Void => VmValue::Scalar(VmScalar::Void),
+            Value::Entity(entity_ref) => entity_ref.into(),
+            Value::Function(erased_function) => {
+                VmValue::Scalar(VmScalar::Function(FunctionRef::Extern(erased_function)))
+            }
+            Value::Float(f) => f.into(),
+            Value::Vector(vec3) => vec3.into(),
+            Value::String(cstr) => VmValue::Scalar(VmScalar::String(StringRef::Temp(cstr))),
+        }
+    }
+}
+
 macro_rules! impl_memory_tuple {
     ($first:ident $(, $rest:ident)*) => {
-        impl<$first, $($rest),*> crate::QuakeCMemory for CallArgs<($first, $($rest),*)>
+        impl<$first, $($rest),*> QuakeCMemory for CallArgs<($first, $($rest),*)>
         where
-        $first: Clone + TryInto<progs::Value>,
-        $first::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        $first: Clone + TryInto<progs::VmValue>,
+        $first::Error: std::error::Error + Send + Sync + 'static,
         $(
-            $rest: Clone + TryInto<progs::Value>,
-            $rest::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+            $rest: Clone + TryInto<progs::VmValue>,
+            $rest::Error: std::error::Error + Send + Sync + 'static,
         )*
         {
-            type Scalar = Option<Scalar>;
+            type Scalar = Option<VmScalar>;
 
             #[expect(non_snake_case)]
             fn get(&self, index: usize) -> anyhow::Result<Self::Scalar> {
@@ -62,10 +178,10 @@ macro_rules! impl_memory_tuple {
                 let value = impl_memory_tuple!(@arg_match arg_offset $first $($rest)*);
 
                 match (value, field_offset) {
-                    (progs::Value::Scalar(scalar), 0) => Ok(Some(scalar)),
-                    (progs::Value::Vector([x, _, _]), 0) => Ok(Some(x.into())),
-                    (progs::Value::Vector([_, y, _]), 1) => Ok(Some(y.into())),
-                    (progs::Value::Vector([_, _, z]), 2) => Ok(Some(z.into())),
+                    (progs::VmValue::Scalar(scalar), 0) => Ok(Some(scalar)),
+                    (progs::VmValue::Vector([x, _, _]), 0) => Ok(Some(x.into())),
+                    (progs::VmValue::Vector([_, y, _]), 1) => Ok(Some(y.into())),
+                    (progs::VmValue::Vector([_, _, z]), 2) => Ok(Some(z.into())),
                     (value, field_offset) => anyhow::bail!("Invalid field access {field_offset} for {value:?}"),
                 }
             }
@@ -97,6 +213,60 @@ macro_rules! impl_memory_tuple {
 
 impl_memory_tuple!(A, B, C, D, E, F, G, H);
 
+impl QuakeCType for QuakeCFunctionDef {
+    fn type_(&self) -> ScalarType {
+        ScalarType::Function
+    }
+
+    fn is_null(&self) -> bool {
+        self.offset == 0
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum ArgType {
+    Void,
+    Any,
+    Entity,
+    Function,
+    Float,
+    Vector,
+    String,
+}
+
+impl fmt::Display for ArgType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ArgType::Void => write!(f, "void"),
+            ArgType::Any => write!(f, "<any>"),
+            ArgType::Entity => write!(f, "entity"),
+            ArgType::Function => write!(f, "function"),
+            ArgType::Float => write!(f, "float"),
+            ArgType::Vector => write!(f, "vector"),
+            ArgType::String => write!(f, "string"),
+        }
+    }
+}
+
+impl ErasedFunction for QuakeCFunctionDef {
+    fn dyn_signature(&self) -> anyhow::Result<ArrayVec<ArgType, MAX_ARGS>> {
+        Ok(self
+            .args
+            .iter()
+            .map(|size| match size {
+                ArgSize::Scalar => ArgType::Any,
+                ArgSize::Vector => ArgType::Vector,
+            })
+            .collect())
+    }
+
+    fn dyn_call(&self, mut context: FnCall) -> anyhow::Result<Value> {
+        let vm_value = context.execution.execute(self)?;
+
+        context.execution.to_value(vm_value.try_into()?)
+    }
+}
+
 // TODO: Add ways to persist context, so it doesn't always need to be fetched from the environment
 // between frames.
 #[non_exhaustive]
@@ -109,11 +279,10 @@ impl QuakeCVm {
         &'a self,
         context: &'a mut C,
         args: T,
-    ) -> ExecutionCtx<'a, Bump, CallArgs<T>>
+    ) -> ExecutionCtx<'a, C, Bump, CallArgs<T>>
     where
         CallArgs<T>: QuakeCMemory,
-        C: Context + 'static,
-        C::Builtin: 'static,
+        C: Context,
     {
         ExecutionCtx {
             alloc: Bump::new(),
@@ -153,7 +322,7 @@ struct ExecutionMemory<'a, Caller = FunctionExecutionCtx<'a>> {
     /// Technically, every QuakeC function returns 3 scalars of arbitrary types.
     /// Only one return value is available at once, if another function is called then the previous return
     /// value is lost unless it was saved to a local. We store it here in order to allow us to access it in `get` etc.
-    last_ret: Option<[Scalar; 3]>,
+    last_ret: Option<[VmScalar; 3]>,
 }
 
 impl ExecutionMemory<'_> {
@@ -174,11 +343,11 @@ pub trait QuakeCMemory {
 
 impl<M> QuakeCMemory for ExecutionMemory<'_, M>
 where
-    M: QuakeCMemory<Scalar = Option<Scalar>>,
+    M: QuakeCMemory<Scalar = Option<VmScalar>>,
 {
-    type Scalar = Scalar;
+    type Scalar = VmScalar;
 
-    fn get(&self, index: usize) -> anyhow::Result<Scalar> {
+    fn get(&self, index: usize) -> anyhow::Result<VmScalar> {
         if RETURN_ADDRS.contains(&index) {
             return self
                 .last_ret
@@ -197,21 +366,28 @@ where
 }
 
 impl ExecutionMemory<'_> {
-    fn set(&mut self, index: usize, value: Scalar) -> anyhow::Result<()> {
+    fn set(&mut self, index: usize, value: VmScalar) -> anyhow::Result<()> {
         self.local.set(index, value)
     }
 
-    fn set_vector(&mut self, index: usize, values: [Scalar; 3]) -> anyhow::Result<()> {
+    fn set_vector(&mut self, index: usize, values: [VmScalar; 3]) -> anyhow::Result<()> {
         self.local.set_vector(index, values)
     }
 }
 
 #[derive(Debug)]
-pub struct ExecutionCtx<'a, Alloc = BumpScope<'a>, Caller = FunctionExecutionCtx<'a>> {
+pub struct ExecutionCtx<
+    'a,
+    Ctx = dyn ErasedContext,
+    Alloc = BumpScope<'a>,
+    Caller = FunctionExecutionCtx<'a>,
+> where
+    Ctx: ?Sized,
+{
     alloc: Alloc,
     memory: ExecutionMemory<'a, Caller>,
     backtrace: BacktraceFrame<'a>,
-    context: &'a mut dyn ErasedContext,
+    context: &'a mut Ctx,
     entity_def: &'a EntityTypeDef,
 
     string_table: &'a StringTable,
@@ -222,11 +398,11 @@ pub struct ExecutionCtx<'a, Alloc = BumpScope<'a>, Caller = FunctionExecutionCtx
 
 enum OpResult {
     Jump(NonZeroIsize),
-    Ret([Scalar; 3]),
+    Ret([VmScalar; 3]),
     Continue,
 }
 
-impl From<OpResult> for ControlFlow<[Scalar; 3], isize> {
+impl From<OpResult> for ControlFlow<[VmScalar; 3], isize> {
     fn from(value: OpResult) -> Self {
         match value {
             OpResult::Jump(ofs) => ControlFlow::Continue(ofs.get()),
@@ -242,8 +418,8 @@ impl From<()> for OpResult {
     }
 }
 
-impl From<[Scalar; 3]> for OpResult {
-    fn from(value: [Scalar; 3]) -> Self {
+impl From<[VmScalar; 3]> for OpResult {
+    fn from(value: [VmScalar; 3]) -> Self {
         Self::Ret(value)
     }
 }
@@ -253,37 +429,41 @@ const RETURN_ADDRS: Range<usize> = 1..4;
 
 /// Frustratingly, the `bump-scope` crate doesn't have a way to be generic over `Bump` or `BumpScope`.
 pub trait ScopedAlloc {
-    type Scope<'a>: BumpAllocatorScopeExt<'a> + ScopedAlloc;
-
     fn scoped<F, O>(&mut self, func: F) -> O
     where
-        F: FnOnce(Self::Scope<'_>) -> O;
+        F: FnOnce(BumpScope<'_>) -> O;
 }
 
 impl ScopedAlloc for Bump {
-    type Scope<'a> = BumpScope<'a>;
-
     fn scoped<F, O>(&mut self, func: F) -> O
     where
-        F: FnOnce(Self::Scope<'_>) -> O,
+        F: FnOnce(BumpScope<'_>) -> O,
     {
         self.scoped(func)
     }
 }
 
 impl ScopedAlloc for BumpScope<'_> {
-    type Scope<'a> = BumpScope<'a>;
-
     fn scoped<F, O>(&mut self, func: F) -> O
     where
-        F: FnOnce(Self::Scope<'_>) -> O,
+        F: FnOnce(BumpScope<'_>) -> O,
     {
         self.scoped(func)
     }
 }
 
-impl<Alloc> ExecutionCtx<'_, Alloc>
+impl ScopedAlloc for &'_ mut BumpScope<'_> {
+    fn scoped<F, O>(&mut self, func: F) -> O
+    where
+        F: FnOnce(BumpScope<'_>) -> O,
+    {
+        (**self).scoped(func)
+    }
+}
+
+impl<Ctx, Alloc> ExecutionCtx<'_, Ctx, Alloc>
 where
+    Ctx: ?Sized,
     Alloc: ScopedAlloc,
 {
     pub fn instr(&self, pc: usize) -> anyhow::Result<Statement> {
@@ -291,13 +471,144 @@ where
     }
 }
 
-impl<Alloc, Caller> ExecutionCtx<'_, Alloc, Caller>
+impl ExecutionCtx<'_> {
+    fn with_builtin_call_context<F, O>(
+        &mut self,
+        name: &CStr,
+        args: ArrayVec<VmScalar, MAX_ARGS>,
+        func: F,
+    ) -> O
+    where
+        F: FnOnce(
+            ExecutionCtx<
+                '_,
+                dyn ErasedContext,
+                BumpScope<'_>,
+                CallArgs<ArrayVec<VmScalar, MAX_ARGS>>,
+            >,
+        ) -> O,
+    {
+        let ExecutionCtx {
+            alloc,
+            memory: ExecutionMemory { global, .. },
+            backtrace,
+            context,
+            entity_def,
+            string_table,
+            functions,
+        } = self;
+
+        alloc.scoped(|alloc| {
+            func(ExecutionCtx {
+                alloc,
+                memory: ExecutionMemory {
+                    local: CallArgs(args),
+                    global,
+                    last_ret: None,
+                },
+                backtrace: BacktraceFrame(Some((name, backtrace))),
+                context: &mut **context,
+                entity_def,
+                string_table,
+                functions,
+            })
+        })
+    }
+}
+
+impl<'a, Alloc, Caller> ExecutionCtx<'a, dyn ErasedContext, Alloc, Caller> {
+    fn downcast<T>(self) -> Option<ExecutionCtx<'a, T, Alloc, Caller>>
+    where
+        T: Any,
+    {
+        let ExecutionCtx {
+            alloc,
+            memory,
+            backtrace,
+            context,
+            entity_def,
+            string_table,
+            functions,
+        } = self;
+
+        Some(ExecutionCtx {
+            alloc,
+            memory,
+            backtrace,
+            context: (context as &mut dyn Any).downcast_mut()?,
+            entity_def,
+            string_table,
+            functions,
+        })
+    }
+}
+
+impl<'a, Ctx, Alloc, Caller> ExecutionCtx<'a, Ctx, Alloc, Caller>
+where
+    Ctx: ErasedContext,
+{
+    fn into_erased(self) -> ExecutionCtx<'a, dyn ErasedContext, Alloc, Caller> {
+        let ExecutionCtx {
+            alloc,
+            memory,
+            backtrace,
+            context,
+            entity_def,
+            string_table,
+            functions,
+        } = self;
+
+        ExecutionCtx {
+            alloc,
+            memory,
+            backtrace,
+            context,
+            entity_def,
+            string_table,
+            functions,
+        }
+    }
+}
+
+impl<'a, Ctx, Alloc, Caller> ExecutionCtx<'a, Ctx, Alloc, Caller>
+where
+    Ctx: ?Sized + ErasedContext,
+{
+    fn to_value(&self, vm_value: VmValue) -> anyhow::Result<Value> {
+        match vm_value {
+            VmValue::Vector(vec) => Ok(Value::Vector(vec.into())),
+            VmValue::Scalar(VmScalar::Float(f)) => Ok(Value::Float(f)),
+            VmValue::Scalar(VmScalar::Void) => Ok(Value::Void),
+            VmValue::Scalar(VmScalar::Entity(ent)) => Ok(Value::Entity(ent)),
+            VmValue::Scalar(VmScalar::String(str)) => {
+                Ok(Value::String(self.string_table.get(str)?))
+            }
+            VmValue::Scalar(VmScalar::Function(FunctionRef::Ptr(ptr))) => {
+                let arg_func = self.functions.get(ptr.0)?.clone();
+
+                match arg_func.try_into_quakec() {
+                    Ok(quakec) => Ok(Value::Function(Arc::new(quakec))),
+                    Err(builtin) => Ok(Value::Function(self.context.dyn_builtin(&builtin)?)),
+                }
+            }
+            VmValue::Scalar(VmScalar::Function(FunctionRef::Extern(func))) => {
+                Ok(Value::Function(func))
+            }
+            VmValue::Scalar(VmScalar::Field(_) | VmScalar::Global(_)) => anyhow::bail!(
+                "Values of type {} are unsupported as arguments to builtins",
+                vm_value.type_()
+            ),
+        }
+    }
+}
+
+impl<Alloc, Caller> ExecutionCtx<'_, dyn ErasedContext, Alloc, Caller>
 where
     Alloc: ScopedAlloc,
     Caller: QuakeCMemory,
 {
     // TODO: We can use the unsafe checkpoint API if just recursing becomes too slow.
-    pub fn execute(&mut self, function: &QuakeCFunctionDef) -> anyhow::Result<[Scalar; 3]> {
+    pub fn execute(&mut self, function: &QuakeCFunctionDef) -> anyhow::Result<[VmScalar; 3]> {
         let Self {
             alloc,
             memory,
@@ -351,16 +662,13 @@ where
     }
 }
 
-impl<Alloc> ExecutionCtx<'_, Alloc>
-where
-    Alloc: ScopedAlloc,
-{
+impl ExecutionCtx<'_> {
     pub fn get<I, O>(&self, index: I) -> anyhow::Result<O>
     where
         I: TryInto<usize>,
-        I::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
-        Scalar: TryInto<O>,
-        <Scalar as TryInto<O>>::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        I::Error: std::error::Error + Send + Sync + 'static,
+        VmScalar: TryInto<O>,
+        <VmScalar as TryInto<O>>::Error: std::error::Error + Send + Sync + 'static,
     {
         Ok(self.memory.get(index.try_into()?)?.try_into()?)
     }
@@ -368,9 +676,9 @@ where
     pub fn set<I, V>(&mut self, index: I, value: V) -> anyhow::Result<()>
     where
         I: TryInto<usize>,
-        I::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
-        V: TryInto<Scalar>,
-        V::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        I::Error: std::error::Error + Send + Sync + 'static,
+        V: TryInto<VmScalar>,
+        V::Error: std::error::Error + Send + Sync + 'static,
     {
         self.memory.set(index.try_into()?, value.try_into()?)
     }
@@ -380,16 +688,16 @@ where
     ///
     /// This can't be done with the regular `set` as this shouldn't be accessible by regular
     /// QuakeC code, only from the engine.
-    pub fn set_return(&mut self, values: [Scalar; 3]) {
+    pub fn set_return(&mut self, values: [VmScalar; 3]) {
         self.memory.last_ret = Some(values);
     }
 
     pub fn get_vector<I, O>(&self, index: I) -> anyhow::Result<[O; 3]>
     where
         I: TryInto<usize>,
-        I::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
-        Scalar: TryInto<O>,
-        <Scalar as TryInto<O>>::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        I::Error: std::error::Error + Send + Sync + 'static,
+        VmScalar: TryInto<O>,
+        <VmScalar as TryInto<O>>::Error: std::error::Error + Send + Sync + 'static,
     {
         let index = index.try_into()?;
 
@@ -399,7 +707,7 @@ where
     pub fn get_vec3<I>(&self, index: I) -> anyhow::Result<Vec3>
     where
         I: TryInto<usize>,
-        I::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        I::Error: std::error::Error + Send + Sync + 'static,
     {
         let index = index.try_into()?;
 
@@ -409,9 +717,9 @@ where
     pub fn set_vector<I, V>(&mut self, index: I, values: [V; 3]) -> anyhow::Result<()>
     where
         I: TryInto<usize>,
-        I::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
-        V: TryInto<Scalar>,
-        V::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        I::Error: std::error::Error + Send + Sync + 'static,
+        V: TryInto<VmScalar>,
+        V::Error: std::error::Error + Send + Sync + 'static,
     {
         let index = index.try_into()?;
         let values = values.try_map(|val| val.try_into())?;
@@ -421,16 +729,16 @@ where
     pub fn set_vec3<I, V>(&mut self, index: I, values: V) -> anyhow::Result<()>
     where
         I: TryInto<usize>,
-        I::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        I::Error: std::error::Error + Send + Sync + 'static,
         V: TryInto<[f32; 3]>,
-        V::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        V::Error: std::error::Error + Send + Sync + 'static,
     {
         let index = index.try_into()?;
         let values = values.try_into()?;
         self.memory.set_vector(index, values.map(Into::into))
     }
 
-    fn execute_internal(&mut self) -> anyhow::Result<[Scalar; 3]> {
+    fn execute_internal(&mut self) -> anyhow::Result<[VmScalar; 3]> {
         let mut counter: usize = 0;
 
         loop {

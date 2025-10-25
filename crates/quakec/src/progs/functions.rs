@@ -12,12 +12,12 @@ use num_derive::FromPrimitive;
 
 use crate::load::LoadFn;
 use crate::ops::Opcode;
-use crate::progs::Scalar;
+use crate::progs::VmScalar;
 use crate::{ARG_ADDRS, QuakeCMemory, quake1};
 
 pub const MAX_ARGS: usize = 8;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "reflect", derive(Reflect))]
 pub struct Statement {
     pub opcode: Opcode,
@@ -40,7 +40,7 @@ impl Statement {
     }
 }
 
-#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq)]
+#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq)]
 #[cfg_attr(feature = "reflect", derive(Reflect))]
 #[repr(u8)]
 pub enum ArgSize {
@@ -59,15 +59,15 @@ impl std::fmt::Display for ArgSize {
 
 #[derive(Debug)]
 pub struct FunctionExecutionCtx<'a> {
-    arguments: FixedBumpVec<'a, Scalar>,
-    local_storage: FixedBumpVec<'a, Scalar>,
+    arguments: FixedBumpVec<'a, VmScalar>,
+    local_storage: FixedBumpVec<'a, VmScalar>,
     /// For now, all functions are stateless. This allows for easier debugging, as we can see what the function
     /// accessed while running. It also ensures that a function that ran with errors can have modifications to
     /// the global state rolled back. QuakeC has few enough globals that this is cheap (although this will
     /// likely need to be limited to only the globals defined in `progdefs.h` for maximum efficiency)
     ///
     /// > TODO: Should QuakeC be able to modify state at all?
-    delta: FixedBumpVec<'a, Option<Scalar>>,
+    delta: FixedBumpVec<'a, Option<VmScalar>>,
     /// If the progs try to access a value within this range, it will access `local_storage` instead of globals.
     ///
     /// > TODO: We should only define globals at all if they are specified in the `progdefs.h` equivalent.
@@ -85,9 +85,9 @@ impl FunctionExecutionCtx<'_> {
 }
 
 impl QuakeCMemory for FunctionExecutionCtx<'_> {
-    type Scalar = Option<Scalar>;
+    type Scalar = Option<VmScalar>;
 
-    fn get(&self, index: usize) -> anyhow::Result<Option<Scalar>> {
+    fn get(&self, index: usize) -> anyhow::Result<Option<VmScalar>> {
         const LOCAL_STORAGE_ERR: &str =
             "Programmer error: `local_storage` was too small for `local_range`. This is a bug!";
 
@@ -110,7 +110,7 @@ impl QuakeCMemory for FunctionExecutionCtx<'_> {
 }
 
 impl FunctionExecutionCtx<'_> {
-    pub fn set(&mut self, index: usize, value: Scalar) -> anyhow::Result<()> {
+    pub fn set(&mut self, index: usize, value: VmScalar) -> anyhow::Result<()> {
         const LOCAL_STORAGE_ERR: &str =
             "Programmer error: `local_storage` was too small for `local_range`. This is a bug!";
         const ARG_STORAGE_ERR: &str =
@@ -140,7 +140,7 @@ impl FunctionExecutionCtx<'_> {
         Ok(())
     }
 
-    pub fn set_vector(&mut self, index: usize, values: [Scalar; 3]) -> anyhow::Result<()> {
+    pub fn set_vector(&mut self, index: usize, values: [VmScalar; 3]) -> anyhow::Result<()> {
         for (offset, value) in values.into_iter().enumerate() {
             self.set(index + offset, value)?;
         }
@@ -149,7 +149,7 @@ impl FunctionExecutionCtx<'_> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuakeCFunctionBody {
     /// `arg_start` + `locals` fields - we do not conflate locals and globals,
     /// so every access needs to check the locals first.
@@ -175,9 +175,9 @@ impl FunctionBody {
 pub type QuakeCFunctionDef = FunctionDef<QuakeCFunctionBody>;
 
 /// Definition for a QuakeC function.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionDef<T = FunctionBody> {
-    pub idx: i32,
+    pub offset: i32,
     pub name: Arc<CStr>,
     pub source: Arc<CStr>,
     /// First N args get copied to the local stack.
@@ -194,14 +194,14 @@ impl FunctionDef {
     pub fn try_into_quakec(self) -> Result<QuakeCFunctionDef, FunctionDef<Builtin>> {
         match self.body.try_into_quakec() {
             Ok(quakec) => Ok(QuakeCFunctionDef {
-                idx: self.idx,
+                offset: self.offset,
                 name: self.name,
                 source: self.source,
                 args: self.args,
                 body: quakec,
             }),
             Err(builtin) => Err(FunctionDef {
-                idx: self.idx,
+                offset: self.offset,
                 name: self.name,
                 source: self.source,
                 args: self.args,
@@ -218,11 +218,11 @@ impl QuakeCFunctionDef {
     ) -> FunctionExecutionCtx<'scope> {
         FunctionExecutionCtx {
             arguments: FixedBumpVec::from_iter_exact_in(
-                std::iter::repeat_n(Scalar::Void, ARG_ADDRS.len()),
+                std::iter::repeat_n(VmScalar::Void, ARG_ADDRS.len()),
                 &mut alloc,
             ),
             local_storage: FixedBumpVec::from_iter_exact_in(
-                std::iter::repeat_n(Scalar::Void, self.body.locals.len()),
+                std::iter::repeat_n(VmScalar::Void, self.body.locals.len()),
                 &mut alloc,
             ),
             delta: FixedBumpVec::from_iter_exact_in(
@@ -260,7 +260,7 @@ impl FunctionRegistry {
                             name: cur.name.clone(),
                             source: cur.source.clone(),
                             args: cur.args.clone(),
-                            idx: cur.offset,
+                            offset: cur.offset,
                             body: if cur.offset < 0 {
                                 debug_assert_eq!(cur.locals.len(), 0);
 

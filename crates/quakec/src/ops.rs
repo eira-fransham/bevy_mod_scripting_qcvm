@@ -1,21 +1,23 @@
 use arrayvec::ArrayVec;
 #[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
+use bump_scope::BumpScope;
 use glam::Vec3;
+use itertools::Either;
 use num_derive::FromPrimitive;
-use std::{fmt, num::NonZeroIsize};
+use std::{ffi::CStr, fmt, num::NonZeroIsize};
 use tracing::{debug, error};
 
 use crate::{
-    ARG_ADDRS, ExecutionCtx, OpResult, ScopedAlloc,
+    ARG_ADDRS, ArgType, CallArgs, ExecutionCtx, OpResult, ScopedAlloc,
     progs::{
-        EntityRef, FieldPtr, FunctionRef, Scalar, StringRef, Type, Value,
+        EntityRef, FieldPtr, FunctionRef, StringRef, Type, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
     },
-    userdata::ErasedBuiltin,
+    userdata::{Context, Entity as _, ErasedContext, ErasedFunction, FnCall, Function as _},
 };
 
-#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq)]
+#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq)]
 #[cfg_attr(feature = "reflect", derive(Reflect))]
 #[repr(i16)]
 pub enum Opcode {
@@ -160,16 +162,14 @@ impl fmt::Display for Opcode {
     }
 }
 
-impl<Alloc> ExecutionCtx<'_, Alloc>
-where
-    Alloc: ScopedAlloc,
-{
+impl ExecutionCtx<'_> {
     pub(crate) fn enter_builtin(
         &mut self,
-        builtin: &dyn ErasedBuiltin,
+        name: &CStr,
+        builtin: &dyn ErasedFunction,
         num_args: usize,
-    ) -> anyhow::Result<[Scalar; 3]> {
-        let sig = builtin.dyn_signature()?;
+    ) -> anyhow::Result<[VmScalar; 3]> {
+        let sig = builtin.signature()?;
         if sig.len() != num_args {
             error!(
                 "Builtin called with wrong number of args. Proceeding, but this is probably a bug"
@@ -181,14 +181,27 @@ where
             .take(num_args)
             .zip(sig)
             .map(|(addr, ty)| match ty {
-                Type::Scalar(_) => self.get::<_, Value>(addr),
-                Type::Vector => Ok(self.get_vec3(addr)?.into()),
+                ArgType::Vector => Ok(self.get_vec3(addr)?.into()),
+                ArgType::Any => Ok(self.get::<_, VmValue>(addr)?),
+                ArgType::Entity => Ok(self.get::<_, EntityRef>(addr)?.into()),
+                ArgType::Function => Ok(self.get::<_, FunctionRef>(addr)?.into()),
+                ArgType::Float => Ok(self.get::<_, f32>(addr)?.into()),
+                ArgType::String => Ok(self.get::<_, StringRef>(addr)?.into()),
+                ArgType::Void => Ok(Default::default()),
             })
-            .collect::<anyhow::Result<ArrayVec<Value, MAX_ARGS>>>()?;
+            .flat_map(|value| match value {
+                Ok(value) => Either::Left(<[VmScalar; 3]>::from(value).map(Ok).into_iter()),
+                Err(e) => Either::Right(std::iter::once(Err(e))),
+            })
+            .collect::<anyhow::Result<ArrayVec<VmScalar, MAX_ARGS>>>()?;
 
-        Ok(builtin
-            .dyn_call(&mut *self.context, &mut args.into_iter())?
-            .into())
+        let vm_value: VmValue = self
+            .with_builtin_call_context(name, args, |ctx| {
+                builtin.dyn_call(FnCall { execution: ctx })
+            })?
+            .into();
+
+        Ok(vm_value.into())
     }
 
     pub(crate) fn execute_statement(&mut self, statement: Statement) -> anyhow::Result<OpResult> {
@@ -223,11 +236,15 @@ where
                     FunctionRef::Ptr(p) => match self.functions.get(p.0)?.clone().try_into_quakec()
                     {
                         Ok(quakec) => self.execute(&quakec)?,
-                        Err(builtin) => {
-                            self.enter_builtin(&*self.context.dyn_builtin(&builtin)?, num_args)?
-                        }
+                        Err(builtin) => self.enter_builtin(
+                            &builtin.name,
+                            &*self.context.builtin(&builtin)?,
+                            num_args,
+                        )?,
                     },
-                    FunctionRef::Extern(func) => self.enter_builtin(&*func, num_args)?,
+                    FunctionRef::Extern(func) => {
+                        self.enter_builtin(c"{anonymous}", &*func, num_args)?
+                    }
                 };
 
                 self.set_return(result);
@@ -330,7 +347,7 @@ where
     }
 
     pub(crate) fn op_if(&mut self, a: i16, b: i16, _c: i16) -> anyhow::Result<OpResult> {
-        let cond = !self.get::<_, Scalar>(a)?.is_null();
+        let cond = !self.get::<_, VmScalar>(a)?.is_null();
         // debug!("{op}: cond == {cond}");
 
         if cond {
@@ -343,7 +360,7 @@ where
     }
 
     pub(crate) fn op_if_not(&mut self, a: i16, b: i16, _c: i16) -> anyhow::Result<OpResult> {
-        let cond = !self.get::<_, Scalar>(a)?.is_null();
+        let cond = !self.get::<_, VmScalar>(a)?.is_null();
         // debug!("{op}: cond == {cond}");
 
         if cond {
@@ -361,94 +378,85 @@ where
         )?))
     }
 
-    pub(crate) fn op_return(&mut self, a: i16, b: i16, c: i16) -> anyhow::Result<[Scalar; 3]> {
-        let val1: Scalar = self.get(a).unwrap_or_default();
-        let val2: Scalar = self.get(b).unwrap_or_default();
-        let val3: Scalar = self.get(c).unwrap_or_default();
+    pub(crate) fn op_return(&mut self, a: i16, b: i16, c: i16) -> anyhow::Result<[VmScalar; 3]> {
+        let val1: VmScalar = self.get(a).unwrap_or_default();
+        let val2: VmScalar = self.get(b).unwrap_or_default();
+        let val3: VmScalar = self.get(c).unwrap_or_default();
 
         Ok([val1, val2, val3])
     }
 
+    fn load_scalar(&mut self, entity: i16, field: i16, out_ptr: i16) -> anyhow::Result<()> {
+        let ent: EntityRef = self.get(entity)?;
+        let FieldPtr(ptr) = self.get(field)?;
+        let field = self.entity_def.get_scalar(ptr)?;
+
+        let value = ent.non_null()?.get_scalar(&*self.context, field)?;
+
+        self.set(out_ptr, value)
+    }
+
     // LOAD_F: load float field from entity
-    pub(crate) fn op_load_f(&mut self, e_ofs: i16, e_f: i16, out_ptr: i16) -> anyhow::Result<()> {
-        let _ent_id: EntityRef = self.get(e_ofs)?;
-        let _fld_ofs: FieldPtr = self.get(e_f)?;
-        let _out_ptr = out_ptr;
-
-        todo!();
-
-        // Ok(())
+    pub(crate) fn op_load_f(
+        &mut self,
+        entity: i16,
+        field: i16,
+        out_ptr: i16,
+    ) -> anyhow::Result<()> {
+        self.load_scalar(entity, field, out_ptr)
     }
 
     // LOAD_V: load vector field from entity
     pub(crate) fn op_load_v(
         &mut self,
-        ent_id_addr: i16,
-        ent_vector_addr: i16,
+        entity: i16,
+        field: i16,
         out_ptr: i16,
     ) -> anyhow::Result<()> {
-        let _ent: EntityRef = self.get(ent_id_addr)?;
-        let _fld_ofs: FieldPtr = self.get(ent_vector_addr)?;
-        let _out_ptr = out_ptr;
+        let ent: EntityRef = self.get(entity)?;
+        let FieldPtr(ptr) = self.get(field)?;
+        let field = self.entity_def.get_vector(ptr)?;
 
-        todo!();
+        let value: [VmScalar; 3] = ent.non_null()?.get(&*self.context, &field)?.into();
 
-        // Ok(())
+        self.set_vector(out_ptr, value)
     }
 
     pub(crate) fn op_load_s(
         &mut self,
-        ent_id_addr: i16,
-        ent_string_id_addr: i16,
+        entity: i16,
+        field: i16,
         out_ptr: i16,
     ) -> anyhow::Result<()> {
-        let _ent: EntityRef = self.get(ent_id_addr)?;
-        let _fld_ofs: FieldPtr = self.get(ent_string_id_addr)?;
-        let _out_ptr = out_ptr;
-
-        todo!();
-
-        // Ok(())
+        self.load_scalar(entity, field, out_ptr)
     }
 
     pub(crate) fn op_load_ent(
         &mut self,
-        ent_id_addr: i16,
-        ent_entity_id_addr: i16,
+        entity: i16,
+        field: i16,
         out_ptr: i16,
     ) -> anyhow::Result<()> {
-        let _ent: EntityRef = self.get(ent_id_addr)?;
-        let _field: FieldPtr = self.get(ent_entity_id_addr)?;
-        let _out_ptr = out_ptr;
-
-        todo!();
-
-        // Ok(())
+        self.load_scalar(entity, field, out_ptr)
     }
 
     pub(crate) fn op_load_fnc(
         &mut self,
-        ent_id_addr: i16,
-        ent_function_id_addr: i16,
+        entity: i16,
+        field: i16,
         out_ptr: i16,
     ) -> anyhow::Result<()> {
-        let _ent: EntityRef = self.get(ent_id_addr)?;
-        let _fnc: FunctionRef = self.get(ent_function_id_addr)?;
-        let _out_ptr = out_ptr;
-
-        todo!();
-
-        // Ok(())
+        self.load_scalar(entity, field, out_ptr)
     }
 
     pub(crate) fn op_address(
         &mut self,
-        ent_id_addr: i16,
-        fld_addr_addr: i16,
+        entity: i16,
+        field: i16,
         out_ptr: i16,
     ) -> anyhow::Result<()> {
-        let _ent_id: EntityRef = self.get(ent_id_addr)?;
-        let _fld_addr: FieldPtr = self.get(fld_addr_addr)?;
+        let _ent_id: EntityRef = self.get(entity)?;
+        let _fld_addr: FieldPtr = self.get(field)?;
         let _out_ptr = out_ptr;
 
         // Should be (a facsimile of) the byte offset of the field in the full entity array.
@@ -557,10 +565,10 @@ where
         map: F,
     ) -> anyhow::Result<()>
     where
-        Scalar: TryInto<T>,
-        <Scalar as TryInto<T>>::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        VmScalar: TryInto<T>,
+        <VmScalar as TryInto<T>>::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
         F: FnOnce(T, T) -> O,
-        O: Into<Scalar>,
+        O: Into<VmScalar>,
     {
         let val1: T = self.get(ptr1)?;
         let val2: T = self.get(ptr2)?;
@@ -670,8 +678,8 @@ where
 
     fn scalar_eq<T>(&mut self, ptr1: i16, ptr2: i16, out_ptr: i16) -> anyhow::Result<()>
     where
-        Scalar: TryInto<T>,
-        <Scalar as TryInto<T>>::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        VmScalar: TryInto<T>,
+        <VmScalar as TryInto<T>>::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
         T: PartialEq,
     {
         self.scalar_binop(ptr1, ptr2, out_ptr, |a: T, b: T| a == b)
@@ -731,8 +739,8 @@ where
 
     fn scalar_ne<T>(&mut self, ptr1: i16, ptr2: i16, out_ptr: i16) -> anyhow::Result<()>
     where
-        Scalar: TryInto<T>,
-        <Scalar as TryInto<T>>::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        VmScalar: TryInto<T>,
+        <VmScalar as TryInto<T>>::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
         T: PartialEq,
     {
         self.scalar_binop(ptr1, ptr2, out_ptr, |a: T, b: T| a != b)
@@ -809,7 +817,7 @@ where
     }
 
     fn copy(&mut self, src_ptr: i16, dst_ptr: i16) -> anyhow::Result<()> {
-        self.set(dst_ptr, self.get::<_, Scalar>(src_ptr)?)
+        self.set(dst_ptr, self.get::<_, VmScalar>(src_ptr)?)
     }
 
     // STORE_F
@@ -895,7 +903,7 @@ where
     }
 
     fn not(&mut self, ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
-        self.set(out_ptr, self.get::<_, Scalar>(ptr)?.is_null())
+        self.set(out_ptr, self.get::<_, VmScalar>(ptr)?.is_null())
     }
 
     // NOT_V: Compare vec to { 0.0, 0.0, 0.0 }
@@ -959,14 +967,14 @@ where
 
     // AND: Logical AND
     pub(crate) fn op_and(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
-        self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: Scalar, b: Scalar| {
+        self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: VmScalar, b: VmScalar| {
             !a.is_null() && !b.is_null()
         })
     }
 
     // OR: Logical OR
     pub(crate) fn op_or(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
-        self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: Scalar, b: Scalar| {
+        self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: VmScalar, b: VmScalar| {
             !a.is_null() || !b.is_null()
         })
     }

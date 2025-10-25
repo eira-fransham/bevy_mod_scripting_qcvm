@@ -3,7 +3,7 @@ use std::{ffi::CStr, sync::Arc};
 use hashbrown::HashMap;
 use itertools::Either;
 
-use crate::progs::{FieldName, GlobalDef, Scalar, ScalarType};
+use crate::progs::{FieldName, GlobalDef, ScalarType, VmScalar};
 
 #[derive(Clone, Debug)]
 pub struct Global {
@@ -11,7 +11,7 @@ pub struct Global {
 
     /// Should be same as `self.value.type_()`, but may get out of sync due to `Void`.
     pub type_: ScalarType,
-    pub value: Scalar,
+    pub value: VmScalar,
 }
 
 impl Global {
@@ -20,7 +20,7 @@ impl Global {
             Ok(type_) => Either::Left(Global {
                 name: def.name.clone().into(),
                 type_,
-                value: Scalar::Void,
+                value: VmScalar::Void,
             }),
             Err(tys_and_offsets) => Either::Right(tys_and_offsets.map(|(type_, offset)| Global {
                 name: FieldName {
@@ -28,13 +28,13 @@ impl Global {
                     offset: Some(offset),
                 },
                 type_,
-                value: Scalar::Void,
+                value: VmScalar::Void,
             })),
         }
     }
 
     fn with_value_bytes(self, bytes: [u8; 4]) -> anyhow::Result<Self> {
-        let value = Scalar::try_from_bytes(self.type_, bytes)?;
+        let value = VmScalar::try_from_bytes(self.type_, bytes)?;
 
         Ok(Self { value, ..self })
     }
@@ -111,7 +111,7 @@ impl GlobalRegistry {
     }
 
     #[inline]
-    pub fn get_value<P>(&self, ptr: P) -> anyhow::Result<Scalar>
+    pub fn get_value<P>(&self, ptr: P) -> anyhow::Result<VmScalar>
     where
         P: TryInto<u16>,
         P::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,

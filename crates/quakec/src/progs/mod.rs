@@ -12,7 +12,7 @@ use num_derive::FromPrimitive;
 
 use crate::{
     entity::ScalarFieldDef,
-    userdata::{ErasedBuiltin, ErasedEntity},
+    userdata::{ErasedEntity, ErasedFunction},
 };
 
 #[derive(Clone, Debug)]
@@ -308,6 +308,15 @@ pub enum EntityRef {
     Entity(Arc<dyn ErasedEntity>),
 }
 
+impl EntityRef {
+    pub fn non_null(self) -> anyhow::Result<Arc<dyn ErasedEntity>> {
+        match self {
+            Self::Worldspawn => anyhow::bail!("Tried to access fields on worldspawn entity"),
+            Self::Entity(ent) => Ok(ent),
+        }
+    }
+}
+
 impl PartialEq for EntityRef {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -329,7 +338,7 @@ pub enum FunctionRef {
     /// A reference to a function that is statically known by QuakeC
     Ptr(Ptr),
     /// An inline reference to an external function.
-    Extern(Arc<dyn ErasedBuiltin>),
+    Extern(Arc<dyn ErasedFunction>),
 }
 
 impl PartialEq for FunctionRef {
@@ -387,8 +396,6 @@ impl StringRef {
 }
 
 #[derive(Default, Clone, PartialEq, Eq)]
-// TODO: Implement pointer opcodes
-#[expect(dead_code)]
 pub struct GlobalPtr(pub Ptr);
 
 impl Deref for GlobalPtr {
@@ -411,7 +418,7 @@ impl Deref for FieldPtr {
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
-pub enum Scalar {
+pub enum VmScalar {
     /// This can be converted to any of the other values, as it is just a general "0".
     #[default]
     Void,
@@ -424,7 +431,7 @@ pub enum Scalar {
     Field(Ptr),
 }
 
-impl From<bool> for Scalar {
+impl From<bool> for VmScalar {
     fn from(value: bool) -> Self {
         if value {
             Self::Float(1.)
@@ -434,19 +441,49 @@ impl From<bool> for Scalar {
     }
 }
 
-impl From<f32> for Scalar {
+impl From<f32> for VmScalar {
     fn from(value: f32) -> Self {
         Self::Float(value)
     }
 }
 
-impl TryFrom<Scalar> for f32 {
+impl From<EntityRef> for VmScalar {
+    fn from(value: EntityRef) -> Self {
+        Self::Entity(value)
+    }
+}
+
+impl From<FunctionRef> for VmScalar {
+    fn from(value: FunctionRef) -> Self {
+        Self::Function(value)
+    }
+}
+
+impl From<StringRef> for VmScalar {
+    fn from(value: StringRef) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<FieldPtr> for VmScalar {
+    fn from(value: FieldPtr) -> Self {
+        Self::Field(value.0)
+    }
+}
+
+impl From<GlobalPtr> for VmScalar {
+    fn from(value: GlobalPtr) -> Self {
+        Self::Global(value.0)
+    }
+}
+
+impl TryFrom<VmScalar> for f32 {
     type Error = ScalarCastError;
 
-    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
+    fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            Scalar::Void => Ok(Default::default()),
-            Scalar::Float(f) => Ok(f),
+            VmScalar::Void => Ok(Default::default()),
+            VmScalar::Float(f) => Ok(f),
             _ => Err(ScalarCastError {
                 expected: ScalarType::Float,
                 found: value.type_(),
@@ -455,13 +492,25 @@ impl TryFrom<Scalar> for f32 {
     }
 }
 
-impl TryFrom<Scalar> for FunctionRef {
+#[derive(Debug, Clone, PartialEq, Eq, snafu::Snafu)]
+pub enum IntoEntityError {
+    WorldspawnAccessForbidden,
+    TypeMismatch { types: ScalarCastError },
+}
+
+impl From<ScalarCastError> for IntoEntityError {
+    fn from(value: ScalarCastError) -> Self {
+        Self::TypeMismatch { types: value }
+    }
+}
+
+impl TryFrom<VmScalar> for FunctionRef {
     type Error = ScalarCastError;
 
-    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
+    fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            Scalar::Void => Ok(Default::default()),
-            Scalar::Function(f) => Ok(f),
+            VmScalar::Void => Ok(Default::default()),
+            VmScalar::Function(f) => Ok(f),
             _ => Err(ScalarCastError {
                 expected: ScalarType::Function,
                 found: value.type_(),
@@ -470,13 +519,13 @@ impl TryFrom<Scalar> for FunctionRef {
     }
 }
 
-impl TryFrom<Scalar> for EntityRef {
+impl TryFrom<VmScalar> for EntityRef {
     type Error = ScalarCastError;
 
-    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
+    fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            Scalar::Void => Ok(Default::default()),
-            Scalar::Entity(f) => Ok(f),
+            VmScalar::Void => Ok(Default::default()),
+            VmScalar::Entity(f) => Ok(f),
             _ => Err(ScalarCastError {
                 expected: ScalarType::Entity,
                 found: value.type_(),
@@ -485,13 +534,13 @@ impl TryFrom<Scalar> for EntityRef {
     }
 }
 
-impl TryFrom<Scalar> for StringRef {
+impl TryFrom<VmScalar> for StringRef {
     type Error = ScalarCastError;
 
-    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
+    fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            Scalar::Void => Ok(Default::default()),
-            Scalar::String(f) => Ok(f),
+            VmScalar::Void => Ok(Default::default()),
+            VmScalar::String(f) => Ok(f),
             _ => Err(ScalarCastError {
                 expected: ScalarType::String,
                 found: value.type_(),
@@ -500,13 +549,13 @@ impl TryFrom<Scalar> for StringRef {
     }
 }
 
-impl TryFrom<Scalar> for GlobalPtr {
+impl TryFrom<VmScalar> for GlobalPtr {
     type Error = ScalarCastError;
 
-    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
+    fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            Scalar::Void => Ok(Default::default()),
-            Scalar::Global(p) => Ok(GlobalPtr(p)),
+            VmScalar::Void => Ok(Default::default()),
+            VmScalar::Global(p) => Ok(GlobalPtr(p)),
             _ => Err(ScalarCastError {
                 expected: ScalarType::String,
                 found: value.type_(),
@@ -515,13 +564,13 @@ impl TryFrom<Scalar> for GlobalPtr {
     }
 }
 
-impl TryFrom<Scalar> for FieldPtr {
+impl TryFrom<VmScalar> for FieldPtr {
     type Error = ScalarCastError;
 
-    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
+    fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            Scalar::Void => Ok(Default::default()),
-            Scalar::Field(p) => Ok(FieldPtr(p)),
+            VmScalar::Void => Ok(Default::default()),
+            VmScalar::Field(p) => Ok(FieldPtr(p)),
             _ => Err(ScalarCastError {
                 expected: ScalarType::String,
                 found: value.type_(),
@@ -530,30 +579,30 @@ impl TryFrom<Scalar> for FieldPtr {
     }
 }
 
-const _: [(); 24] = [(); std::mem::size_of::<Scalar>()];
+const _: [(); 24] = [(); std::mem::size_of::<VmScalar>()];
 
-impl Scalar {
+impl VmScalar {
     pub fn is_null(&self) -> bool {
         match self {
-            Scalar::Void => true,
-            Scalar::Float(f) => *f != 0.,
-            Scalar::Entity(entity_ref) => entity_ref.is_null(),
-            Scalar::String(string_ref) => string_ref.is_null(),
-            Scalar::Function(function_ref) => function_ref.is_null(),
-            Scalar::Global(ptr) => ptr.is_null(),
-            Scalar::Field(ptr) => ptr.is_null(),
+            VmScalar::Void => true,
+            VmScalar::Float(f) => *f != 0.,
+            VmScalar::Entity(entity_ref) => entity_ref.is_null(),
+            VmScalar::String(string_ref) => string_ref.is_null(),
+            VmScalar::Function(function_ref) => function_ref.is_null(),
+            VmScalar::Global(ptr) => ptr.is_null(),
+            VmScalar::Field(ptr) => ptr.is_null(),
         }
     }
 
     pub fn type_(&self) -> ScalarType {
         match self {
-            Scalar::Void => ScalarType::Void,
-            Scalar::Float(_) => ScalarType::Float,
-            Scalar::Entity(_) => ScalarType::Entity,
-            Scalar::String(_) => ScalarType::String,
-            Scalar::Function(_) => ScalarType::Function,
-            Scalar::Global(_) => ScalarType::GlobalRef,
-            Scalar::Field(_) => ScalarType::FieldRef,
+            VmScalar::Void => ScalarType::Void,
+            VmScalar::Float(_) => ScalarType::Float,
+            VmScalar::Entity(_) => ScalarType::Entity,
+            VmScalar::String(_) => ScalarType::String,
+            VmScalar::Function(_) => ScalarType::Function,
+            VmScalar::Global(_) => ScalarType::GlobalRef,
+            VmScalar::Field(_) => ScalarType::FieldRef,
         }
     }
 
@@ -561,78 +610,93 @@ impl Scalar {
         match ty {
             ScalarType::Void => {
                 if bytes == [0; 4] {
-                    Ok(Scalar::Void)
+                    Ok(VmScalar::Void)
                 } else {
                     Err(anyhow::Error::msg("`void` can only be initialized with 0"))
                 }
             }
-            ScalarType::Float => Ok(Scalar::Float(f32::from_le_bytes(bytes))),
-            ScalarType::String => Ok(Scalar::String(StringRef::Id(i32::from_le_bytes(bytes)))),
+            ScalarType::Float => Ok(VmScalar::Float(f32::from_le_bytes(bytes))),
+            ScalarType::String => Ok(VmScalar::String(StringRef::Id(i32::from_le_bytes(bytes)))),
             ScalarType::Entity => {
                 if bytes == [0; 4] {
-                    Ok(Scalar::Entity(EntityRef::Worldspawn))
+                    Ok(VmScalar::Entity(EntityRef::Worldspawn))
                 } else {
                     Err(anyhow::Error::msg(
                         "Cannot literally initialise an entity to any value other than worldspawn (no entities have been spawned at load-time)",
                     ))
                 }
             }
-            ScalarType::Function => Ok(Scalar::Function(FunctionRef::Ptr(Ptr(
+            ScalarType::Function => Ok(VmScalar::Function(FunctionRef::Ptr(Ptr(
                 i32::from_le_bytes(bytes),
             )))),
 
-            ScalarType::FieldRef => Ok(Scalar::Field(Ptr(i32::from_le_bytes(bytes)))),
-            ScalarType::GlobalRef => Ok(Scalar::Global(Ptr(i32::from_le_bytes(bytes)))),
+            ScalarType::FieldRef => Ok(VmScalar::Field(Ptr(i32::from_le_bytes(bytes)))),
+            ScalarType::GlobalRef => Ok(VmScalar::Global(Ptr(i32::from_le_bytes(bytes)))),
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Value {
-    Scalar(Scalar),
+pub enum VmValue {
+    Scalar(VmScalar),
     /// The only value in QuakeC that can be more than 32 bits (logically 32 bits, `Scalar` is larger
     /// because it's not just indices) is a vector of floats. This can only exist "ephemerally", as
     /// all values stored to/from stack or globals are ultimately scalars.
     Vector([f32; 3]),
 }
 
-impl Default for Value {
+impl Default for VmValue {
     fn default() -> Self {
         Self::Scalar(Default::default())
     }
 }
 
-impl From<Value> for [Scalar; 3] {
-    fn from(value: Value) -> Self {
+impl From<VmValue> for [VmScalar; 3] {
+    fn from(value: VmValue) -> Self {
         match value {
-            Value::Scalar(scalar) => [scalar, Scalar::Void, Scalar::Void],
-            Value::Vector(floats) => floats.map(Into::into),
+            VmValue::Scalar(scalar) => [scalar, VmScalar::Void, VmScalar::Void],
+            VmValue::Vector(floats) => floats.map(Into::into),
         }
     }
 }
 
-impl From<[f32; 3]> for Value {
+impl From<[f32; 3]> for VmValue {
     fn from(value: [f32; 3]) -> Self {
         Self::Vector(value)
     }
 }
 
-impl From<Vec3> for Value {
+impl From<Vec3> for VmValue {
     fn from(value: Vec3) -> Self {
         Self::Vector(value.into())
     }
 }
 
-impl<T> From<T> for Value
+impl TryFrom<[VmScalar; 3]> for VmValue {
+    type Error = ScalarCastError;
+
+    fn try_from(value: [VmScalar; 3]) -> Result<Self, Self::Error> {
+        match value {
+            [scalar, VmScalar::Void, VmScalar::Void] => Ok(VmValue::Scalar(scalar)),
+            [x, y, z] => Ok(VmValue::Vector([
+                x.try_into()?,
+                y.try_into()?,
+                z.try_into()?,
+            ])),
+        }
+    }
+}
+
+impl<T> From<T> for VmValue
 where
-    T: Into<Scalar>,
+    T: Into<VmScalar>,
 {
     fn from(value: T) -> Self {
         Self::Scalar(value.into())
     }
 }
 
-impl Value {
+impl VmValue {
     pub fn type_(&self) -> Type {
         match self {
             Self::Scalar(scalar) => Type::Scalar(scalar.type_()),

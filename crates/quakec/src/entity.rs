@@ -1,6 +1,6 @@
-use std::{convert::identity, sync::Arc};
+use std::sync::Arc;
 
-use crate::progs::{FieldDef, FieldName, Ptr, ScalarType};
+use crate::progs::{FieldDef, FieldName, FieldOffset, Ptr, ScalarType, Type};
 
 #[derive(Clone, Debug)]
 pub struct ScalarFieldDef {
@@ -12,7 +12,7 @@ pub struct ScalarFieldDef {
 
 #[derive(Clone, Debug)]
 pub struct EntityTypeDef {
-    fields: Arc<[Option<ScalarFieldDef>]>,
+    scalars: Arc<[Option<ScalarFieldDef>]>,
     // TODO: Expose this
     // offsets: HashMap<Arc<CStr>, Ptr>,
 }
@@ -45,25 +45,75 @@ impl EntityTypeDef {
         }
 
         Self {
-            fields: fields.into(),
+            scalars: fields.into(),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.fields.len()
+        self.scalars.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub fn get(&self, field_ref: Ptr) -> anyhow::Result<ScalarFieldDef> {
+    pub fn get_scalar(&self, field_ref: Ptr) -> anyhow::Result<&ScalarFieldDef> {
         let offset: usize = field_ref.0.try_into()?;
 
-        self.fields
+        self.scalars
             .get(offset)
-            .cloned()
-            .and_then(identity)
+            .and_then(Option::as_ref)
             .ok_or_else(|| anyhow::Error::msg(format!("No field at the offset {offset}")))
+    }
+
+    // TODO: It would be extremely easy to improve this, but it's good enough for now.
+    pub fn get_vector(&self, field_ref: Ptr) -> anyhow::Result<FieldDef> {
+        let [x, y, z] = std::array::from_fn(|i| self.get_scalar(Ptr(field_ref.0 + i as i32)));
+        match [x?, y?, z?] {
+            [
+                ScalarFieldDef {
+                    name:
+                        FieldName {
+                            name,
+                            offset: Some(FieldOffset::X),
+                            ..
+                        },
+                    offset,
+                    ..
+                },
+                ScalarFieldDef {
+                    name:
+                        FieldName {
+                            offset: Some(FieldOffset::Y),
+                            ..
+                        },
+                    ..
+                },
+                ScalarFieldDef {
+                    name:
+                        FieldName {
+                            offset: Some(FieldOffset::Z),
+                            ..
+                        },
+                    ..
+                },
+            ] => Ok(FieldDef {
+                type_: Type::Vector,
+                offset: *offset,
+                name: name.clone(),
+            }),
+            [
+                ScalarFieldDef {
+                    type_,
+                    name: FieldName { name, .. },
+                    ..
+                },
+                ..,
+            ] => anyhow::bail!(
+                "Type mismatch for {}, expected vector, found {}",
+                name.to_string_lossy(),
+                type_
+            ),
+        }
     }
 }
