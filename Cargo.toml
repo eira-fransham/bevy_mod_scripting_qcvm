@@ -3,12 +3,20 @@ name = "bevy_mod_scripting_quakec"
 version = "0.1.0"
 edition = "2024"
 
-license = "GPL-2.0"
-homepage = "https://github.com/eira-fransham/bevy_mod_scripting_quakec"
-repository = "https://github.com/eira-fransham/bevy_mod_scripting_quakec"
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 
 [workspace]
 members = ["crates/quakec"]
+
+[workspace.package]
+authors = ["Eira Fransham <eira.fransham@gmail.com>"]
+# Needs to be licensed under GPL to be compatible with Quake 1's license.
+license = "GPL-2.0"
+homepage = "https://github.com/eira-fransham/seismon"
+repository = "https://github.com/eira-fransham/seismon"
 
 [workspace.dependencies]
 anyhow = "1.0"
