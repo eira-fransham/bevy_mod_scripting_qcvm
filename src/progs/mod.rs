@@ -1,46 +1,42 @@
 pub mod functions;
 pub mod globals;
-mod ops;
-mod string_table;
 
 use std::{
     any::{Any, TypeId},
-    collections::HashMap,
+    backtrace::Backtrace,
+    cmp::Ordering,
+    ffi::{CStr, CString},
     fmt,
     io::{Read, Seek, SeekFrom},
-    iter,
+    ops::{Deref, Range},
     sync::Arc,
 };
 
-use crate::{
-    common::{bsp::BspError, console::ConsoleError, net::NetError}, progs::{functions::{FunctionBody, FunctionRef, QuakeCFunction, QuakeCProgs}, globals::Global}, server::world::{EntityError, EntityTypeDef}, QuakeCVm, QuakeCVmRef
-};
-
-use bevy::prelude::*;
+use arc_slice::{ArcSlice, layout::VecLayout};
+use arrayvec::ArrayVec;
 use bevy_ecs::{component::Component, entity::Entity};
-use bevy_log::debug;
-use bevy_math::Vec3;
+use bevy_log::{debug, warn};
 use bevy_mod_scripting_bindings::{
-    DynamicScriptFunction, DynamicScriptFunctionMut, FromScript, FunctionKey, InteropError, IntoScript, PartialReflectExt, ReflectBase, ReflectBaseType, ReflectReference, ScriptValue, TypeIdSource, WorldGuard
+    FromScript, InteropError, IntoScript, ReflectBase, ReflectBaseType, ReflectReference,
+    ScriptValue, TypeIdSource, WorldGuard,
 };
 use bevy_reflect::Reflect;
 use byteorder::{LittleEndian, ReadBytesExt};
+use hashbrown::HashMap;
 use num::FromPrimitive;
 use num_derive::FromPrimitive;
-use snafu::{Backtrace, prelude::*};
+use snafu::Snafu;
 
-use self::{
-    functions::{BuiltinFunctionId, FunctionDef, FunctionKind, MAX_ARGS, Statement},
-    globals::{GLOBAL_ADDR_ARG_0, GLOBAL_STATIC_COUNT},
-};
-pub use self::{
-    functions::{FunctionId, Functions},
-    globals::{
-        GlobalAddrEntity, GlobalAddrFloat, GlobalAddrFunction, GlobalAddrVector, Globals,
-        GlobalsError,
+use crate::{
+    ExecutionCtx, QuakeCVm,
+    entity::{EntityError, EntityTypeDef},
+    progs::{
+        functions::{
+            ArgSize, ExternFn, FunctionDef, FunctionRegistry, MAX_ARGS, QuakeCFunctionDef,
+            Statement,
+        },
+        globals::{GlobalRegistry, GlobalsError},
     },
-    ops::Opcode,
-    string_table::StringTable,
 };
 
 const VERSION: i32 = 6;
@@ -59,6 +55,47 @@ const FUNCTION_SIZE: usize = 36;
 // the on-disk size of a global or field definition
 const DEF_SIZE: usize = 8;
 
+#[derive(Clone, Debug)]
+pub struct StringTable {
+    /// Interned string data. In the `progs.dat` all the strings are concatenated together,
+    /// delineated by `\0`, but since we handle strings using `Arc` we still need to map
+    /// the raw byte offset in the lump to something we can cheaply clone.
+    strings: HashMap<usize, Arc<CStr>>,
+}
+
+impl StringTable {
+    pub fn new<D: AsRef<[u8]>>(data: D) -> anyhow::Result<StringTable> {
+        let data = data.as_ref();
+        let mut offset = 0;
+        let mut strings = HashMap::new();
+
+        while !data.is_empty() {
+            // TODO: Error handling.
+            let next = CStr::from_bytes_until_nul(&data[offset..])?;
+            let next_len = next.count_bytes();
+            strings.insert(offset, next.into());
+            offset += next_len;
+        }
+
+        Ok(Self { strings })
+    }
+
+    pub fn get<I>(&self, id: I) -> anyhow::Result<Arc<CStr>>
+    where
+        I: Into<StringRef>,
+    {
+        match id.into() {
+            StringRef::Id(id) => {
+                let id: usize = id.try_into()?;
+                self.strings
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::Error::msg(format!("No string with id {id}")))
+            }
+            StringRef::Temp(lit) => Ok(lit.clone()),
+        }
+    }
+}
 #[derive(Snafu, Debug)]
 pub enum ProgsError {
     #[snafu(context(false), display("{source:?}"))]
@@ -72,22 +109,8 @@ pub enum ProgsError {
         backtrace: Backtrace,
     },
     #[snafu(context(false))]
-    Net {
-        source: NetError,
-    },
-    #[snafu(context(false))]
-    Console {
-        source: ConsoleError,
-        backtrace: Backtrace,
-    },
-    #[snafu(context(false))]
     Entity {
         source: EntityError,
-        backtrace: Backtrace,
-    },
-    #[snafu(context(false))]
-    Bsp {
-        source: BspError,
         backtrace: Backtrace,
     },
     CallStackOverflow {
@@ -115,79 +138,54 @@ impl ProgsError {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
-#[repr(C)]
-pub struct StringId(pub usize);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Ptr {
+    /// A signed reference to a function, field, or global.
+    ///
+    /// Quake 1 only supports 16-bit references, but other engines (e.g. FTEQW) support
+    /// more, so for now we use 32-bit. `0` is a valid reference for all 3 of field, function
+    /// and global.
+    Id(i32),
+    /// A reference by name.
+    Name(Arc<CStr>),
+}
 
-impl StringId {
-    pub fn is_none(&self) -> bool {
-        self.0 == 0
+impl Default for Ptr {
+    fn default() -> Self {
+        Self::Id(0)
     }
 }
 
-impl TryInto<i32> for StringId {
-    type Error = ProgsError;
-
-    fn try_into(self) -> Result<i32, Self::Error> {
-        if self.0 > i32::MAX as usize {
-            Err(ProgsError::with_msg("string id out of i32 range"))
-        } else {
-            Ok(self.0 as i32)
-        }
+impl Ptr {
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Id(0))
     }
 }
 
-impl StringId {
-    pub fn new() -> StringId {
-        StringId(0)
+impl TryFrom<usize> for Ptr {
+    type Error = <usize as TryInto<i32>>::Error;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Ok(Self::Id(value.try_into()?))
     }
 }
 
-impl fmt::Display for StringId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "s{}", self.0)
+impl From<i32> for Ptr {
+    fn from(value: i32) -> Self {
+        Self::Id(value)
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
-#[repr(C)]
-pub struct EntityId(pub i32);
-
-impl fmt::Display for EntityId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "e{}", self.0)
+impl From<i16> for Ptr {
+    fn from(value: i16) -> Self {
+        Self::Id(value.into())
     }
 }
 
-impl EntityId {
-    pub const NONE: Self = Self(0);
-
-    pub fn is_none(&self) -> bool {
-        self.0 <= 0
+impl From<Arc<CStr>> for Ptr {
+    fn from(value: Arc<CStr>) -> Self {
+        Self::Name(value)
     }
-}
-
-impl From<EntityId> for u16 {
-    fn from(other: EntityId) -> Self {
-        other.0 as _
-    }
-}
-
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-#[repr(C)]
-pub struct FieldAddr(pub usize);
-
-impl fmt::Display for FieldAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "fld{}", self.0)
-    }
-}
-
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-#[repr(C)]
-pub struct EntityFieldAddr {
-    pub entity_id: EntityId,
-    pub field_addr: FieldAddr,
 }
 
 enum LumpId {
@@ -199,30 +197,89 @@ enum LumpId {
     Globals = 5,
 }
 
-#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq)]
-#[repr(u16)]
+#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq, Reflect)]
+#[repr(u8)]
+pub enum ScalarType {
+    Void = 0,
+    String = 1,
+    Float = 2,
+    // Vector = 3, see `Type`.
+    Entity = 4,
+
+    FieldRef = 5,
+    Function = 6,
+    GlobalRef = 7,
+}
+
+const VECTOR_TAG: u8 = 3;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Reflect)]
+#[repr(u8)]
 pub enum Type {
-    QVoid = 0,
-    QString = 1,
-    QFloat = 2,
-    QVector = 3,
-    QEntity = 4,
-    QField = 5,
-    QFunction = 6,
-    QPointer = 7,
+    Scalar(ScalarType),
+    Vector = 3,
+}
+
+impl Type {
+    pub fn num_elements(&self) -> usize {
+        match self {
+            Self::Scalar(_) => 1,
+            Self::Vector => 3,
+        }
+    }
+}
+
+impl TryFrom<Type> for ScalarType {
+    type Error = [(ScalarType, FieldOffset); 3];
+
+    fn try_from(value: Type) -> Result<Self, Self::Error> {
+        match value {
+            Type::Scalar(scalar) => Ok(scalar),
+            Type::Vector => Err([
+                (ScalarType::Float, FieldOffset::X),
+                (ScalarType::Float, FieldOffset::Y),
+                (ScalarType::Float, FieldOffset::Z),
+            ]),
+        }
+    }
+}
+
+impl FromPrimitive for Type {
+    fn from_i64(n: i64) -> Option<Self> {
+        Self::from_u8(n.try_into().ok()?)
+    }
+
+    fn from_u64(n: u64) -> Option<Self> {
+        Self::from_u8(n.try_into().ok()?)
+    }
+    fn from_u8(n: u8) -> Option<Self> {
+        if n == VECTOR_TAG {
+            Some(Self::Vector)
+        } else {
+            ScalarType::from_u8(n).map(Self::Scalar)
+        }
+    }
+}
+
+impl fmt::Display for ScalarType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Void => write!(f, "void"),
+            Self::String => write!(f, "string"),
+            Self::Float => write!(f, "float"),
+            Self::Entity => write!(f, "entity"),
+            Self::FieldRef => write!(f, "field"),
+            Self::Function => write!(f, "function"),
+            Self::GlobalRef => write!(f, "pointer"),
+        }
+    }
 }
 
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::QVoid => write!(f, "void"),
-            Self::QString => write!(f, "string"),
-            Self::QFloat => write!(f, "float"),
-            Self::QVector => write!(f, "vector"),
-            Self::QEntity => write!(f, "entity"),
-            Self::QField => write!(f, "field"),
-            Self::QFunction => write!(f, "function"),
-            Self::QPointer => write!(f, "pointer"),
+            Self::Scalar(scalar) => write!(f, "{scalar}"),
+            Self::Vector => write!(f, "vector"),
         }
     }
 }
@@ -233,18 +290,51 @@ struct Lump {
     count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Reflect, FromPrimitive)]
+pub enum FieldOffset {
+    X = 0,
+    Y = 1,
+    Z = 2,
+}
+
+impl FieldOffset {
+    /// All fields of a vector.
+    pub const FIELDS: [Self; 3] = [FieldOffset::X, FieldOffset::Y, FieldOffset::Z];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FieldName {
+    pub name: Arc<CStr>,
+    /// For vectors, we want to take the "raw" global definition
+    /// and make each field addressable individually, so we only
+    /// have to store scalars.
+    pub offset: Option<FieldOffset>,
+}
+
+impl From<Arc<CStr>> for FieldName {
+    fn from(name: Arc<CStr>) -> Self {
+        Self { name, offset: None }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GlobalDef {
     // TODO: Implement this
     _save: bool,
     type_: Type,
     offset: u16,
-    name: Arc<str>,
+    name: Arc<CStr>,
 }
 
 impl fmt::Display for GlobalDef {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{} {} = {}", self.type_, self.name, self.offset)
+        write!(
+            f,
+            "{} {} = {}",
+            self.type_,
+            self.name.to_string_lossy(),
+            self.offset
+        )
     }
 }
 
@@ -253,24 +343,63 @@ impl fmt::Display for GlobalDef {
 /// These definitions can be used to look up entity fields by name. This is
 /// required for custom fields defined in QuakeC code; their offsets are not
 /// known at compile time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDef {
     pub type_: Type,
     pub offset: u16,
-    pub name: Arc<str>,
+    pub name: Arc<CStr>,
+}
+
+impl PartialOrd for FieldDef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FieldDef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Put vector fields first, since we will deduplicate and vector fields
+        // require fewer calls to host code.
+        self.offset
+            .cmp(&other.offset)
+            .then(match (self.type_, other.type_) {
+                (Type::Vector, Type::Vector) => Ordering::Equal,
+                (Type::Vector, _) => Ordering::Less,
+                (_, Type::Vector) => Ordering::Greater,
+                _ => Ordering::Equal,
+            })
+            .then(self.name.cmp(&other.name))
+    }
 }
 
 impl fmt::Display for FieldDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {} = {}", self.type_, self.name, self.offset)
+        write!(
+            f,
+            "{} {} = {}",
+            self.type_,
+            self.name.to_string_lossy(),
+            self.offset
+        )
     }
 }
 
 /// The values returned by loading a `progs.dat` file.
 pub struct LoadProgs {
-    pub globals: Globals,
+    pub globals: GlobalRegistry,
     pub entity_def: EntityTypeDef,
+    /// We don't use string IDs internally any more, but we store the string table so that
+    /// progs can load them.
     pub string_table: StringTable,
+    pub function_defs: FunctionRegistry,
+}
+
+struct LoadFn {
+    offset: i32,
+    name: Arc<CStr>,
+    source: Arc<CStr>,
+    locals: Range<usize>,
+    args: ArrayVec<ArgSize, MAX_ARGS>,
 }
 
 /// Loads all data from a `progs.dat` file.
@@ -308,7 +437,7 @@ where
     (&mut src)
         .take(string_lump.count as u64)
         .read_to_end(&mut strings)?;
-    let string_table = StringTable::new(strings);
+    let string_table = StringTable::new(strings)?;
 
     assert_eq!(
         src.stream_position()?,
@@ -318,62 +447,6 @@ where
     );
 
     // Read function definitions and statements and construct Functions
-
-    let function_lump = &lumps[LumpId::Functions as usize];
-    src.seek(SeekFrom::Start(function_lump.offset as u64))?;
-    let mut function_defs = Vec::with_capacity(function_lump.count);
-    for i in 0..function_lump.count {
-        assert_eq!(
-            src.stream_position()?,
-            src.seek(SeekFrom::Start(
-                (function_lump.offset + i * FUNCTION_SIZE) as u64,
-            ))?
-        );
-
-        let kind = match src.read_i32::<LittleEndian>()? {
-            x if x < 0 => match BuiltinFunctionId::from_i32(-x) {
-                Some(f) => FunctionKind::BuiltIn(f),
-                None => {
-                    return Err(ProgsError::with_msg(format!(
-                        "Invalid built-in function ID {}",
-                        -x
-                    )));
-                }
-            },
-            x => FunctionKind::QuakeC(x as usize),
-        };
-
-        let arg_start = src.read_i32::<LittleEndian>()?;
-        let locals = src.read_i32::<LittleEndian>()?;
-
-        // throw away profile variable
-        let _ = src.read_i32::<LittleEndian>()?;
-
-        let name_id = src.read_i32::<LittleEndian>()?;
-        let srcfile_id = src.read_i32::<LittleEndian>()?;
-
-        let argc = src.read_i32::<LittleEndian>()?;
-        let mut argsz = [0; MAX_ARGS];
-        src.read_exact(&mut argsz)?;
-
-        function_defs.push(QuakeCFunction {
-            name: string_table.get(name_id.try_into()?),
-            kind,
-            arg_start: arg_start as usize,
-            locals: locals as usize,
-            name_id,
-            srcfile_id,
-            argc: argc as usize,
-            argsz,
-        });
-    }
-
-    assert_eq!(
-        src.stream_position()?,
-        src.seek(SeekFrom::Start(
-            (function_lump.offset + function_lump.count * FUNCTION_SIZE) as u64,
-        ))?
-    );
 
     let statement_lump = &lumps[LumpId::Statements as usize];
     src.seek(SeekFrom::Start(statement_lump.offset as u64))?;
@@ -394,29 +467,75 @@ where
         ))?
     );
 
-    let functions = Functions {
-        defs: function_defs.into_boxed_slice(),
-        statements: statements.into_boxed_slice(),
-    };
+    let statements: ArcSlice<[Statement]> = statements.into();
 
-    let globaldef_lump = &lumps[LumpId::GlobalDefs as usize];
-    src.seek(SeekFrom::Start(globaldef_lump.offset as u64))?;
-    let mut globaldefs = Vec::new();
-    for _ in 0..globaldef_lump.count {
-        let type_ = src.read_u16::<LittleEndian>()?;
-        let offset = src.read_u16::<LittleEndian>()?;
-        let name_id = string_table.id_from_i32(src.read_i32::<LittleEndian>()?)?;
-        let debug_name = format!("{}", string_table.get(name_id).unwrap_or_default());
-        globaldefs.push(GlobalDef {
-            _save: type_ & SAVE_GLOBAL != 0,
-            type_: Type::from_u16(type_ & !SAVE_GLOBAL).unwrap(),
+    let function_lump = &lumps[LumpId::Functions as usize];
+    src.seek(SeekFrom::Start(function_lump.offset as u64))?;
+    let mut load_functions = Vec::with_capacity(function_lump.count);
+
+    for _ in 0..function_lump.count {
+        let offset = src.read_i32::<LittleEndian>()?;
+
+        let arg_start = usize::try_from(src.read_i32::<LittleEndian>()?)?;
+        let locals = usize::try_from(src.read_i32::<LittleEndian>()?)?;
+
+        // This is always 0
+        let _ = src.read_i32::<LittleEndian>()?;
+
+        let name_id = src.read_i32::<LittleEndian>()?;
+        let srcfile_id = src.read_i32::<LittleEndian>()?;
+
+        let name = string_table.get(name_id)?;
+        let source = string_table.get(srcfile_id)?;
+
+        let argc = src.read_i32::<LittleEndian>()?;
+        let mut arg_size_buf = [0; MAX_ARGS];
+        src.read_exact(&mut arg_size_buf)?;
+
+        let mut args = ArrayVec::<ArgSize, MAX_ARGS>::new();
+
+        for byte in &arg_size_buf[..argc as usize] {
+            args.push(ArgSize::from_u8(*byte).unwrap());
+        }
+
+        load_functions.push(LoadFn {
             offset,
-            name_id,
-            debug_name,
+            name,
+            locals: arg_start..arg_start + locals,
+            source,
+            args,
         });
     }
 
-    globaldefs.sort_by_key(|def| def.offset);
+    assert_eq!(
+        src.stream_position()?,
+        src.seek(SeekFrom::Start(
+            (function_lump.offset + function_lump.count * FUNCTION_SIZE) as u64,
+        ))?
+    );
+
+    load_functions.sort_unstable_by_key(|def| def.offset);
+
+    let function_defs = FunctionRegistry::new(statements, load_functions)?;
+
+    let globaldef_lump = &lumps[LumpId::GlobalDefs as usize];
+    src.seek(SeekFrom::Start(globaldef_lump.offset as u64))?;
+    let mut global_defs = Vec::new();
+    for _ in 0..globaldef_lump.count {
+        let type_ = src.read_u16::<LittleEndian>()?;
+        let offset = src.read_u16::<LittleEndian>()?;
+        let name_id = src.read_i32::<LittleEndian>()?;
+        let name = string_table.get(name_id)?;
+
+        global_defs.push(GlobalDef {
+            _save: type_ & SAVE_GLOBAL != 0,
+            type_: Type::from_u16(type_ & !SAVE_GLOBAL).unwrap(),
+            offset,
+            name,
+        });
+    }
+
+    global_defs.sort_by_key(|def| def.offset);
 
     assert_eq!(
         src.stream_position()?,
@@ -431,17 +550,19 @@ where
     for _ in 0..fielddef_lump.count {
         let type_ = src.read_u16::<LittleEndian>()?;
         let offset = src.read_u16::<LittleEndian>()?;
-        let name_id = string_table.id_from_i32(src.read_i32::<LittleEndian>()?)?;
+        let name_id = src.read_i32::<LittleEndian>()?;
+
+        let name = string_table.get(name_id)?;
 
         if type_ & SAVE_GLOBAL != 0 {
-            return Err(ProgsError::with_msg(
+            return Err(anyhow::Error::msg(
                 "Save flag not allowed in field definitions",
             ));
         }
         field_defs.push(FieldDef {
             type_: Type::from_u16(type_).unwrap(),
             offset,
-            name_id,
+            name,
         });
     }
 
@@ -455,60 +576,347 @@ where
     let globals_lump = &lumps[LumpId::Globals as usize];
     src.seek(SeekFrom::Start(globals_lump.offset as u64))?;
 
-    if globals_lump.count < GLOBAL_STATIC_COUNT {
-        return Err(ProgsError::with_msg(
-            "Global count lower than static global count",
-        ));
-    }
+    // if globals_lump.count < GLOBAL_STATIC_COUNT {
+    //     return Err(ProgsError::with_msg(
+    //         "Global count lower than static global count",
+    //     ));
+    // }
 
-    let mut addrs = Vec::with_capacity(globals_lump.count);
-    for _ in 0..globals_lump.count {
-        let mut block = [0; 4];
-        src.read_exact(&mut block)?;
+    let mut global_values = vec![0; globals_lump.count * 4];
+    src.read_exact(&mut global_values)?;
 
-        // TODO: handle endian conversions (BigEndian systems should use BigEndian internally)
-        addrs.push(block);
-    }
+    let globals = GlobalRegistry::new(global_defs, &global_values)?;
 
-    assert_eq!(
-        src.stream_position()?,
-        src.seek(SeekFrom::Start(
-            (globals_lump.offset + globals_lump.count * 4) as u64,
-        ))?
-    );
-
-    let cx = ExecutionContext::new(functions);
-
-    let globals = Globals::new(globaldefs.into_boxed_slice(), addrs.into_boxed_slice());
-
-    let entity_def = EntityTypeDef::new(ent_addr_count, field_defs.into_boxed_slice())?;
+    let entity_def = EntityTypeDef::new(field_defs.into_boxed_slice())?;
 
     Ok(LoadProgs {
-        cx,
         globals,
         entity_def,
         string_table,
+        function_defs,
     })
 }
 
-#[derive(Clone, Debug)]
-pub enum Value {
-    /// Represents empty entity (worldspawn), empty function (invalid), or empty of any other type.
-    /// Prevents wrapping all fields in an option and makes coercion from `ScriptValue` easier.
-    ///
-    /// > TODO: Is this a bad idea?
-    Void,
-    Float(f32),
+/// Abstraction around `bevy_ecs::entity::Entity` that allows us to impl `Default` without
+/// world access.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+pub enum EntityRef {
+    #[default]
+    Worldspawn,
+    /// We use `Entity` rather than an index here so entities that aren't managed by the VM
+    /// can still be passed to QuakeC functions.
     Entity(Entity),
-    String(Arc<str>),
-    Function(FunctionBody),
 }
 
+impl EntityRef {
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Worldspawn)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionRef {
+    /// A reference to a function that is statically known by QuakeC
+    Ptr(Ptr),
+    /// An inline reference to an external function.
+    Extern(ExternFn),
+}
+
+pub enum FunctionKind {
+    QuakeC(QuakeCFunctionDef),
+    Extern(ExternFn),
+}
+
+impl FunctionRef {
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Ptr(Ptr::Id(0)))
+    }
+}
+
+impl Default for FunctionRef {
+    fn default() -> Self {
+        Self::Ptr(Ptr::Id(0))
+    }
+}
+
+/// Separate type from `Ref` in order to prevent them being confused, as the `Arc<CStr>` variant
+/// of `StringRef` is not the name, it's the actual value.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StringRef {
+    Id(i32),
+    Temp(Arc<CStr>),
+}
+
+impl From<i32> for StringRef {
+    fn from(value: i32) -> Self {
+        Self::Id(value)
+    }
+}
+
+impl From<Arc<CStr>> for StringRef {
+    fn from(value: Arc<CStr>) -> Self {
+        Self::Temp(value)
+    }
+}
+
+impl Default for StringRef {
+    fn default() -> Self {
+        Self::Id(0)
+    }
+}
+
+impl StringRef {
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Id(0))
+    }
+}
+
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct GlobalPtr(pub Ptr);
+
+impl Deref for GlobalPtr {
+    type Target = Ptr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct FieldPtr(pub Ptr);
+
+impl Deref for FieldPtr {
+    type Target = Ptr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Default, Clone, Debug, PartialEq)]
+pub enum ScalarKind {
+    /// This can be converted to any of the other values, as it is just a general "0".
+    #[default]
+    Void,
+    /// For all other variants,
+    Float(f32),
+    Entity(EntityRef),
+    String(StringRef),
+    Function(FunctionRef),
+    Global(Ptr),
+    Field(Ptr),
+}
+
+impl From<bool> for ScalarKind {
+    fn from(value: bool) -> Self {
+        if value {
+            Self::Float(1.)
+        } else {
+            Self::Float(0.)
+        }
+    }
+}
+
+impl From<f32> for ScalarKind {
+    fn from(value: f32) -> Self {
+        Self::Float(value)
+    }
+}
+
+impl TryFrom<ScalarKind> for f32 {
+    type Error = ScalarCastError;
+
+    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+        match value {
+            ScalarKind::Void => Ok(Default::default()),
+            ScalarKind::Float(f) => Ok(f),
+            _ => Err(ScalarCastError {
+                expected: ScalarType::Float,
+                found: value.type_(),
+            }),
+        }
+    }
+}
+
+impl TryFrom<ScalarKind> for FunctionRef {
+    type Error = ScalarCastError;
+
+    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+        match value {
+            ScalarKind::Void => Ok(Default::default()),
+            ScalarKind::Function(f) => Ok(f),
+            _ => Err(ScalarCastError {
+                expected: ScalarType::Function,
+                found: value.type_(),
+            }),
+        }
+    }
+}
+
+impl TryFrom<ScalarKind> for EntityRef {
+    type Error = ScalarCastError;
+
+    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+        match value {
+            ScalarKind::Void => Ok(Default::default()),
+            ScalarKind::Entity(f) => Ok(f),
+            _ => Err(ScalarCastError {
+                expected: ScalarType::Entity,
+                found: value.type_(),
+            }),
+        }
+    }
+}
+
+impl TryFrom<ScalarKind> for StringRef {
+    type Error = ScalarCastError;
+
+    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+        match value {
+            ScalarKind::Void => Ok(Default::default()),
+            ScalarKind::String(f) => Ok(f),
+            _ => Err(ScalarCastError {
+                expected: ScalarType::String,
+                found: value.type_(),
+            }),
+        }
+    }
+}
+
+impl TryFrom<ScalarKind> for GlobalPtr {
+    type Error = ScalarCastError;
+
+    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+        match value {
+            ScalarKind::Void => Ok(Default::default()),
+            ScalarKind::Global(p) => Ok(GlobalPtr(p)),
+            _ => Err(ScalarCastError {
+                expected: ScalarType::String,
+                found: value.type_(),
+            }),
+        }
+    }
+}
+
+impl TryFrom<ScalarKind> for FieldPtr {
+    type Error = ScalarCastError;
+
+    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+        match value {
+            ScalarKind::Void => Ok(Default::default()),
+            ScalarKind::Field(p) => Ok(FieldPtr(p)),
+            _ => Err(ScalarCastError {
+                expected: ScalarType::String,
+                found: value.type_(),
+            }),
+        }
+    }
+}
+
+const _: () = {
+    // TODO: This is too big, `ExternFn` is bloating the size of this type.
+    assert!(std::mem::size_of::<ScalarKind>() == 32);
+};
+
+impl ScalarKind {
+    pub fn is_null(&self) -> bool {
+        match self {
+            ScalarKind::Void => true,
+            ScalarKind::Float(f) => *f != 0.,
+            ScalarKind::Entity(entity_ref) => entity_ref.is_null(),
+            ScalarKind::String(string_ref) => string_ref.is_null(),
+            ScalarKind::Function(function_ref) => function_ref.is_null(),
+            ScalarKind::Global(ptr) => ptr.is_null(),
+            ScalarKind::Field(ptr) => ptr.is_null(),
+        }
+    }
+
+    pub fn type_(&self) -> ScalarType {
+        match self {
+            ScalarKind::Void => ScalarType::Void,
+            ScalarKind::Float(_) => ScalarType::Float,
+            ScalarKind::Entity(_) => ScalarType::Entity,
+            ScalarKind::String(_) => ScalarType::String,
+            ScalarKind::Function(_) => ScalarType::Function,
+            ScalarKind::Global(_) => ScalarType::GlobalRef,
+            ScalarKind::Field(_) => ScalarType::FieldRef,
+        }
+    }
+
+    pub fn try_from_bytes(ty: ScalarType, bytes: [u8; 4]) -> anyhow::Result<Self> {
+        match ty {
+            ScalarType::Void => {
+                if bytes == [0; 4] {
+                    Ok(ScalarKind::Void)
+                } else {
+                    Err(anyhow::Error::msg("`void` can only be initialized with 0"))
+                }
+            }
+            ScalarType::Float => Ok(ScalarKind::Float(f32::from_le_bytes(bytes))),
+            ScalarType::String => Ok(ScalarKind::String(StringRef::Id(i32::from_le_bytes(bytes)))),
+            ScalarType::Entity => {
+                if bytes == [0; 4] {
+                    Ok(ScalarKind::Entity(EntityRef::Worldspawn))
+                } else {
+                    Err(anyhow::Error::msg(
+                        "Cannot literally initialise an entity to any value other than worldspawn (no entities have been spawned at load-time)",
+                    ))
+                }
+            }
+            ScalarType::Function => Ok(ScalarKind::Function(FunctionRef::Ptr(Ptr::Id(
+                i32::from_le_bytes(bytes),
+            )))),
+
+            ScalarType::FieldRef => Ok(ScalarKind::Field(Ptr::Id(
+                i32::from_le_bytes(bytes).try_into()?,
+            ))),
+            ScalarType::GlobalRef => Ok(ScalarKind::Global(Ptr::Id(
+                i32::from_le_bytes(bytes).try_into()?,
+            ))),
+        }
+    }
+}
+
+pub enum ValueKind {
+    Scalar(ScalarKind),
+    /// The only value in QuakeC that can be more than 32 bits (logically 32 bits, `Scalar` is larger
+    /// because it's not just indices) is a vector of floats. This can only exist "ephemerally", as
+    /// all values stored to/from stack or globals are ultimately scalars.
+    Vector([f32; 3]),
+}
+
+impl ValueKind {
+    pub fn type_(&self) -> Type {
+        match self {
+            Self::Scalar(scalar) => Type::Scalar(scalar.type_()),
+            Self::Vector(_) => Type::Vector,
+        }
+    }
+}
+
+pub struct Value {
+    /// Many QuakeC types are relative to the worldspawn or require the id->global map. We should not need to
+    /// pass the worldspawn around everywhere, so we use `ValueKind`/`ScalarKind` internally, when we know
+    /// what our references are relative to.
+    worldspawn: Entity,
+    kind: ValueKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, snafu::Snafu)]
+pub struct ScalarCastError {
+    pub expected: ScalarType,
+    pub found: ScalarType,
+}
+
+/// Marker component that an entity can be referenced by QuakeC. Partially to
+/// support `bevy_mod_scripting::ReflectReference` (which requires a component type)
+/// but also to make it more explicit which entities can be referenced by QuakeC
+/// since most entities will not return anything useful.
 #[derive(Component, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Reflect)]
 struct QuakeCEntity;
 
-impl FromScript for Value {
-    type This<'w> = Value;
+impl FromScript for ScalarKind {
+    type This<'w> = ScalarKind;
 
     fn from_script(
         value: ScriptValue,
@@ -518,16 +926,22 @@ impl FromScript for Value {
         Self: Sized,
     {
         match value {
-            ScriptValue::Unit => Ok(Value::Void),
-            ScriptValue::Bool(v) => Ok(Value::Float(if v { 1. } else { 0. })),
-            ScriptValue::Integer(i) => Ok(Value::Float(i as f32)),
-            ScriptValue::Float(f) => Ok(Value::Float(f as f32)),
-            ScriptValue::String(cow) => Ok(Value::String(cow.into())),
+            ScriptValue::Unit => Ok(ScalarKind::Void),
+            ScriptValue::Bool(v) => Ok(ScalarKind::Float(if v { 1. } else { 0. })),
+            ScriptValue::Integer(i) => Ok(ScalarKind::Float(i as f32)),
+            ScriptValue::Float(f) => Ok(ScalarKind::Float(f as f32)),
+            ScriptValue::String(cow) => {
+                let mut bytes = cow.into_owned().into_bytes();
+                bytes.push(0);
+                // This can only fail if the input has internal null.
+                let cstring = CString::from_vec_with_nul(bytes).unwrap();
+                Ok(ScalarKind::String(StringRef::Temp(cstring.into())))
+            }
             ScriptValue::List(script_values) => {
                 if script_values.is_empty() {
-                    Ok(Value::Void)
+                    Ok(ScalarKind::Void)
                 } else if script_values.len() == 1 {
-                    Value::from_script(script_values[0], world)
+                    ScalarKind::from_script(script_values[0].clone(), world)
                 } else {
                     Err(InteropError::TypeMismatch {
                         expected: TypeId::of::<Self>().into(),
@@ -540,18 +954,24 @@ impl FromScript for Value {
                 got: Some(TypeId::of::<HashMap<String, ScriptValue>>()).into(),
             }),
 
-            ScriptValue::Reference(reference @ ReflectReference {
-                base:
-                    ReflectBaseType {
-                        base_id: ReflectBase::Component(ent, c_id),
-                        ..
-                    },
-                ..
-            }) => {
-                if c_id == world.get_component_id(TypeId::of::<QuakeCEntity>())?.unwrap() {
-                    Ok(Value::Entity(ent))
+            ScriptValue::Reference(
+                reference @ ReflectReference {
+                    base:
+                        ReflectBaseType {
+                            base_id: ReflectBase::Component(ent, c_id),
+                            ..
+                        },
+                    ..
+                },
+            ) => {
+                if c_id
+                    == world
+                        .get_component_id(TypeId::of::<QuakeCEntity>())?
+                        .unwrap()
+                {
+                    Ok(ScalarKind::Entity(EntityRef::Entity(ent)))
                 } else if c_id == world.get_component_id(TypeId::of::<QuakeCVm>())?.unwrap() {
-                    Ok(Value::Void)
+                    Ok(ScalarKind::Void)
                 } else {
                     Err(InteropError::TypeMismatch {
                         expected: TypeId::of::<Self>().into(),
@@ -559,10 +979,16 @@ impl FromScript for Value {
                     })
                 }
             }
-            ScriptValue::Function(function) => Ok(Value::Function(FunctionBody::Builtin(function))),
-            ScriptValue::FunctionMut(function) => {
-                Ok(Value::Function(FunctionBody::BuiltinMut(function)))
-            }
+            ScriptValue::Reference(reference) => Err(InteropError::TypeMismatch {
+                expected: TypeId::of::<Self>().into(),
+                got: reference.type_id_of(TypeIdSource::Tail, world)?.into(),
+            }),
+            ScriptValue::Function(function) => Ok(ScalarKind::Function(FunctionRef::Extern(
+                ExternFn::Ref(function),
+            ))),
+            ScriptValue::FunctionMut(function) => Ok(ScalarKind::Function(FunctionRef::Extern(
+                ExternFn::Mut(function),
+            ))),
             ScriptValue::Error(err) => Err(err),
         }
     }
@@ -570,321 +996,13 @@ impl FromScript for Value {
 
 impl IntoScript for Value {
     fn into_script(self, world: WorldGuard<'_>) -> Result<ScriptValue, InteropError> {
-        match self {
-            Value::Void => Ok(ScriptValue::Unit),
-            Value::Float(f) => Ok(ScriptValue::Float(f as f64)),
-            Value::Entity(e) => todo!(),
-            Value::String(_) => todo!(),
-            Value::Function(_) => todo!(),
-        }
-    }
-}
+        // let type_id = TypeId::of::<QuakeCEntity>();
+        // let component_id = world.get_component_id(type_id)?.ok_or(
+        //     InteropError::UnregisteredComponentOrResourceType {
+        //         type_name: Cow::from(std::any::type_name::<QuakeCEntity>()).into(),
+        //     },
+        // )?;
 
-enum CowMut<'a, T> {
-    Owned(T),
-    Borrowed(&'a mut T),
-}
-
-/// A QuakeC VM context.
-#[derive(Debug)]
-pub struct ExecutionContext<'a, Runaway: ?Sized = usize> {
-    function: FunctionDef,
-    call_stack_depth: u16,
-    backtrace: Option<&'a ExecutionContext<'a, dyn Any>>,
-    runaway: Runaway,
-}
-
-impl ExecutionContext<'static> {
-    pub fn new(function: FunctionDef) -> anyhow::Result<Self> {
-        Ok(ExecutionContext {
-            function,
-            call_stack_depth: 0,
-            backtrace: None,
-            runaway: 10000,
-        })
-    }
-}
-
-impl<R> ExecutionContext<'_, R> where R: 'static + AsMut<usize> {
-    pub fn backtrace(&self) -> impl Iterator<Item = &'_ FunctionDef> + '_ {
-        std::iter::successors(Some(self as &ExecutionContext<dyn Any>), |cur| cur.backtrace).map(|frame| &frame.function)
-    }
-
-    pub fn print_backtrace(&self, force: bool) {
-        let backtrace_var =
-            std::env::var("RUST_LIB_BACKTRACE").or_else(|_| std::env::var("RUST_BACKTRACE"));
-        let backtrace_enabled = matches!(backtrace_var.as_deref(), Err(_) | Ok("0"));
-        if force || backtrace_enabled {
-            for (depth, def) in self.backtrace().enumerate() {
-                // TODO: More info about the function (e.g. builtin vs internal)
-                println!("{}: {}", depth, def.name());
-            }
-        }
-    }
-
-    pub fn execute(&mut self, vm: QuakeCVmRef<'_>) -> anyhow::Result<Value> {
-        use Opcode as O;
-
-        let function = match &self.function {
-            FunctionDef::Progs(func) => func,
-            _ => todo!(),
-        };
-
-        let mut instruction: isize = 0;
-
-        loop {
-            *self.runaway.as_mut() -= 1;
-
-            if *self.runaway.as_mut() == 0 {
-                self.print_backtrace(false);
-                return Err(ProgsError::LocalStackOverflow {
-                    backtrace: Backtrace::capture(),
-                }
-                .into());
-            }
-
-            let statement = function.body[instruction as usize];
-            let op = statement.opcode;
-            let a = statement.arg1;
-            let b = statement.arg2;
-            let c = statement.arg3;
-
-            debug!("{:<12} {:>5} {:>5} {:>5}", op.to_string(), a, b, c);
-
-            match op {
-                // Control flow ================================================
-                O::If => {
-                    let cond = vm.globals.get_int(a)? != 0;
-                    debug!("{op}: cond == {cond}");
-
-                    if cond {
-                        instruction += b as isize;
-                        continue;
-                    }
-                }
-
-                O::IfNot => {
-                    let cond = vm.globals.get_int(a)? != 0;
-                    debug!("{op}: cond != {cond}");
-
-                    if !cond {
-                        instruction += b as isize;
-                        continue;
-                    }
-                }
-
-                O::Goto => {
-                    instruction += a as isize;
-                    continue;
-                }
-
-                O::Call0
-                | O::Call1
-                | O::Call2
-                | O::Call3
-                | O::Call4
-                | O::Call5
-                | O::Call6
-                | O::Call7
-                | O::Call8 => {
-                    let f_to_call = vm.globals.get_function_id(a)?;
-
-                    if f_to_call.0 == 0 {
-                        return Err(ProgsError::with_msg("NULL function").into());
-                    }
-
-                    let Ok(def) = vm.functions.get(f_to_call) else {
-                        return Err(ProgsError::with_msg("NULL function").into());
-                    };
-
-                    debug!("Calling function {f_to_call}");
-
-                    let called_with_args = op as usize - O::Call0 as usize;
-                    if def.argc != called_with_args {
-                        /// Seemingly `droptofloor` is defined with 2 args in the quakec defs
-                        /// but every example I can find calls it with 0 args and the
-                        /// implementation ignores any extra args. To prevent spamming the
-                        /// console with warnings, we ignore arg count mismatches for this
-                        /// function.
-                        const HACK_IGNORE_MISMATCH: &[&[u8]] = &[b"droptofloor"];
-
-                        let func_name = self.string_table.get(name_id).unwrap();
-                        if !HACK_IGNORE_MISMATCH.contains(&&*func_name) {
-                            self.cx.print_backtrace(&self.string_table, false);
-                            warn!(
-                                "Arg count mismatch calling {}: expected {}, found {}",
-                                func_name, def.argc, called_with_args,
-                            );
-                        }
-                    }
-
-                    if let FunctionKind::BuiltIn(b) = def.kind {
-                        self.enter_builtin(b, registry.reborrow(), vfs)?;
-                        debug!(
-                            "Returning from built-in function {}",
-                            self.string_table.get(name_id).unwrap()
-                        );
-                    } else {
-                        self.cx
-                            .enter_function(&self.string_table, &mut vm.globals, f_to_call)?;
-                        continue;
-                    }
-                }
-
-                O::Done | O::Return => self.op_return(a, b, c)?,
-
-                O::MulF => vm.globals.op_mul_f(a, b, c)?,
-                O::MulV => vm.globals.op_mul_v(a, b, c)?,
-                O::MulFV => vm.globals.op_mul_fv(a, b, c)?,
-                O::MulVF => vm.globals.op_mul_vf(a, b, c)?,
-                O::Div => vm.globals.op_div(a, b, c)?,
-                O::AddF => vm.globals.op_add_f(a, b, c)?,
-                O::AddV => vm.globals.op_add_v(a, b, c)?,
-                O::SubF => vm.globals.op_sub_f(a, b, c)?,
-                O::SubV => vm.globals.op_sub_v(a, b, c)?,
-                O::EqF => vm.globals.op_eq_f(a, b, c)?,
-                O::EqV => vm.globals.op_eq_v(a, b, c)?,
-                O::EqS => vm.globals.op_eq_s(&self.string_table, a, b, c)?,
-                O::EqEnt => vm.globals.op_eq_ent(a, b, c)?,
-                O::EqFnc => vm.globals.op_eq_fnc(a, b, c)?,
-                O::NeF => vm.globals.op_ne_f(a, b, c)?,
-                O::NeV => vm.globals.op_ne_v(a, b, c)?,
-                O::NeS => vm.globals.op_ne_s(&self.string_table, a, b, c)?,
-                O::NeEnt => vm.globals.op_ne_ent(a, b, c)?,
-                O::NeFnc => vm.globals.op_ne_fnc(a, b, c)?,
-                O::Le => vm.globals.op_le(a, b, c)?,
-                O::Ge => vm.globals.op_ge(a, b, c)?,
-                O::Lt => vm.globals.op_lt(a, b, c)?,
-                O::Gt => vm.globals.op_gt(a, b, c)?,
-                O::LoadF => self.op_load_f(a, b, c)?,
-                O::LoadV => self.op_load_v(a, b, c)?,
-                O::LoadS => self.op_load_s(a, b, c)?,
-                O::LoadEnt => self.op_load_ent(a, b, c)?,
-                O::LoadFld => panic!("load_fld not implemented"),
-                O::LoadFnc => self.op_load_fnc(a, b, c)?,
-                O::Address => self.op_address(a, b, c)?,
-                O::StoreF => vm.globals.op_store_f(a, b, c)?,
-                O::StoreV => vm.globals.op_store_v(a, b, c)?,
-                O::StoreS => vm.globals.op_store_s(a, b, c)?,
-                O::StoreEnt => vm.globals.op_store_ent(a, b, c)?,
-                O::StoreFld => vm.globals.op_store_fld(a, b, c)?,
-                O::StoreFnc => vm.globals.op_store_fnc(a, b, c)?,
-                O::StorePF => self.op_storep_f(a, b, c)?,
-                O::StorePV => self.op_storep_v(a, b, c)?,
-                O::StorePS => self.op_storep_s(a, b, c)?,
-                O::StorePEnt => self.op_storep_ent(a, b, c)?,
-                O::StorePFld => panic!("storep_fld not implemented"),
-                O::StorePFnc => self.op_storep_fnc(a, b, c)?,
-                O::NotF => vm.globals.op_not_f(a, b, c)?,
-                O::NotV => vm.globals.op_not_v(a, b, c)?,
-                O::NotS => vm.globals.op_not_s(a, b, c)?,
-                O::NotEnt => vm.globals.op_not_ent(a, b, c)?,
-                O::NotFnc => vm.globals.op_not_fnc(a, b, c)?,
-                O::And => vm.globals.op_and(a, b, c)?,
-                O::Or => vm.globals.op_or(a, b, c)?,
-                O::BitAnd => vm.globals.op_bit_and(a, b, c)?,
-                O::BitOr => vm.globals.op_bit_or(a, b, c)?,
-
-                O::State => self.op_state(a, b, c)?,
-            }
-
-            // Increment program counter.
-            self.cx.jump_relative(1);
-            }
-            }
-
-    pub fn enter_function(
-        &mut self,
-    ) -> anyhow::Result<ExecutionContext<'_>> {
-        let def = self.functions.get_def(f)?;
-        debug!(
-            "Calling QuakeC function {}",
-            string_table.get(def.name_id).unwrap()
-        );
-
-        let backtrace = self.backtrace.push(StackFrame {
-            func: 
-            func_id: self.current_function,
-        });
-
-        // check call stack overflow
-        if self.backtrace.len() >= MAX_CALL_STACK_DEPTH {
-            return Err(ProgsError::CallStackOverflow {
-                backtrace: Backtrace::capture(),
-            });
-        }
-
-        // preemptively check local stack overflow
-        if self.locals.len() + def.locals > MAX_LOCAL_STACK_DEPTH {
-            return Err(ProgsError::LocalStackOverflow {
-                backtrace: Backtrace::capture(),
-            });
-        }
-
-        // save locals to stack
-        for i in 0..def.locals {
-            self.locals
-                .push(globals.get_bytes((def.arg_start + i) as i16)?);
-        }
-
-        let mut dest = def.arg_start;
-        for arg in 0..def.argc {
-            for component in 0..def.argsz[arg] as usize {
-                let val = globals.get_bytes((GLOBAL_ADDR_ARG_0 + arg * 3 + component) as i16)?;
-                globals.put_bytes(val, dest as i16)?;
-                dest += 1;
-            }
-        }
-
-        self.function = f;
-
-        match def.kind {
-            FunctionKind::BuiltIn(_) => {
-                panic!("built-in functions should not be called with enter_function()")
-            }
-            FunctionKind::QuakeC(pc) => self.pc = pc,
-        }
-
-        Ok(())
-    }
-
-    pub fn leave_function(
-        &mut self,
-        string_table: &StringTable,
-        globals: &mut Globals,
-    ) -> Result<()> {
-        let def = self.functions.get_def(self.function)?;
-        debug!(
-            "Returning from QuakeC function {}",
-            string_table.get(def.name_id).unwrap()
-        );
-
-        for i in (0..def.locals).rev() {
-            globals.put_bytes(
-                self.locals
-                    .pop()
-                    .ok_or_else(|| ProgsError::with_msg("local stack underflow"))?,
-                (def.arg_start + i) as i16,
-            )?;
-        }
-
-        let frame = self
-            .backtrace
-            .pop()
-            .ok_or_else(|| ProgsError::with_msg("call stack underflow"))?;
-
-        self.function = frame.func_id;
-        self.pc = frame.instr_id;
-
-        Ok(())
-    }
-
-    pub fn load_statement(&self) -> Statement {
-        self.functions.statements[self.pc].clone()
-    }
-
-    /// Performs an unconditional relative jump.
-    pub fn jump_relative(&mut self, rel: i16) {
-        self.pc = (self.pc as isize + rel as isize) as usize;
+        todo!()
     }
 }

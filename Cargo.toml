@@ -9,6 +9,7 @@ repository = "https://github.com/eira-fransham/bevy_mod_scripting_quakec"
 
 [dependencies]
 anyhow = "1.0"
+arc-slice = { version = "0.1", features = ["default-layout-any-buffer"] }
 arrayvec = "0.7"
 bevy_ecs = "0.16"
 bevy_asset = "0.16"
@@ -21,10 +22,19 @@ bevy_mod_scripting_core = "0.16"
 bevy_mod_scripting_display = "0.16"
 bevy_mod_scripting_bindings = "0.16"
 bevy_mod_scripting_asset = "0.16"
+bimap = "0.6"
+bitflags = "2.10"
+bump-scope = "1.4"
 byteorder = "1.5"
 hashbrown = "0.16"
 indexmap = "2.11"
+itertools = "0.14"
 num = "0.4"
 num-traits = "0.2"
 num-derive = "0.4"
 snafu = "0.8"
+strum = { version = "0.27", features = ["derive"] }
+
+[features]
+default = ["quake1"]
+quake1 = []
