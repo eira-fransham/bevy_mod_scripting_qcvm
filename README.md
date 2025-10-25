@@ -13,5 +13,5 @@ language such as Lua. This may sound like a strange goal to have, but there are 
 - Transparent multi-variant support: FTEQW-only mods, Darkplaces-only mods and mods for some strange
   variant I haven't even heard of should be supportable without changing the core engine.
 - Runtime redefinition: As Seismon is designed for hackability and moddability, it should be trivial
-  to change things about the engine on-the-fly, and for mods to override functionaliy that would
+  to change things about the engine on-the-fly, and for mods to override functionality that would
   usually require engine changes.
