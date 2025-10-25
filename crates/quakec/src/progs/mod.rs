@@ -5,28 +5,20 @@ use std::{
     cmp::Ordering,
     ffi::CStr,
     fmt,
-    io::{Read, Seek, SeekFrom},
-    ops::{Deref, Range},
+    ops::Deref,
     sync::Arc,
 };
 
-use arc_slice::ArcSlice;
-use arrayvec::ArrayVec;
 #[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
-use byteorder::{LittleEndian, ReadBytesExt};
 use glam::Vec3;
 use hashbrown::HashMap;
 use num::FromPrimitive;
 use num_derive::FromPrimitive;
-use tracing::debug;
 
 use crate::{
-    entity::{EntityTypeDef, ScalarFieldDef},
-    progs::{
-        functions::{ArgSize, FunctionRegistry, MAX_ARGS, QuakeCFunctionDef, Statement},
-        globals::GlobalRegistry,
-    },
+    entity::ScalarFieldDef,
+    progs::functions::QuakeCFunctionDef,
     userdata::{ErasedBuiltin, ErasedEntity},
 };
 
@@ -73,6 +65,7 @@ impl StringTable {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Default)]
 pub struct Ptr(pub(crate) i32);
 
 impl fmt::Display for Ptr {
@@ -81,11 +74,6 @@ impl fmt::Display for Ptr {
     }
 }
 
-impl Default for Ptr {
-    fn default() -> Self {
-        Self(0)
-    }
-}
 
 impl Ptr {
     pub const NULL: Self = Self(0);
