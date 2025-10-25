@@ -49,8 +49,8 @@ impl From<::std::io::Error> for EntityError {
 }
 
 #[derive(Clone, Debug)]
-pub struct FieldInfo {
-    pub names: FieldName,
+pub struct ScalarFieldInfo {
+    pub name: FieldName,
     pub offset: u16,
     /// The type of the field.
     pub type_: ScalarType,
@@ -58,8 +58,8 @@ pub struct FieldInfo {
 
 #[derive(Clone, Debug)]
 pub struct EntityTypeDef {
-    fields: Arc<[Option<FieldInfo>]>,
-    offsets: HashMap<Arc<CStr>, usize>,
+    fields: Arc<[Option<ScalarFieldInfo>]>,
+    offsets: HashMap<Arc<CStr>, Ptr>,
 }
 
 impl EntityTypeDef {
@@ -75,14 +75,8 @@ impl EntityTypeDef {
         self.fields.len()
     }
 
-    pub fn get(&self, field_ref: Ptr) -> anyhow::Result<FieldInfo> {
-        let offset: usize = match field_ref {
-            Ptr::Id(idx) => idx.try_into()?,
-            Ptr::Name(name) => *self
-                .offsets
-                .get(&name)
-                .ok_or_else(|| anyhow::Error::msg(format!("No field with the name {name:?}")))?,
-        };
+    pub fn get(&self, field_ref: Ptr) -> anyhow::Result<ScalarFieldInfo> {
+        let offset: usize = field_ref.0.try_into()?;
 
         self.fields
             .get(offset)

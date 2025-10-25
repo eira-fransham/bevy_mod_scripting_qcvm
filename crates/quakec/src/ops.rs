@@ -1,17 +1,17 @@
-use bevy_log::debug;
-use bevy_math::Vec3;
+#[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
+use glam::Vec3;
 use num_derive::FromPrimitive;
 use std::{fmt, num::NonZeroIsize};
+use tracing::debug;
 
 use crate::{
     ExecutionCtx, OpResult,
-    progs::{
-        EntityRef, FieldPtr, FunctionRef, ScalarKind, StringRef, functions::Statement,
-    },
+    progs::{EntityRef, FieldPtr, FunctionRef, Scalar, StringRef, functions::Statement},
 };
 
-#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Reflect)]
+#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq)]
+#[cfg_attr(feature = "reflect", derive(Reflect))]
 #[repr(i16)]
 pub enum Opcode {
     Done = 0,
@@ -280,7 +280,7 @@ impl ExecutionCtx<'_> {
     }
 
     pub fn op_if(&mut self, a: i16, b: i16, _c: i16) -> anyhow::Result<OpResult> {
-        let cond = !self.get::<_, ScalarKind>(a)?.is_null();
+        let cond = !self.get::<_, Scalar>(a)?.is_null();
         // debug!("{op}: cond == {cond}");
 
         if cond {
@@ -293,7 +293,7 @@ impl ExecutionCtx<'_> {
     }
 
     pub fn op_if_not(&mut self, a: i16, b: i16, _c: i16) -> anyhow::Result<OpResult> {
-        let cond = !self.get::<_, ScalarKind>(a)?.is_null();
+        let cond = !self.get::<_, Scalar>(a)?.is_null();
         // debug!("{op}: cond == {cond}");
 
         if cond {
@@ -311,10 +311,10 @@ impl ExecutionCtx<'_> {
         )?))
     }
 
-    pub fn op_return(&mut self, a: i16, b: i16, c: i16) -> anyhow::Result<[ScalarKind; 3]> {
-        let val1: ScalarKind = self.get(a).unwrap_or_default();
-        let val2: ScalarKind = self.get(b).unwrap_or_default();
-        let val3: ScalarKind = self.get(c).unwrap_or_default();
+    pub fn op_return(&mut self, a: i16, b: i16, c: i16) -> anyhow::Result<[Scalar; 3]> {
+        let val1: Scalar = self.get(a).unwrap_or_default();
+        let val2: Scalar = self.get(b).unwrap_or_default();
+        let val3: Scalar = self.get(c).unwrap_or_default();
 
         Ok([val1, val2, val3])
     }
@@ -496,11 +496,10 @@ impl ExecutionCtx<'_> {
         map: F,
     ) -> anyhow::Result<()>
     where
-        ScalarKind: TryInto<T>,
-        <ScalarKind as TryInto<T>>::Error:
-            snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        Scalar: TryInto<T>,
+        <Scalar as TryInto<T>>::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
         F: FnOnce(T, T) -> O,
-        O: Into<ScalarKind>,
+        O: Into<Scalar>,
     {
         let val1: T = self.get(ptr1)?;
         let val2: T = self.get(ptr2)?;
@@ -590,9 +589,8 @@ impl ExecutionCtx<'_> {
 
     fn scalar_eq<T>(&mut self, ptr1: i16, ptr2: i16, out_ptr: i16) -> anyhow::Result<()>
     where
-        ScalarKind: TryInto<T>,
-        <ScalarKind as TryInto<T>>::Error:
-            snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        Scalar: TryInto<T>,
+        <Scalar as TryInto<T>>::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
         T: PartialEq,
     {
         self.scalar_binop(ptr1, ptr2, out_ptr, |a: T, b: T| a == b)
@@ -642,9 +640,8 @@ impl ExecutionCtx<'_> {
 
     fn scalar_ne<T>(&mut self, ptr1: i16, ptr2: i16, out_ptr: i16) -> anyhow::Result<()>
     where
-        ScalarKind: TryInto<T>,
-        <ScalarKind as TryInto<T>>::Error:
-            snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+        Scalar: TryInto<T>,
+        <Scalar as TryInto<T>>::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
         T: PartialEq,
     {
         self.scalar_binop(ptr1, ptr2, out_ptr, |a: T, b: T| a != b)
@@ -711,7 +708,7 @@ impl ExecutionCtx<'_> {
     }
 
     fn copy(&mut self, src_ptr: i16, dst_ptr: i16) -> anyhow::Result<()> {
-        self.set(dst_ptr, self.get::<_, ScalarKind>(src_ptr)?)
+        self.set(dst_ptr, self.get::<_, Scalar>(src_ptr)?)
     }
 
     // STORE_F
@@ -767,7 +764,7 @@ impl ExecutionCtx<'_> {
     }
 
     fn not(&mut self, ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
-        self.set(out_ptr, self.get::<_, ScalarKind>(ptr)?.is_null())
+        self.set(out_ptr, self.get::<_, Scalar>(ptr)?.is_null())
     }
 
     // NOT_V: Compare vec to { 0.0, 0.0, 0.0 }
@@ -821,14 +818,14 @@ impl ExecutionCtx<'_> {
 
     // AND: Logical AND
     pub fn op_and(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
-        self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: ScalarKind, b: ScalarKind| {
+        self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: Scalar, b: Scalar| {
             !a.is_null() && !b.is_null()
         })
     }
 
     // OR: Logical OR
     pub fn op_or(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
-        self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: ScalarKind, b: ScalarKind| {
+        self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: Scalar, b: Scalar| {
             !a.is_null() || !b.is_null()
         })
     }

@@ -7,34 +7,40 @@ license = "GPL-2.0"
 homepage = "https://github.com/eira-fransham/bevy_mod_scripting_quakec"
 repository = "https://github.com/eira-fransham/bevy_mod_scripting_quakec"
 
-[dependencies]
+[workspace]
+members = ["crates/quakec"]
+
+[workspace.dependencies]
 anyhow = "1.0"
-arc-slice = { version = "0.1", features = ["default-layout-any-buffer"] }
+arc-slice = "0.1" 
 arrayvec = "0.7"
-bevy_ecs = "0.16"
-bevy_asset = "0.16"
-bevy_app = "0.16"
-bevy_log = "0.16"
-bevy_math = "0.16"
-bevy_platform = "0.16"
-bevy_reflect = "0.16"
-bevy_mod_scripting_core = "0.16"
-bevy_mod_scripting_display = "0.16"
-bevy_mod_scripting_bindings = "0.16"
-bevy_mod_scripting_asset = "0.16"
 bimap = "0.6"
 bitflags = "2.10"
 bump-scope = "1.4"
 byteorder = "1.5"
 hashbrown = "0.16"
+glam = "^0.30"
 indexmap = "2.11"
 itertools = "0.14"
 num = "0.4"
 num-traits = "0.2"
 num-derive = "0.4"
 snafu = "0.8"
-strum = { version = "0.27", features = ["derive"] }
+strum = "0.27" 
+tracing = "^0.1"
 
-[features]
-default = ["quake1"]
-quake1 = []
+bevy_reflect = "0.17"
+
+[dependencies]
+bevy_ecs = "0.17"
+bevy_asset = "0.17"
+bevy_app = "0.17"
+bevy_log = "0.17"
+bevy_math = "0.17"
+bevy_platform = "0.17"
+
+# Pending update to 0.17
+# bevy_mod_scripting_core = "0.16"
+# bevy_mod_scripting_display = "0.16"
+# bevy_mod_scripting_bindings = "0.16"
+# bevy_mod_scripting_asset = "0.16"

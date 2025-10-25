@@ -3,7 +3,7 @@ use std::{fmt, ops::Range, sync::Arc};
 
 use arc_slice::ArcSlice;
 use arrayvec::ArrayVec;
-use bevy_mod_scripting_bindings::{DynamicScriptFunction, DynamicScriptFunctionMut};
+#[cfg(feature = "reflect")]
 use bevy_reflect::{Reflect, reflect_remote};
 use bump_scope::{BumpAllocatorScopeExt, FixedBumpVec};
 use hashbrown::HashMap;
@@ -11,12 +11,13 @@ use num::FromPrimitive as _;
 use num_derive::FromPrimitive;
 
 use crate::ops::Opcode;
-use crate::progs::{LoadFn, ProgsError, Ptr, ScalarKind};
+use crate::progs::{LoadFn, ProgsError, Scalar};
 use crate::{ARG_ADDRS, quake1};
 
 pub const MAX_ARGS: usize = 8;
 
-#[derive(Debug, Copy, Clone, Reflect)]
+#[derive(Debug, Copy, Clone)]
+#[cfg_attr(feature = "reflect", derive(Reflect))]
 pub struct Statement {
     pub opcode: Opcode,
     pub arg1: i16,
@@ -38,7 +39,8 @@ impl Statement {
     }
 }
 
-#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Reflect)]
+#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq)]
+#[cfg_attr(feature = "reflect", derive(Reflect))]
 #[repr(u8)]
 pub enum ArgSize {
     Scalar = 1,
@@ -56,15 +58,15 @@ impl std::fmt::Display for ArgSize {
 
 #[derive(Debug)]
 pub struct FunctionExecutionCtx<'a> {
-    arguments: FixedBumpVec<'a, ScalarKind>,
-    local_storage: FixedBumpVec<'a, ScalarKind>,
+    arguments: FixedBumpVec<'a, Scalar>,
+    local_storage: FixedBumpVec<'a, Scalar>,
     /// For now, all functions are stateless. This allows for easier debugging, as we can see what the function
     /// accessed while running. It also ensures that a function that ran with errors can have modifications to
     /// the global state rolled back. QuakeC has few enough globals that this is cheap (although this will
     /// likely need to be limited to only the globals defined in `progdefs.h` for maximum efficiency)
     ///
     /// > TODO: Should QuakeC be able to modify state at all?
-    delta: FixedBumpVec<'a, Option<ScalarKind>>,
+    delta: FixedBumpVec<'a, Option<Scalar>>,
     /// If the progs try to access a value within this range, it will access `local_storage` instead of globals.
     ///
     /// > TODO: We should only define globals at all if they are specified in the `progdefs.h` equivalent.
@@ -80,7 +82,7 @@ impl FunctionExecutionCtx<'_> {
             .ok_or_else(|| anyhow::Error::msg("Out-of-bounds instruction access"))?)
     }
 
-    pub fn get(&self, index: usize) -> anyhow::Result<Option<ScalarKind>> {
+    pub fn get(&self, index: usize) -> anyhow::Result<Option<Scalar>> {
         const LOCAL_STORAGE_ERR: &str =
             "Programmer error: `local_storage` was too small for `local_range`. This is a bug!";
 
@@ -101,11 +103,11 @@ impl FunctionExecutionCtx<'_> {
         }
     }
 
-    pub fn get_vector(&self, index: usize) -> anyhow::Result<[Option<ScalarKind>; 3]> {
+    pub fn get_vector(&self, index: usize) -> anyhow::Result<[Option<Scalar>; 3]> {
         Ok([self.get(index)?, self.get(index + 1)?, self.get(index + 2)?])
     }
 
-    pub fn set(&mut self, index: usize, value: ScalarKind) -> anyhow::Result<()> {
+    pub fn set(&mut self, index: usize, value: Scalar) -> anyhow::Result<()> {
         const LOCAL_STORAGE_ERR: &str =
             "Programmer error: `local_storage` was too small for `local_range`. This is a bug!";
         const ARG_STORAGE_ERR: &str =
@@ -135,20 +137,13 @@ impl FunctionExecutionCtx<'_> {
         Ok(())
     }
 
-    pub fn set_vector(&mut self, index: usize, values: [ScalarKind; 3]) -> anyhow::Result<()> {
+    pub fn set_vector(&mut self, index: usize, values: [Scalar; 3]) -> anyhow::Result<()> {
         for (offset, value) in values.into_iter().enumerate() {
             self.set(index + offset, value)?;
         }
 
         Ok(())
     }
-}
-
-#[reflect_remote(Vec<T>)]
-#[reflect(opaque)]
-#[derive(Clone)]
-struct ReflectVec<T: Clone> {
-    inner: Vec<T>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,11 +201,11 @@ impl QuakeCFunctionDef {
     ) -> FunctionExecutionCtx<'scope> {
         FunctionExecutionCtx {
             arguments: FixedBumpVec::from_iter_exact_in(
-                std::iter::repeat_n(ScalarKind::Void, ARG_ADDRS.len()),
+                std::iter::repeat_n(Scalar::Void, ARG_ADDRS.len()),
                 &mut alloc,
             ),
             local_storage: FixedBumpVec::from_iter_exact_in(
-                std::iter::repeat_n(ScalarKind::Void, self.body.locals.len()),
+                std::iter::repeat_n(Scalar::Void, self.body.locals.len()),
                 &mut alloc,
             ),
             delta: FixedBumpVec::from_iter_exact_in(
@@ -221,14 +216,6 @@ impl QuakeCFunctionDef {
             statements: self.body.statements.clone(),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Reflect)]
-pub enum ExternFn {
-    Ref(DynamicScriptFunction),
-    // TODO: What's the difference between `DynamicScriptFunctionMut` and `DynamicScriptFunctionMut`?
-    // They both require `&` to call.
-    Mut(DynamicScriptFunctionMut),
 }
 
 #[derive(Debug, Clone)]
@@ -283,14 +270,15 @@ impl FunctionRegistry {
         Ok(Self { by_index, by_name })
     }
 
-    pub fn get<F: Into<Ptr>>(&self, func: F) -> anyhow::Result<&FunctionDef> {
-        match func.into() {
-            Ptr::Id(id) => self.by_index.get(&id).ok_or_else(|| {
-                ProgsError::with_msg(format!("Function at index {id} does not exist")).into()
-            }),
-            Ptr::Name(name) => self.by_name.get(&name).ok_or_else(|| {
-                ProgsError::with_msg(format!("Function with name {:?} does not exist", name)).into()
-            }),
-        }
+    pub fn get<F>(&self, func: F) -> anyhow::Result<&FunctionDef>
+    where
+        F: TryInto<i32>,
+        F::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+    {
+        let func = func.try_into()?;
+
+        self.by_index
+            .get(&func)
+            .ok_or_else(|| ProgsError::with_msg(format!("Function {func} does not exist")).into())
     }
 }

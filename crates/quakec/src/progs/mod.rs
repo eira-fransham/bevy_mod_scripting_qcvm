@@ -2,10 +2,9 @@ pub mod functions;
 pub mod globals;
 
 use std::{
-    any::TypeId,
     backtrace::Backtrace,
     cmp::Ordering,
-    ffi::{CStr, CString},
+    ffi::CStr,
     fmt,
     io::{Read, Seek, SeekFrom},
     ops::{Deref, Range},
@@ -14,35 +13,26 @@ use std::{
 
 use arc_slice::ArcSlice;
 use arrayvec::ArrayVec;
-use bevy_ecs::{component::Component, entity::Entity};
-use bevy_log::debug;
-use bevy_mod_scripting_bindings::{
-    FromScript, InteropError, IntoScript, ReflectBase, ReflectBaseType, ReflectReference,
-    ScriptValue, TypeIdSource, WorldGuard,
-};
+#[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
 use byteorder::{LittleEndian, ReadBytesExt};
 use hashbrown::HashMap;
 use num::FromPrimitive;
 use num_derive::FromPrimitive;
 use snafu::Snafu;
+use tracing::debug;
 
 use crate::{
-    QuakeCVm,
-    entity::{EntityError, EntityTypeDef},
+    entity::{EntityError, EntityTypeDef, ScalarFieldInfo},
     progs::{
-        functions::{
-            ArgSize, ExternFn, FunctionRegistry, MAX_ARGS, QuakeCFunctionDef,
-            Statement,
-        },
+        functions::{ArgSize, FunctionRegistry, MAX_ARGS, QuakeCFunctionDef, Statement},
         globals::{GlobalRegistry, GlobalsError},
     },
+    userdata::{ErasedBuiltin, ErasedEntity},
 };
 
 const VERSION: i32 = 6;
 const CRC: i32 = 5927;
-const MAX_CALL_STACK_DEPTH: usize = 32;
-const MAX_LOCAL_STACK_DEPTH: usize = 2048;
 const LUMP_COUNT: usize = 6;
 const SAVE_GLOBAL: u16 = 1 << 15;
 
@@ -139,26 +129,25 @@ impl ProgsError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Ptr {
-    /// A signed reference to a function, field, or global.
-    ///
-    /// Quake 1 only supports 16-bit references, but other engines (e.g. FTEQW) support
-    /// more, so for now we use 32-bit. `0` is a valid reference for all 3 of field, function
-    /// and global.
-    Id(i32),
-    /// A reference by name.
-    Name(Arc<CStr>),
+pub struct Ptr(pub(crate) i32);
+
+impl fmt::Display for Ptr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "*{}", self.0)
+    }
 }
 
 impl Default for Ptr {
     fn default() -> Self {
-        Self::Id(0)
+        Self(0)
     }
 }
 
 impl Ptr {
+    pub const NULL: Self = Self(0);
+
     pub fn is_null(&self) -> bool {
-        matches!(self, Self::Id(0))
+        *self == Self::NULL
     }
 }
 
@@ -166,25 +155,19 @@ impl TryFrom<usize> for Ptr {
     type Error = <usize as TryInto<i32>>::Error;
 
     fn try_from(value: usize) -> Result<Self, Self::Error> {
-        Ok(Self::Id(value.try_into()?))
+        Ok(Self(value.try_into()?))
     }
 }
 
 impl From<i32> for Ptr {
     fn from(value: i32) -> Self {
-        Self::Id(value)
+        Self(value)
     }
 }
 
 impl From<i16> for Ptr {
     fn from(value: i16) -> Self {
-        Self::Id(value.into())
-    }
-}
-
-impl From<Arc<CStr>> for Ptr {
-    fn from(value: Arc<CStr>) -> Self {
-        Self::Name(value)
+        Self(value.into())
     }
 }
 
@@ -197,7 +180,8 @@ enum LumpId {
     Globals = 5,
 }
 
-#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq, Reflect)]
+#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq)]
+#[cfg_attr(feature = "reflect", derive(Reflect))]
 #[repr(u8)]
 pub enum ScalarType {
     Void = 0,
@@ -213,7 +197,8 @@ pub enum ScalarType {
 
 const VECTOR_TAG: u8 = 3;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Reflect)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "reflect", derive(Reflect))]
 #[repr(u8)]
 pub enum Type {
     Scalar(ScalarType),
@@ -235,11 +220,7 @@ impl TryFrom<Type> for ScalarType {
     fn try_from(value: Type) -> Result<Self, Self::Error> {
         match value {
             Type::Scalar(scalar) => Ok(scalar),
-            Type::Vector => Err([
-                (ScalarType::Float, FieldOffset::X),
-                (ScalarType::Float, FieldOffset::Y),
-                (ScalarType::Float, FieldOffset::Z),
-            ]),
+            Type::Vector => Err(FieldOffset::FIELDS.map(|fld| (ScalarType::Float, fld))),
         }
     }
 }
@@ -290,7 +271,8 @@ struct Lump {
     count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Reflect, FromPrimitive)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, FromPrimitive)]
+#[cfg_attr(feature = "reflect", derive(Reflect))]
 pub enum FieldOffset {
     X = 0,
     Y = 1,
@@ -348,6 +330,29 @@ pub struct FieldDef {
     pub type_: Type,
     pub offset: u16,
     pub name: Arc<CStr>,
+}
+
+impl FieldDef {
+    pub fn to_scalar(&self) -> Result<ScalarFieldInfo, [ScalarFieldInfo; 3]> {
+        match ScalarType::try_from(self.type_) {
+            Err(fields) => Err(fields.map(|(type_, fld)| ScalarFieldInfo {
+                name: FieldName {
+                    name: self.name.clone(),
+                    offset: Some(fld),
+                },
+                offset: fld as _,
+                type_,
+            })),
+            Ok(type_) => Ok(ScalarFieldInfo {
+                name: FieldName {
+                    name: self.name.clone(),
+                    offset: None,
+                },
+                offset: self.offset,
+                type_,
+            }),
+        }
+    }
 }
 
 impl PartialOrd for FieldDef {
@@ -599,13 +604,23 @@ where
 
 /// Abstraction around `bevy_ecs::entity::Entity` that allows us to impl `Default` without
 /// world access.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone)]
 pub enum EntityRef {
     #[default]
     Worldspawn,
     /// We use `Entity` rather than an index here so entities that aren't managed by the VM
     /// can still be passed to QuakeC functions.
-    Entity(Entity),
+    Entity(Arc<dyn ErasedEntity>),
+}
+
+impl PartialEq for EntityRef {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Worldspawn, Self::Worldspawn) => true,
+            (Self::Entity(lhs), Self::Entity(rhs)) => lhs.dyn_eq(&**rhs),
+            _ => false,
+        }
+    }
 }
 
 impl EntityRef {
@@ -614,28 +629,38 @@ impl EntityRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum FunctionRef {
     /// A reference to a function that is statically known by QuakeC
     Ptr(Ptr),
     /// An inline reference to an external function.
-    Extern(ExternFn),
+    Extern(Arc<dyn ErasedBuiltin>),
+}
+
+impl PartialEq for FunctionRef {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ptr(lhs), Self::Ptr(rhs)) => lhs == rhs,
+            (Self::Extern(lhs), Self::Extern(rhs)) => lhs.dyn_eq(&**rhs),
+            _ => false,
+        }
+    }
 }
 
 pub enum FunctionKind {
     QuakeC(QuakeCFunctionDef),
-    Extern(ExternFn),
+    Extern(Arc<dyn ErasedBuiltin>),
 }
 
 impl FunctionRef {
     pub fn is_null(&self) -> bool {
-        matches!(self, Self::Ptr(Ptr::Id(0)))
+        matches!(self, Self::Ptr(Ptr::NULL))
     }
 }
 
 impl Default for FunctionRef {
     fn default() -> Self {
-        Self::Ptr(Ptr::Id(0))
+        Self::Ptr(Default::default())
     }
 }
 
@@ -694,7 +719,7 @@ impl Deref for FieldPtr {
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
-pub enum ScalarKind {
+pub enum Scalar {
     /// This can be converted to any of the other values, as it is just a general "0".
     #[default]
     Void,
@@ -707,7 +732,7 @@ pub enum ScalarKind {
     Field(Ptr),
 }
 
-impl From<bool> for ScalarKind {
+impl From<bool> for Scalar {
     fn from(value: bool) -> Self {
         if value {
             Self::Float(1.)
@@ -717,19 +742,19 @@ impl From<bool> for ScalarKind {
     }
 }
 
-impl From<f32> for ScalarKind {
+impl From<f32> for Scalar {
     fn from(value: f32) -> Self {
         Self::Float(value)
     }
 }
 
-impl TryFrom<ScalarKind> for f32 {
+impl TryFrom<Scalar> for f32 {
     type Error = ScalarCastError;
 
-    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
         match value {
-            ScalarKind::Void => Ok(Default::default()),
-            ScalarKind::Float(f) => Ok(f),
+            Scalar::Void => Ok(Default::default()),
+            Scalar::Float(f) => Ok(f),
             _ => Err(ScalarCastError {
                 expected: ScalarType::Float,
                 found: value.type_(),
@@ -738,13 +763,13 @@ impl TryFrom<ScalarKind> for f32 {
     }
 }
 
-impl TryFrom<ScalarKind> for FunctionRef {
+impl TryFrom<Scalar> for FunctionRef {
     type Error = ScalarCastError;
 
-    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
         match value {
-            ScalarKind::Void => Ok(Default::default()),
-            ScalarKind::Function(f) => Ok(f),
+            Scalar::Void => Ok(Default::default()),
+            Scalar::Function(f) => Ok(f),
             _ => Err(ScalarCastError {
                 expected: ScalarType::Function,
                 found: value.type_(),
@@ -753,13 +778,13 @@ impl TryFrom<ScalarKind> for FunctionRef {
     }
 }
 
-impl TryFrom<ScalarKind> for EntityRef {
+impl TryFrom<Scalar> for EntityRef {
     type Error = ScalarCastError;
 
-    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
         match value {
-            ScalarKind::Void => Ok(Default::default()),
-            ScalarKind::Entity(f) => Ok(f),
+            Scalar::Void => Ok(Default::default()),
+            Scalar::Entity(f) => Ok(f),
             _ => Err(ScalarCastError {
                 expected: ScalarType::Entity,
                 found: value.type_(),
@@ -768,13 +793,13 @@ impl TryFrom<ScalarKind> for EntityRef {
     }
 }
 
-impl TryFrom<ScalarKind> for StringRef {
+impl TryFrom<Scalar> for StringRef {
     type Error = ScalarCastError;
 
-    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
         match value {
-            ScalarKind::Void => Ok(Default::default()),
-            ScalarKind::String(f) => Ok(f),
+            Scalar::Void => Ok(Default::default()),
+            Scalar::String(f) => Ok(f),
             _ => Err(ScalarCastError {
                 expected: ScalarType::String,
                 found: value.type_(),
@@ -783,13 +808,13 @@ impl TryFrom<ScalarKind> for StringRef {
     }
 }
 
-impl TryFrom<ScalarKind> for GlobalPtr {
+impl TryFrom<Scalar> for GlobalPtr {
     type Error = ScalarCastError;
 
-    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
         match value {
-            ScalarKind::Void => Ok(Default::default()),
-            ScalarKind::Global(p) => Ok(GlobalPtr(p)),
+            Scalar::Void => Ok(Default::default()),
+            Scalar::Global(p) => Ok(GlobalPtr(p)),
             _ => Err(ScalarCastError {
                 expected: ScalarType::String,
                 found: value.type_(),
@@ -798,13 +823,13 @@ impl TryFrom<ScalarKind> for GlobalPtr {
     }
 }
 
-impl TryFrom<ScalarKind> for FieldPtr {
+impl TryFrom<Scalar> for FieldPtr {
     type Error = ScalarCastError;
 
-    fn try_from(value: ScalarKind) -> Result<Self, Self::Error> {
+    fn try_from(value: Scalar) -> Result<Self, Self::Error> {
         match value {
-            ScalarKind::Void => Ok(Default::default()),
-            ScalarKind::Field(p) => Ok(FieldPtr(p)),
+            Scalar::Void => Ok(Default::default()),
+            Scalar::Field(p) => Ok(FieldPtr(p)),
             _ => Err(ScalarCastError {
                 expected: ScalarType::String,
                 found: value.type_(),
@@ -813,33 +838,30 @@ impl TryFrom<ScalarKind> for FieldPtr {
     }
 }
 
-const _: () = {
-    // TODO: This is too big, `ExternFn` is bloating the size of this type.
-    assert!(std::mem::size_of::<ScalarKind>() == 32);
-};
+const _: [(); 24] = [(); std::mem::size_of::<Scalar>()];
 
-impl ScalarKind {
+impl Scalar {
     pub fn is_null(&self) -> bool {
         match self {
-            ScalarKind::Void => true,
-            ScalarKind::Float(f) => *f != 0.,
-            ScalarKind::Entity(entity_ref) => entity_ref.is_null(),
-            ScalarKind::String(string_ref) => string_ref.is_null(),
-            ScalarKind::Function(function_ref) => function_ref.is_null(),
-            ScalarKind::Global(ptr) => ptr.is_null(),
-            ScalarKind::Field(ptr) => ptr.is_null(),
+            Scalar::Void => true,
+            Scalar::Float(f) => *f != 0.,
+            Scalar::Entity(entity_ref) => entity_ref.is_null(),
+            Scalar::String(string_ref) => string_ref.is_null(),
+            Scalar::Function(function_ref) => function_ref.is_null(),
+            Scalar::Global(ptr) => ptr.is_null(),
+            Scalar::Field(ptr) => ptr.is_null(),
         }
     }
 
     pub fn type_(&self) -> ScalarType {
         match self {
-            ScalarKind::Void => ScalarType::Void,
-            ScalarKind::Float(_) => ScalarType::Float,
-            ScalarKind::Entity(_) => ScalarType::Entity,
-            ScalarKind::String(_) => ScalarType::String,
-            ScalarKind::Function(_) => ScalarType::Function,
-            ScalarKind::Global(_) => ScalarType::GlobalRef,
-            ScalarKind::Field(_) => ScalarType::FieldRef,
+            Scalar::Void => ScalarType::Void,
+            Scalar::Float(_) => ScalarType::Float,
+            Scalar::Entity(_) => ScalarType::Entity,
+            Scalar::String(_) => ScalarType::String,
+            Scalar::Function(_) => ScalarType::Function,
+            Scalar::Global(_) => ScalarType::GlobalRef,
+            Scalar::Field(_) => ScalarType::FieldRef,
         }
     }
 
@@ -847,45 +869,56 @@ impl ScalarKind {
         match ty {
             ScalarType::Void => {
                 if bytes == [0; 4] {
-                    Ok(ScalarKind::Void)
+                    Ok(Scalar::Void)
                 } else {
                     Err(anyhow::Error::msg("`void` can only be initialized with 0"))
                 }
             }
-            ScalarType::Float => Ok(ScalarKind::Float(f32::from_le_bytes(bytes))),
-            ScalarType::String => Ok(ScalarKind::String(StringRef::Id(i32::from_le_bytes(bytes)))),
+            ScalarType::Float => Ok(Scalar::Float(f32::from_le_bytes(bytes))),
+            ScalarType::String => Ok(Scalar::String(StringRef::Id(i32::from_le_bytes(bytes)))),
             ScalarType::Entity => {
                 if bytes == [0; 4] {
-                    Ok(ScalarKind::Entity(EntityRef::Worldspawn))
+                    Ok(Scalar::Entity(EntityRef::Worldspawn))
                 } else {
                     Err(anyhow::Error::msg(
                         "Cannot literally initialise an entity to any value other than worldspawn (no entities have been spawned at load-time)",
                     ))
                 }
             }
-            ScalarType::Function => Ok(ScalarKind::Function(FunctionRef::Ptr(Ptr::Id(
+            ScalarType::Function => Ok(Scalar::Function(FunctionRef::Ptr(Ptr(
                 i32::from_le_bytes(bytes),
             )))),
 
-            ScalarType::FieldRef => Ok(ScalarKind::Field(Ptr::Id(
-                i32::from_le_bytes(bytes).try_into()?,
-            ))),
-            ScalarType::GlobalRef => Ok(ScalarKind::Global(Ptr::Id(
-                i32::from_le_bytes(bytes).try_into()?,
-            ))),
+            ScalarType::FieldRef => Ok(Scalar::Field(Ptr(i32::from_le_bytes(bytes).try_into()?))),
+            ScalarType::GlobalRef => Ok(Scalar::Global(Ptr(i32::from_le_bytes(bytes).try_into()?))),
         }
     }
 }
 
-pub enum ValueKind {
-    Scalar(ScalarKind),
+pub enum Value {
+    Scalar(Scalar),
     /// The only value in QuakeC that can be more than 32 bits (logically 32 bits, `Scalar` is larger
     /// because it's not just indices) is a vector of floats. This can only exist "ephemerally", as
     /// all values stored to/from stack or globals are ultimately scalars.
     Vector([f32; 3]),
 }
 
-impl ValueKind {
+impl From<[f32; 3]> for Value {
+    fn from(value: [f32; 3]) -> Self {
+        Self::Vector(value)
+    }
+}
+
+impl<T> From<T> for Value
+where
+    T: Into<Scalar>,
+{
+    fn from(value: T) -> Self {
+        Self::Scalar(value.into())
+    }
+}
+
+impl Value {
     pub fn type_(&self) -> Type {
         match self {
             Self::Scalar(scalar) => Type::Scalar(scalar.type_()),
@@ -894,115 +927,8 @@ impl ValueKind {
     }
 }
 
-pub struct Value {
-    /// Many QuakeC types are relative to the worldspawn or require the id->global map. We should not need to
-    /// pass the worldspawn around everywhere, so we use `ValueKind`/`ScalarKind` internally, when we know
-    /// what our references are relative to.
-    worldspawn: Entity,
-    kind: ValueKind,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, snafu::Snafu)]
 pub struct ScalarCastError {
     pub expected: ScalarType,
     pub found: ScalarType,
-}
-
-/// Marker component that an entity can be referenced by QuakeC. Partially to
-/// support `bevy_mod_scripting::ReflectReference` (which requires a component type)
-/// but also to make it more explicit which entities can be referenced by QuakeC
-/// since most entities will not return anything useful.
-#[derive(Component, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Reflect)]
-struct QuakeCEntity;
-
-impl FromScript for ScalarKind {
-    type This<'w> = ScalarKind;
-
-    fn from_script(
-        value: ScriptValue,
-        world: WorldGuard<'_>,
-    ) -> Result<Self::This<'_>, InteropError>
-    where
-        Self: Sized,
-    {
-        match value {
-            ScriptValue::Unit => Ok(ScalarKind::Void),
-            ScriptValue::Bool(v) => Ok(ScalarKind::Float(if v { 1. } else { 0. })),
-            ScriptValue::Integer(i) => Ok(ScalarKind::Float(i as f32)),
-            ScriptValue::Float(f) => Ok(ScalarKind::Float(f as f32)),
-            ScriptValue::String(cow) => {
-                let mut bytes = cow.into_owned().into_bytes();
-                bytes.push(0);
-                // This can only fail if the input has internal null.
-                let cstring = CString::from_vec_with_nul(bytes).unwrap();
-                Ok(ScalarKind::String(StringRef::Temp(cstring.into())))
-            }
-            ScriptValue::List(script_values) => {
-                if script_values.is_empty() {
-                    Ok(ScalarKind::Void)
-                } else if script_values.len() == 1 {
-                    ScalarKind::from_script(script_values[0].clone(), world)
-                } else {
-                    Err(InteropError::TypeMismatch {
-                        expected: TypeId::of::<Self>().into(),
-                        got: Some(TypeId::of::<Vec<ScriptValue>>()).into(),
-                    })
-                }
-            }
-            ScriptValue::Map(_) => Err(InteropError::TypeMismatch {
-                expected: TypeId::of::<Self>().into(),
-                got: Some(TypeId::of::<HashMap<String, ScriptValue>>()).into(),
-            }),
-
-            ScriptValue::Reference(
-                reference @ ReflectReference {
-                    base:
-                        ReflectBaseType {
-                            base_id: ReflectBase::Component(ent, c_id),
-                            ..
-                        },
-                    ..
-                },
-            ) => {
-                if c_id
-                    == world
-                        .get_component_id(TypeId::of::<QuakeCEntity>())?
-                        .unwrap()
-                {
-                    Ok(ScalarKind::Entity(EntityRef::Entity(ent)))
-                } else if c_id == world.get_component_id(TypeId::of::<QuakeCVm>())?.unwrap() {
-                    Ok(ScalarKind::Void)
-                } else {
-                    Err(InteropError::TypeMismatch {
-                        expected: TypeId::of::<Self>().into(),
-                        got: reference.type_id_of(TypeIdSource::Tail, world)?.into(),
-                    })
-                }
-            }
-            ScriptValue::Reference(reference) => Err(InteropError::TypeMismatch {
-                expected: TypeId::of::<Self>().into(),
-                got: reference.type_id_of(TypeIdSource::Tail, world)?.into(),
-            }),
-            ScriptValue::Function(function) => Ok(ScalarKind::Function(FunctionRef::Extern(
-                ExternFn::Ref(function),
-            ))),
-            ScriptValue::FunctionMut(function) => Ok(ScalarKind::Function(FunctionRef::Extern(
-                ExternFn::Mut(function),
-            ))),
-            ScriptValue::Error(err) => Err(err),
-        }
-    }
-}
-
-impl IntoScript for Value {
-    fn into_script(self, world: WorldGuard<'_>) -> Result<ScriptValue, InteropError> {
-        // let type_id = TypeId::of::<QuakeCEntity>();
-        // let component_id = world.get_component_id(type_id)?.ok_or(
-        //     InteropError::UnregisteredComponentOrResourceType {
-        //         type_name: Cow::from(std::any::type_name::<QuakeCEntity>()).into(),
-        //     },
-        // )?;
-
-        todo!()
-    }
 }

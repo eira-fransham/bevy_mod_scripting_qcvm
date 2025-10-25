@@ -1,10 +1,9 @@
 use std::{error::Error, ffi::CStr, fmt, sync::Arc};
 
-use bevy_mod_scripting_bindings::{ScriptGlobalMakerFn, ScriptValue};
 use hashbrown::HashMap;
 use itertools::Either;
 
-use crate::progs::{FieldName, GlobalDef, Ptr, ScalarKind, ScalarType};
+use crate::progs::{FieldName, GlobalDef, Ptr, Scalar, ScalarType};
 
 pub const GLOBAL_STATIC_START: usize = 28;
 pub const GLOBAL_DYNAMIC_START: usize = 64;
@@ -74,7 +73,7 @@ pub enum External {
 }
 
 pub struct GlobalValue {
-    value: Result<ScalarKind, Arc<ScriptGlobalMakerFn<ScriptValue>>>,
+    value: Scalar,
 }
 
 #[derive(Clone, Debug)]
@@ -83,7 +82,7 @@ pub struct Global {
 
     /// Should be same as `self.value.type_()`, but may get out of sync due to `Void`.
     pub type_: ScalarType,
-    pub value: ScalarKind,
+    pub value: Scalar,
 }
 
 impl Global {
@@ -92,7 +91,7 @@ impl Global {
             Ok(type_) => Ok(Global {
                 name: def.name.clone().into(),
                 type_,
-                value: ScalarKind::Void,
+                value: Scalar::Void,
             }),
             Err(tys_and_offsets) => Err(tys_and_offsets.map(|(type_, offset)| Global {
                 name: FieldName {
@@ -100,13 +99,13 @@ impl Global {
                     offset: Some(offset),
                 },
                 type_,
-                value: ScalarKind::Void,
+                value: Scalar::Void,
             })),
         }
     }
 
     fn with_value_bytes(self, bytes: [u8; 4]) -> anyhow::Result<Self> {
-        let value = ScalarKind::try_from_bytes(self.type_, bytes)?;
+        let value = Scalar::try_from_bytes(self.type_, bytes)?;
 
         Ok(Self { value, ..self })
     }
@@ -181,9 +180,9 @@ impl GlobalRegistry {
     }
 
     #[inline]
-    pub fn get_value<P>(&self, ptr: P) -> anyhow::Result<ScalarKind>
+    pub fn get_value<P>(&self, ptr: P) -> anyhow::Result<Scalar>
     where
-        P: TryInto<Ptr>,
+        P: TryInto<u16>,
         P::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
     {
         self.get(ptr).map(|glob| glob.value.clone())
@@ -207,19 +206,9 @@ impl GlobalRegistry {
     #[inline]
     pub fn get<P>(&self, ptr: P) -> anyhow::Result<&Global>
     where
-        P: TryInto<Ptr>,
+        P: TryInto<u16>,
         P::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
     {
-        match ptr.try_into()? {
-            Ptr::Id(index) => self.get_with_index(index.try_into()?),
-            Ptr::Name(cstr) => {
-                let offset = self
-                    .infos
-                    .get(&cstr)
-                    .ok_or_else(|| anyhow::Error::msg(format!("No global with name {cstr:?}")))?;
-
-                self.get_with_index(*offset)
-            }
-        }
+        self.get_with_index(ptr.try_into()?)
     }
 }
