@@ -279,10 +279,10 @@ impl QuakeCVm {
         &'a self,
         context: &'a mut C,
         args: T,
-    ) -> ExecutionCtx<'a, C, Bump, CallArgs<T>>
+    ) -> ExecutionCtx<'a, dyn ErasedContext, Bump, CallArgs<T>>
     where
         CallArgs<T>: QuakeCMemory,
-        C: Context,
+        C: ErasedContext,
     {
         ExecutionCtx {
             alloc: Bump::new(),
