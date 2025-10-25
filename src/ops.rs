@@ -1,4 +1,3 @@
-use bevy_ecs::entity::Entity;
 use bevy_log::debug;
 use bevy_math::Vec3;
 use bevy_reflect::Reflect;
@@ -8,7 +7,7 @@ use std::{fmt, num::NonZeroIsize};
 use crate::{
     ExecutionCtx, OpResult,
     progs::{
-        EntityRef, FieldPtr, FunctionRef, ScalarKind, StringRef, StringTable, functions::Statement,
+        EntityRef, FieldPtr, FunctionRef, ScalarKind, StringRef, functions::Statement,
     },
 };
 

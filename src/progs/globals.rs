@@ -4,7 +4,7 @@ use bevy_mod_scripting_bindings::{ScriptGlobalMakerFn, ScriptValue};
 use hashbrown::HashMap;
 use itertools::Either;
 
-use crate::progs::{FieldName, GlobalDef, Ptr, ScalarKind, ScalarType, ValueKind};
+use crate::progs::{FieldName, GlobalDef, Ptr, ScalarKind, ScalarType};
 
 pub const GLOBAL_STATIC_START: usize = 28;
 pub const GLOBAL_DYNAMIC_START: usize = 64;

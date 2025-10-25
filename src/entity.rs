@@ -1,10 +1,9 @@
-use std::{cmp::Ordering, convert::identity, error::Error, ffi::CStr, fmt, sync::Arc};
+use std::{convert::identity, error::Error, ffi::CStr, fmt, sync::Arc};
 
-use bevy_ecs::component::ComponentId;
 use hashbrown::HashMap;
 use num_derive::FromPrimitive;
 
-use crate::progs::{FieldDef, FieldName, Ptr, ScalarType, Type};
+use crate::progs::{FieldDef, FieldName, Ptr, ScalarType};
 
 pub const MAX_ENT_LEAVES: usize = 16;
 

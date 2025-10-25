@@ -8,7 +8,6 @@ use bevy_ecs::{
     entity::Entity,
     system::{In, SystemId},
 };
-use bevy_log::debug;
 use bevy_math::Vec3;
 use bevy_mod_scripting_asset::Language;
 use bevy_mod_scripting_bindings::{FunctionCallContext, ScriptFunctionRegistry};
@@ -18,9 +17,9 @@ use hashbrown::HashMap;
 use crate::{
     entity::EntityTypeDef,
     progs::{
-        FieldOffset, FunctionRef, ProgsError, ScalarKind, ScalarType, StringTable, ValueKind,
+        FieldOffset, ScalarKind, StringTable, ValueKind,
         functions::{
-            ArgSize, FunctionDef, FunctionExecutionCtx, FunctionRegistry, QuakeCFunctionDef,
+            FunctionExecutionCtx, FunctionRegistry, QuakeCFunctionDef,
             Statement,
         },
         globals::GlobalRegistry,

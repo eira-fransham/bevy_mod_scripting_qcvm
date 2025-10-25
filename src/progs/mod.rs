@@ -2,7 +2,7 @@ pub mod functions;
 pub mod globals;
 
 use std::{
-    any::{Any, TypeId},
+    any::TypeId,
     backtrace::Backtrace,
     cmp::Ordering,
     ffi::{CStr, CString},
@@ -12,10 +12,10 @@ use std::{
     sync::Arc,
 };
 
-use arc_slice::{ArcSlice, layout::VecLayout};
+use arc_slice::ArcSlice;
 use arrayvec::ArrayVec;
 use bevy_ecs::{component::Component, entity::Entity};
-use bevy_log::{debug, warn};
+use bevy_log::debug;
 use bevy_mod_scripting_bindings::{
     FromScript, InteropError, IntoScript, ReflectBase, ReflectBaseType, ReflectReference,
     ScriptValue, TypeIdSource, WorldGuard,
@@ -28,11 +28,11 @@ use num_derive::FromPrimitive;
 use snafu::Snafu;
 
 use crate::{
-    ExecutionCtx, QuakeCVm,
+    QuakeCVm,
     entity::{EntityError, EntityTypeDef},
     progs::{
         functions::{
-            ArgSize, ExternFn, FunctionDef, FunctionRegistry, MAX_ARGS, QuakeCFunctionDef,
+            ArgSize, ExternFn, FunctionRegistry, MAX_ARGS, QuakeCFunctionDef,
             Statement,
         },
         globals::{GlobalRegistry, GlobalsError},

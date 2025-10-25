@@ -12,7 +12,6 @@ use num_derive::FromPrimitive;
 
 use crate::ops::Opcode;
 use crate::progs::{LoadFn, ProgsError, Ptr, ScalarKind};
-use crate::quake1::globals::GLOBALS_RANGE;
 use crate::{ARG_ADDRS, quake1};
 
 pub const MAX_ARGS: usize = 8;
