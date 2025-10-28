@@ -719,7 +719,7 @@ where
             VmValue::Scalar(VmScalar::Function(FunctionRef::Ptr(ptr))) => {
                 let arg_func = self.functions.get_by_index(ptr.0)?.clone();
 
-                match arg_func.try_into_quakec() {
+                match arg_func.try_into_qc() {
                     Ok(quakec) => Ok(Value::Function(Arc::new(quakec))),
                     Err(builtin) => Ok(Value::Function(self.context.dyn_builtin(&builtin)?)),
                 }
@@ -747,7 +747,7 @@ where
             .functions
             .get_by_index(function)?
             .clone()
-            .try_into_quakec()
+            .try_into_qc()
             .map_err(|_| anyhow::format_err!("Not a quakec function (TODO)"))?;
 
         let out = self.execute_def(&quakec_func)?;
@@ -764,7 +764,7 @@ where
             .functions
             .get_by_name(function)?
             .clone()
-            .try_into_quakec()
+            .try_into_qc()
             .map_err(|_| anyhow::format_err!("Not a quakec function (TODO)"))?;
 
         let out = self.execute_def(&quakec_func)?;

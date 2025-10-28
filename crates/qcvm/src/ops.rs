@@ -233,7 +233,7 @@ impl ExecutionCtx<'_> {
 
                 let result = match func_ref {
                     FunctionRef::Ptr(p) => {
-                        match self.functions.get_by_index(p.0)?.clone().try_into_quakec() {
+                        match self.functions.get_by_index(p.0)?.clone().try_into_qc() {
                             Ok(quakec) => self.execute_def(&quakec)?,
                             Err(builtin) => self.enter_builtin(
                                 &builtin.name,

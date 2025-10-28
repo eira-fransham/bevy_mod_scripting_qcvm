@@ -1,4 +1,4 @@
-# `bevy_mod_scripting_quakec`
+# `bevy_mod_scripting_qcvm`
 
 This is a (still unfinished) rewrite of the QuakeC runtime from
 [Seismon](https://github.com/eira-fransham/seismon) to be a reusable module that can be included

@@ -156,7 +156,7 @@ pub enum FunctionBody {
 }
 
 impl FunctionBody {
-    pub fn try_into_quakec(self) -> Result<QuakeCFunctionBody, Builtin> {
+    pub fn try_into_qc(self) -> Result<QuakeCFunctionBody, Builtin> {
         match self {
             Self::Progs(quakec) => Ok(quakec),
             Self::Builtin => Err(Builtin),
@@ -183,8 +183,8 @@ pub struct Builtin;
 pub type BuiltinDef = FunctionDef<Builtin>;
 
 impl FunctionDef {
-    pub fn try_into_quakec(self) -> Result<QuakeCFunctionDef, FunctionDef<Builtin>> {
-        match self.body.try_into_quakec() {
+    pub fn try_into_qc(self) -> Result<QuakeCFunctionDef, FunctionDef<Builtin>> {
+        match self.body.try_into_qc() {
             Ok(quakec) => Ok(QuakeCFunctionDef {
                 offset: self.offset,
                 name: self.name,
