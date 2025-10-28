@@ -13,18 +13,20 @@ use std::{
 use arrayvec::ArrayVec;
 use bump_scope::{Bump, BumpScope};
 use glam::Vec3;
+use itertools::Itertools;
+use snafu::Snafu;
 
 use crate::{
     entity::EntityTypeDef,
     load::Progs,
     progs::{
-        FunctionRef, ScalarType, StringRef, StringTable, VmScalar, VmValue,
+        FieldOffset, FunctionRef, ScalarType, StringRef, StringTable, VmScalar, VmValue,
         functions::{
             ArgSize, FunctionExecutionCtx, FunctionRegistry, MAX_ARGS, QuakeCFunctionDef, Statement,
         },
         globals::GlobalRegistry,
     },
-    userdata::{ErasedContext, ErasedFunction, FnCall, QuakeCType},
+    userdata::{ErasedContext, ErasedEntity, ErasedFunction, FnCall, QuakeCType},
 };
 
 pub use crate::progs::{EntityRef, ScalarCastError};
@@ -38,7 +40,16 @@ pub mod userdata;
 #[cfg(feature = "quake1")]
 pub mod quake1;
 
+#[derive(Debug)]
 pub struct CallArgs<T>(T);
+
+impl QuakeCMemory for CallArgs<()> {
+    type Scalar = Option<VmScalar>;
+
+    fn get(&self, _: usize) -> anyhow::Result<Self::Scalar> {
+        Ok(None)
+    }
+}
 
 impl QuakeCMemory for CallArgs<ArrayVec<VmScalar, MAX_ARGS>> {
     type Scalar = Option<VmScalar>;
@@ -68,6 +79,12 @@ pub enum Value {
     String(Arc<CStr>),
 }
 
+#[derive(Snafu, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum SetFieldError {
+    NoSuchField { field: FieldOffset },
+    TypeError { expected: ArgType, found: ArgType },
+}
+
 impl Value {
     pub fn type_(&self) -> ArgType {
         match self {
@@ -78,6 +95,80 @@ impl Value {
             Value::Vector(_) => ArgType::Vector,
             Value::String(_) => ArgType::String,
         }
+    }
+
+    pub fn set(&mut self, field: Option<FieldOffset>, value: Value) -> Result<(), SetFieldError> {
+        match (self, field, value) {
+            (this, None, value) => *this = value,
+            (Value::Vector(v), Some(offset), Value::Float(f)) => match offset {
+                FieldOffset::X => v.x = f,
+                FieldOffset::Y => v.y = f,
+                FieldOffset::Z => v.z = f,
+            },
+            (Value::Vector(_), Some(_), val) => {
+                return Err(SetFieldError::TypeError {
+                    expected: ArgType::Float,
+                    found: val.type_(),
+                });
+            }
+            (_, Some(offset), _) => return Err(SetFieldError::NoSuchField { field: offset }),
+        }
+
+        Ok(())
+    }
+}
+
+impl From<f32> for Value {
+    fn from(value: f32) -> Self {
+        Self::Float(value)
+    }
+}
+
+impl From<Arc<dyn ErasedFunction>> for Value {
+    fn from(value: Arc<dyn ErasedFunction>) -> Self {
+        Self::Function(value)
+    }
+}
+
+impl From<EntityRef> for Value {
+    fn from(value: EntityRef) -> Self {
+        Self::Entity(value)
+    }
+}
+
+impl From<Arc<dyn ErasedEntity>> for Value {
+    fn from(value: Arc<dyn ErasedEntity>) -> Self {
+        Self::Entity(EntityRef::Entity(value))
+    }
+}
+
+impl From<Vec3> for Value {
+    fn from(value: Vec3) -> Self {
+        Self::Vector(value)
+    }
+}
+
+impl From<Arc<CStr>> for Value {
+    fn from(value: Arc<CStr>) -> Self {
+        Self::String(value)
+    }
+}
+
+impl TryFrom<Value> for VmScalar {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        Ok(match value {
+            Value::Void => VmScalar::Void,
+            Value::Entity(entity_ref) => VmScalar::Entity(entity_ref),
+            Value::Function(erased_function) => {
+                VmScalar::Function(FunctionRef::Extern(erased_function))
+            }
+            Value::Float(float) => VmScalar::Float(float),
+            // TODO: Just read x value?
+            Value::Vector(_) => anyhow::bail!("Tried to read vector as a scalar"),
+            Value::String(cstr) => VmScalar::String(StringRef::Temp(cstr)),
+        })
     }
 }
 
@@ -174,6 +265,7 @@ macro_rules! impl_memory_tuple {
 
                 let arg_offset = index.checked_sub(ARG_ADDRS.start).expect("Programmer error - index out of range for args");
                 let field_offset = arg_offset % 3;
+                let arg_offset = arg_offset - field_offset;
 
                 let value = impl_memory_tuple!(@arg_match arg_offset $first $($rest)*);
 
@@ -182,7 +274,7 @@ macro_rules! impl_memory_tuple {
                     (progs::VmValue::Vector([x, _, _]), 0) => Ok(Some(x.into())),
                     (progs::VmValue::Vector([_, y, _]), 1) => Ok(Some(y.into())),
                     (progs::VmValue::Vector([_, _, z]), 2) => Ok(Some(z.into())),
-                    (value, field_offset) => anyhow::bail!("Invalid field access {field_offset} for {value:?}"),
+                    _ => Ok(Some(progs::VmScalar::Void)),
                 }
             }
 
@@ -225,8 +317,9 @@ impl QuakeCType for QuakeCFunctionDef {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum ArgType {
+    // TODO: Should we ever expose `Void` to the caller?
     Void,
-    Any,
+    AnyScalar,
     Entity,
     Function,
     Float,
@@ -234,11 +327,51 @@ pub enum ArgType {
     String,
 }
 
+impl TryFrom<progs::Type> for ArgType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: progs::Type) -> Result<Self, Self::Error> {
+        Ok(match value {
+            progs::Type::Scalar(scalar_type) => scalar_type.try_into()?,
+            progs::Type::Vector => ArgType::Vector,
+        })
+    }
+}
+
+impl TryFrom<ScalarType> for ArgType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ScalarType) -> Result<Self, Self::Error> {
+        Ok(match value {
+            ScalarType::Void => ArgType::Void,
+            ScalarType::String => ArgType::String,
+            ScalarType::Float => ArgType::Float,
+            ScalarType::Entity => ArgType::Entity,
+            ScalarType::Function => ArgType::Function,
+            ScalarType::FieldRef => anyhow::bail!("We don't support `FieldRef` in host bindings"),
+            ScalarType::GlobalRef => anyhow::bail!("We don't support `GlobalRef` in host bindings"),
+        })
+    }
+}
+
+impl ArgType {
+    pub fn num_elements(&self) -> usize {
+        self.arg_size() as _
+    }
+
+    pub(crate) fn arg_size(&self) -> ArgSize {
+        match self {
+            Self::Vector => ArgSize::Vector,
+            _ => ArgSize::Scalar,
+        }
+    }
+}
+
 impl fmt::Display for ArgType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ArgType::Void => write!(f, "void"),
-            ArgType::Any => write!(f, "<any>"),
+            ArgType::AnyScalar => write!(f, "<any>"),
             ArgType::Entity => write!(f, "entity"),
             ArgType::Function => write!(f, "function"),
             ArgType::Float => write!(f, "float"),
@@ -254,14 +387,14 @@ impl ErasedFunction for QuakeCFunctionDef {
             .args
             .iter()
             .map(|size| match size {
-                ArgSize::Scalar => ArgType::Any,
+                ArgSize::Scalar => ArgType::AnyScalar,
                 ArgSize::Vector => ArgType::Vector,
             })
             .collect())
     }
 
     fn dyn_call(&self, mut context: FnCall) -> anyhow::Result<Value> {
-        let vm_value = context.execution.execute(self)?;
+        let vm_value = context.execution.execute_def(self)?;
 
         context.execution.to_value(vm_value.try_into()?)
     }
@@ -584,7 +717,7 @@ where
                 Ok(Value::String(self.string_table.get(str)?))
             }
             VmValue::Scalar(VmScalar::Function(FunctionRef::Ptr(ptr))) => {
-                let arg_func = self.functions.get(ptr.0)?.clone();
+                let arg_func = self.functions.get_by_index(ptr.0)?.clone();
 
                 match arg_func.try_into_quakec() {
                     Ok(quakec) => Ok(Value::Function(Arc::new(quakec))),
@@ -594,7 +727,9 @@ where
             VmValue::Scalar(VmScalar::Function(FunctionRef::Extern(func))) => {
                 Ok(Value::Function(func))
             }
-            VmValue::Scalar(VmScalar::Field(_) | VmScalar::Global(_)) => anyhow::bail!(
+            VmValue::Scalar(
+                VmScalar::EntityField(..) | VmScalar::Field(_) | VmScalar::Global(_),
+            ) => anyhow::bail!(
                 "Values of type {} are unsupported as arguments to builtins",
                 vm_value.type_()
             ),
@@ -605,10 +740,41 @@ where
 impl<Alloc, Caller> ExecutionCtx<'_, dyn ErasedContext, Alloc, Caller>
 where
     Alloc: ScopedAlloc,
-    Caller: QuakeCMemory,
+    Caller: fmt::Debug + QuakeCMemory<Scalar = Option<VmScalar>>,
 {
+    pub fn execute_by_index(&mut self, function: usize) -> anyhow::Result<Value> {
+        let quakec_func = self
+            .functions
+            .get_by_index(function)?
+            .clone()
+            .try_into_quakec()
+            .map_err(|_| anyhow::format_err!("Not a quakec function (TODO)"))?;
+
+        let out = self.execute_def(&quakec_func)?;
+        let value = VmValue::try_from(out)?;
+
+        self.to_value(value)
+    }
+
+    pub fn execute_by_name<F>(&mut self, function: F) -> anyhow::Result<Value>
+    where
+        F: AsRef<CStr>,
+    {
+        let quakec_func = self
+            .functions
+            .get_by_name(function)?
+            .clone()
+            .try_into_quakec()
+            .map_err(|_| anyhow::format_err!("Not a quakec function (TODO)"))?;
+
+        let out = self.execute_def(&quakec_func)?;
+        let value = VmValue::try_from(out)?;
+
+        self.to_value(value)
+    }
+
     // TODO: We can use the unsafe checkpoint API if just recursing becomes too slow.
-    pub fn execute(&mut self, function: &QuakeCFunctionDef) -> anyhow::Result<[VmScalar; 3]> {
+    fn execute_def(&mut self, function: &QuakeCFunctionDef) -> anyhow::Result<[VmScalar; 3]> {
         let Self {
             alloc,
             memory,
@@ -620,18 +786,34 @@ where
         } = self;
 
         alloc.scoped(move |alloc| {
-            let mut memory = ExecutionMemory {
+            let mut new_memory = ExecutionMemory {
                 local: function.ctx(&alloc),
                 global: memory.global,
                 last_ret: None,
             };
 
-            for (src, dst) in ARG_ADDRS.zip(function.body.locals.clone()) {
-                memory.set(dst, memory.get(src)?)?;
+            let mut dst_locals = function.body.locals.clone();
+
+            for (mut src, dst_size) in ARG_ADDRS.chunks(3).into_iter().zip(&function.args) {
+                match dst_size {
+                    ArgSize::Scalar => {
+                        let src = src.next().unwrap();
+                        let dst = dst_locals
+                            .next()
+                            .ok_or_else(|| anyhow::format_err!("Too few locals for arguments"))?;
+                        new_memory.set(dst, memory.get(dbg!(src))?)?;
+                    }
+
+                    ArgSize::Vector => {
+                        for (src, dst) in src.zip(dst_locals.by_ref()) {
+                            new_memory.set(dst, memory.get(src)?)?;
+                        }
+                    }
+                }
             }
 
             let mut out = ExecutionCtx {
-                memory,
+                memory: new_memory,
                 alloc,
                 backtrace: BacktraceFrame(Some((&function.name, &*backtrace))),
                 context: &mut **context,
@@ -742,16 +924,6 @@ impl ExecutionCtx<'_> {
         let mut counter: usize = 0;
 
         loop {
-            // *self.runaway.as_mut() -= 1;
-
-            // if *self.runaway.as_mut() == 0 {
-            //     self.print_backtrace(false);
-            //     return Err(ProgsError::LocalStackOverflow {
-            //         backtrace: Backtrace::capture(),
-            //     }
-            //     .into());
-            // }
-
             match self.execute_statement(self.instr(counter)?)?.into() {
                 ControlFlow::Continue(idx) => {
                     counter = counter

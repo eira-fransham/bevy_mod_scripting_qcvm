@@ -389,7 +389,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bevy_mod_scripting_quakec"
+name = "bevy_mod_scripting_qcvm"
 version = "0.1.0"
 dependencies = [
  "bevy_app",
@@ -1294,8 +1294,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "quakec"
-version = "0.1.1"
+name = "qcvm"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-slice",

@@ -58,6 +58,7 @@ impl StringTable {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
 pub struct Ptr(pub(crate) i32);
 
 impl fmt::Display for Ptr {
@@ -117,6 +118,12 @@ const VECTOR_TAG: u8 = 3;
 pub enum Type {
     Scalar(ScalarType),
     Vector = 3,
+}
+
+impl From<ScalarType> for Type {
+    fn from(value: ScalarType) -> Self {
+        Self::Scalar(value)
+    }
 }
 
 impl Type {
@@ -243,20 +250,14 @@ pub struct FieldDef {
 impl FieldDef {
     pub fn to_scalar(&self) -> Result<ScalarFieldDef, [ScalarFieldDef; 3]> {
         match ScalarType::try_from(self.type_) {
-            Err(fields) => Err(fields.map(|(type_, fld)| ScalarFieldDef {
-                name: FieldName {
-                    name: self.name.clone(),
-                    offset: Some(fld),
-                },
-                offset: fld as _,
+            Err(fields) => Err(fields.map(|(type_, field)| ScalarFieldDef {
+                field: Some(field),
+                def: self.clone(),
                 type_,
             })),
             Ok(type_) => Ok(ScalarFieldDef {
-                name: FieldName {
-                    name: self.name.clone(),
-                    offset: None,
-                },
-                offset: self.offset,
+                field: None,
+                def: self.clone(),
                 type_,
             }),
         }
@@ -429,7 +430,39 @@ pub enum VmScalar {
     Function(FunctionRef),
     Global(Ptr),
     Field(Ptr),
+    /// Internal representation for `OP_ADDR`.
+    ///
+    /// For some reason this doesn't seem to bloat this type at all,
+    /// it's 24 bytes either way. The inner values can't be extracted
+    /// to a separate struct without increasing size even further,
+    /// though.
+    ///
+    /// > TODO: Could probably store as SoA to reduce cache misses
+    EntityField(EntityRef, Ptr),
 }
+
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct EntityField {
+    pub entity: EntityRef,
+    pub field: Ptr,
+}
+
+impl TryFrom<VmScalar> for EntityField {
+    type Error = ScalarCastError;
+
+    fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
+        match value {
+            VmScalar::EntityField(entity, field) => Ok(EntityField { entity, field }),
+            // TODO: `FieldRef` isn't really right for this.
+            other => Err(ScalarCastError {
+                expected: ScalarType::FieldRef,
+                found: other.type_(),
+            }),
+        }
+    }
+}
+
+const _: [(); 24] = [(); std::mem::size_of::<VmScalar>()];
 
 impl From<bool> for VmScalar {
     fn from(value: bool) -> Self {
@@ -591,6 +624,7 @@ impl VmScalar {
             VmScalar::Function(function_ref) => function_ref.is_null(),
             VmScalar::Global(ptr) => ptr.is_null(),
             VmScalar::Field(ptr) => ptr.is_null(),
+            VmScalar::EntityField(ent, fld) => ent.is_null() && fld.is_null(),
         }
     }
 
@@ -603,6 +637,8 @@ impl VmScalar {
             VmScalar::Function(_) => ScalarType::Function,
             VmScalar::Global(_) => ScalarType::GlobalRef,
             VmScalar::Field(_) => ScalarType::FieldRef,
+            // TODO: Probably not correct.
+            VmScalar::EntityField(..) => ScalarType::FieldRef,
         }
     }
 
@@ -705,7 +741,7 @@ impl VmValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, snafu::Snafu)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, snafu::Snafu)]
 pub struct ScalarCastError {
     pub expected: ScalarType,
     pub found: ScalarType,

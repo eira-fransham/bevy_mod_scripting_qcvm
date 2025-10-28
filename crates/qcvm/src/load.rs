@@ -49,6 +49,7 @@ struct Lump {
     count: usize,
 }
 
+#[derive(Debug)]
 pub(crate) struct LoadFn {
     pub offset: i32,
     pub name: Arc<CStr>,

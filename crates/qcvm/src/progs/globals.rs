@@ -110,6 +110,12 @@ impl GlobalRegistry {
             .ok_or_else(|| anyhow::format_err!("No global with index {index}"))
     }
 
+    pub fn get_with_index_mut(&mut self, index: u16) -> anyhow::Result<&mut Global> {
+        self.globals
+            .get_mut(&index)
+            .ok_or_else(|| anyhow::format_err!("No global with index {index}"))
+    }
+
     #[inline]
     pub fn get_value<P>(&self, ptr: P) -> anyhow::Result<VmScalar>
     where
@@ -141,5 +147,14 @@ impl GlobalRegistry {
         P::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
     {
         self.get_with_index(ptr.try_into()?)
+    }
+
+    #[inline]
+    pub fn get_mut<P>(&mut self, ptr: P) -> anyhow::Result<&mut Global>
+    where
+        P: TryInto<u16>,
+        P::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
+    {
+        self.get_with_index_mut(ptr.try_into()?)
     }
 }

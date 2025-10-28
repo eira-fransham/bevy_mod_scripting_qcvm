@@ -12,8 +12,8 @@ use num_derive::FromPrimitive;
 
 use crate::load::LoadFn;
 use crate::ops::Opcode;
-use crate::progs::VmScalar;
-use crate::{ARG_ADDRS, QuakeCMemory, quake1};
+use crate::progs::{ScalarType, VmScalar};
+use crate::{ARG_ADDRS, QuakeCMemory};
 
 pub const MAX_ARGS: usize = 8;
 
@@ -61,13 +61,6 @@ impl std::fmt::Display for ArgSize {
 pub struct FunctionExecutionCtx<'a> {
     arguments: FixedBumpVec<'a, VmScalar>,
     local_storage: FixedBumpVec<'a, VmScalar>,
-    /// For now, all functions are stateless. This allows for easier debugging, as we can see what the function
-    /// accessed while running. It also ensures that a function that ran with errors can have modifications to
-    /// the global state rolled back. QuakeC has few enough globals that this is cheap (although this will
-    /// likely need to be limited to only the globals defined in `progdefs.h` for maximum efficiency)
-    ///
-    /// > TODO: Should QuakeC be able to modify state at all?
-    delta: FixedBumpVec<'a, Option<VmScalar>>,
     /// If the progs try to access a value within this range, it will access `local_storage` instead of globals.
     ///
     /// > TODO: We should only define globals at all if they are specified in the `progdefs.h` equivalent.
@@ -84,14 +77,22 @@ impl FunctionExecutionCtx<'_> {
     }
 }
 
+const LOCAL_STORAGE_ERR: &str =
+    "Programmer error: `local_storage` was too small for `local_range`. This is a bug!";
+const ARG_STORAGE_ERR: &str =
+    "Programmer error: `arguments` was too small for `ARG_ADDRS`. This is a bug!";
+
 impl QuakeCMemory for FunctionExecutionCtx<'_> {
     type Scalar = Option<VmScalar>;
 
     fn get(&self, index: usize) -> anyhow::Result<Option<VmScalar>> {
-        const LOCAL_STORAGE_ERR: &str =
-            "Programmer error: `local_storage` was too small for `local_range`. This is a bug!";
+        if ARG_ADDRS.contains(&index) {
+            let index = index - ARG_ADDRS.start;
 
-        if self.local_range.contains(&index) {
+            Ok(Some(
+                self.arguments.get(index).expect(ARG_STORAGE_ERR).clone(),
+            ))
+        } else if self.local_range.contains(&index) {
             let index = index - self.local_range.start;
 
             Ok(Some(
@@ -101,20 +102,16 @@ impl QuakeCMemory for FunctionExecutionCtx<'_> {
                     .clone(),
             ))
         } else {
-            self.delta
-                .get(index)
-                .ok_or_else(|| anyhow::Error::msg(format!("Global {index} is out of range")))
-                .cloned()
+            Ok(None)
         }
     }
 }
 
 impl FunctionExecutionCtx<'_> {
     pub fn set(&mut self, index: usize, value: VmScalar) -> anyhow::Result<()> {
-        const LOCAL_STORAGE_ERR: &str =
-            "Programmer error: `local_storage` was too small for `local_range`. This is a bug!";
-        const ARG_STORAGE_ERR: &str =
-            "Programmer error: `arguments` was too small for `ARG_ADDRS`. This is a bug!";
+        if value.type_() == ScalarType::Void {
+            return Ok(());
+        }
 
         if ARG_ADDRS.contains(&index) {
             let index = index - ARG_ADDRS.start;
@@ -129,12 +126,7 @@ impl FunctionExecutionCtx<'_> {
 
             *local = value;
         } else {
-            let global = self
-                .delta
-                .get_mut(index)
-                .ok_or_else(|| anyhow::Error::msg(format!("Global {index} is out of range")))?;
-
-            *global = Some(value);
+            anyhow::bail!("Global {index} is out of range");
         }
 
         Ok(())
@@ -225,10 +217,6 @@ impl QuakeCFunctionDef {
                 std::iter::repeat_n(VmScalar::Void, self.body.locals.len()),
                 &mut alloc,
             ),
-            delta: FixedBumpVec::from_iter_exact_in(
-                std::iter::repeat_n(None, quake1::GLOBALS_RANGE.len()),
-                &mut alloc,
-            ),
             local_range: self.body.locals.clone(),
             statements: self.body.statements.clone(),
         }
@@ -238,13 +226,10 @@ impl QuakeCFunctionDef {
 #[derive(Debug, Clone)]
 pub struct FunctionRegistry {
     by_index: HashMap<i32, FunctionDef>,
-    // TODO
-    #[expect(dead_code)]
     by_name: HashMap<Arc<CStr>, FunctionDef>,
 }
 
 impl FunctionRegistry {
-    /// `iter` should be sorted by `offset`
     pub(crate) fn new<I>(statements: ArcSlice<[Statement]>, iter: I) -> anyhow::Result<Self>
     where
         I: IntoIterator<Item = LoadFn>,
@@ -289,7 +274,7 @@ impl FunctionRegistry {
         Ok(Self { by_index, by_name })
     }
 
-    pub fn get<F>(&self, func: F) -> anyhow::Result<&FunctionDef>
+    pub fn get_by_index<F>(&self, func: F) -> anyhow::Result<&FunctionDef>
     where
         F: TryInto<i32>,
         F::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
@@ -299,5 +284,16 @@ impl FunctionRegistry {
         self.by_index
             .get(&func)
             .ok_or_else(|| anyhow::format_err!("Function {func} does not exist"))
+    }
+
+    pub fn get_by_name<F>(&self, func: F) -> anyhow::Result<&FunctionDef>
+    where
+        F: AsRef<CStr>,
+    {
+        let func = func.as_ref();
+
+        self.by_name
+            .get(func)
+            .ok_or_else(|| anyhow::format_err!("Function {func:?} does not exist"))
     }
 }

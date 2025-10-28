@@ -1,5 +1,5 @@
 [package]
-name = "bevy_mod_scripting_quakec"
+name = "bevy_mod_scripting_qcvm"
 version = "0.1.0"
 edition = "2024"
 
@@ -9,7 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [workspace]
-members = ["crates/quakec"]
+members = ["crates/qcvm"]
 
 [workspace.package]
 authors = ["Eira Fransham <eira.fransham@gmail.com>"]
