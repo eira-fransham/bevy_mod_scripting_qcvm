@@ -15,8 +15,8 @@ members = ["crates/qcvm"]
 authors = ["Eira Fransham <eira.fransham@gmail.com>"]
 # Needs to be licensed under GPL to be compatible with Quake 1's license.
 license = "GPL-2.0"
-homepage = "https://github.com/eira-fransham/seismon"
-repository = "https://github.com/eira-fransham/seismon"
+homepage = "https://github.com/eira-fransham/bevy_mod_scripting_qcvm"
+repository = "https://github.com/eira-fransham/bevy_mod_scripting_qcvm"
 
 [workspace.dependencies]
 anyhow = "1.0"
