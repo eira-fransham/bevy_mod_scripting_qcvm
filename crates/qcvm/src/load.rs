@@ -14,7 +14,7 @@ use tracing::debug;
 use crate::{
     entity::EntityTypeDef,
     progs::{
-        FieldDef, GlobalDef, StringTable, Type,
+        FieldDef, GlobalDef, StringTable, VmType,
         functions::{ArgSize, FunctionRegistry, MAX_ARGS, Statement},
         globals::GlobalRegistry,
     },
@@ -187,7 +187,7 @@ impl Progs {
 
         load_functions.sort_unstable_by_key(|def| def.offset);
 
-        let functions = FunctionRegistry::new(statements, load_functions)?;
+        let functions = FunctionRegistry::new(statements, &load_functions)?;
 
         let globaldef_lump = &lumps[LumpId::GlobalDefs as usize];
         src.seek(SeekFrom::Start(globaldef_lump.offset as u64))?;
@@ -200,7 +200,7 @@ impl Progs {
 
             global_defs.push(GlobalDef {
                 save: type_ & SAVE_GLOBAL != 0,
-                type_: Type::from_u16(type_ & !SAVE_GLOBAL).unwrap(),
+                type_: VmType::from_u16(type_ & !SAVE_GLOBAL).unwrap(),
                 offset,
                 name,
             });
@@ -231,7 +231,7 @@ impl Progs {
                 ));
             }
             field_defs.push(FieldDef {
-                type_: Type::from_u16(type_).unwrap(),
+                type_: VmType::from_u16(type_).unwrap(),
                 offset,
                 name,
             });

@@ -1,20 +1,22 @@
 use std::ffi::CStr;
 use std::{fmt, ops::Range, sync::Arc};
 
+use crate::{FunctionRef, HashMap, Type};
 use arc_slice::ArcSlice;
 use arrayvec::ArrayVec;
 #[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
 use bump_scope::{BumpAllocatorScopeExt, FixedBumpVec};
-use hashbrown::HashMap;
+use itertools::Itertools;
 use num::FromPrimitive as _;
 use num_derive::FromPrimitive;
 
 use crate::load::LoadFn;
 use crate::ops::Opcode;
-use crate::progs::{ScalarType, VmScalar};
+use crate::progs::{VmScalar, VmScalarType};
 use crate::{ARG_ADDRS, QuakeCMemory};
 
+/// The maximum number of arguments supported by the runtime.
 pub const MAX_ARGS: usize = 8;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -43,9 +45,18 @@ impl Statement {
 #[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq)]
 #[cfg_attr(feature = "reflect", derive(Reflect))]
 #[repr(u8)]
-pub enum ArgSize {
+pub(crate) enum ArgSize {
     Scalar = 1,
     Vector = 3,
+}
+
+impl From<ArgSize> for Type {
+    fn from(value: ArgSize) -> Self {
+        match value {
+            ArgSize::Scalar => Type::AnyScalar,
+            ArgSize::Vector => Type::Vector,
+        }
+    }
 }
 
 impl std::fmt::Display for ArgSize {
@@ -58,7 +69,7 @@ impl std::fmt::Display for ArgSize {
 }
 
 #[derive(Debug)]
-pub struct FunctionExecutionCtx<'a> {
+pub(crate) struct FunctionExecutionCtx<'a> {
     arguments: FixedBumpVec<'a, VmScalar>,
     local_storage: FixedBumpVec<'a, VmScalar>,
     /// If the progs try to access a value within this range, it will access `local_storage` instead of globals.
@@ -109,7 +120,7 @@ impl QuakeCMemory for FunctionExecutionCtx<'_> {
 
 impl FunctionExecutionCtx<'_> {
     pub fn set(&mut self, index: usize, value: VmScalar) -> anyhow::Result<()> {
-        if value.type_() == ScalarType::Void {
+        if value.type_() == VmScalarType::Void {
             return Ok(());
         }
 
@@ -169,21 +180,29 @@ pub type QuakeCFunctionDef = FunctionDef<QuakeCFunctionBody>;
 /// Definition for a QuakeC function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionDef<T = FunctionBody> {
+    /// The offset to the start of this function's statements for QuakeC
+    /// functions, the negative index of a builtin for functions provided
+    /// by the host.
     pub offset: i32,
+    /// The name of this function.
     pub name: Arc<CStr>,
+    /// The source file that this function is defined in.
     pub source: Arc<CStr>,
     /// First N args get copied to the local stack.
-    pub args: ArrayVec<ArgSize, MAX_ARGS>,
+    pub args: ArrayVec<Type, MAX_ARGS>,
+    /// If the function is defined in QuakeC, the function body.
     pub body: T,
 }
 
+/// No body as the function is provided by the host.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Builtin;
 
+/// A function definition for a function provided by the host.
 pub type BuiltinDef = FunctionDef<Builtin>;
 
 impl FunctionDef {
-    pub fn try_into_qc(self) -> Result<QuakeCFunctionDef, FunctionDef<Builtin>> {
+    pub(crate) fn try_into_qc(self) -> Result<QuakeCFunctionDef, FunctionDef<Builtin>> {
         match self.body.try_into_qc() {
             Ok(quakec) => Ok(QuakeCFunctionDef {
                 offset: self.offset,
@@ -204,7 +223,7 @@ impl FunctionDef {
 }
 
 impl QuakeCFunctionDef {
-    pub fn ctx<'scope>(
+    pub(crate) fn ctx<'scope>(
         &self,
         mut alloc: impl BumpAllocatorScopeExt<'scope>,
     ) -> FunctionExecutionCtx<'scope> {
@@ -223,6 +242,7 @@ impl QuakeCFunctionDef {
     }
 }
 
+/// The registry of functions known to the `progs.dat`.
 #[derive(Debug, Clone)]
 pub struct FunctionRegistry {
     by_index: HashMap<i32, FunctionDef>,
@@ -230,21 +250,22 @@ pub struct FunctionRegistry {
 }
 
 impl FunctionRegistry {
-    pub(crate) fn new<I>(statements: ArcSlice<[Statement]>, iter: I) -> anyhow::Result<Self>
-    where
-        I: IntoIterator<Item = LoadFn>,
-    {
-        let (by_index, by_name) = iter
-            .into_iter()
+    pub(crate) fn new(
+        statements: ArcSlice<[Statement]>,
+        definitions: &[LoadFn],
+    ) -> anyhow::Result<Self> {
+        let (by_index, by_name) = definitions
+            .iter()
             .map(Some)
             .chain(std::iter::once(None))
-            .map_windows::<_, _, 2>(|[cur, next]| -> anyhow::Result<_> {
+            .tuple_windows()
+            .map(|(cur, next)| -> anyhow::Result<_> {
                 match (cur, next) {
                     (Some(cur), next) => {
                         let func_def = FunctionDef {
                             name: cur.name.clone(),
                             source: cur.source.clone(),
-                            args: cur.args.clone(),
+                            args: cur.args.iter().copied().map(Into::into).collect(),
                             offset: cur.offset,
                             body: if cur.offset < 0 {
                                 debug_assert_eq!(cur.locals.len(), 0);
@@ -274,6 +295,18 @@ impl FunctionRegistry {
         Ok(Self { by_index, by_name })
     }
 
+    /// Get a function by either an index or a name.
+    pub fn get<F>(&self, func: F) -> anyhow::Result<&FunctionDef>
+    where
+        F: Into<FunctionRef>,
+    {
+        match func.into() {
+            FunctionRef::Offset(i) => self.get_by_index(i),
+            FunctionRef::Name(name) => self.get_by_name(name),
+        }
+    }
+
+    /// Get a function by its index.
     pub fn get_by_index<F>(&self, func: F) -> anyhow::Result<&FunctionDef>
     where
         F: TryInto<i32>,
@@ -286,6 +319,7 @@ impl FunctionRegistry {
             .ok_or_else(|| anyhow::format_err!("Function {func} does not exist"))
     }
 
+    /// Get a function by its name.
     pub fn get_by_name<F>(&self, func: F) -> anyhow::Result<&FunctionDef>
     where
         F: AsRef<CStr>,

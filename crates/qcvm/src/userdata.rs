@@ -1,6 +1,9 @@
+//! Types and traits related to host bindings for the QuakeC runtime.
+
 use std::{
     any::Any,
-    fmt::{self, Display},
+    fmt,
+    ops::{Deref, DerefMut},
     sync::Arc,
 };
 
@@ -9,23 +12,26 @@ use arrayvec::ArrayVec;
 use bump_scope::BumpScope;
 
 use crate::{
-    ARG_ADDRS, ArgType, CallArgs, ExecutionCtx, QuakeCMemory, Value,
-    progs::{
-        FieldDef, FieldOffset, ScalarType, VmScalar, VmValue,
-        functions::{BuiltinDef, MAX_ARGS},
-    },
+    ARG_ADDRS, AsErasedContext, BuiltinDef, CallArgs, ExecutionCtx, FunctionRef, MAX_ARGS,
+    QuakeCArgs, QuakeCMemory, Type, Value,
+    progs::{FieldDef, VectorField, VmScalar, VmValue},
 };
 
+/// User-provided global context. This is passed in to all functions and entity getters/setters.
 pub trait Context {
-    type Entity: ?Sized + Entity;
-    type Function: ?Sized + Function;
-    type Error: std::error::Error + Send + Sync + 'static;
+    /// The type of entity handles.
+    type Entity: ?Sized + EntityHandle<Context = Self>;
+    /// The type of host-provided builtin functions.
+    type Function: ?Sized + Function<Context = Self>;
+    /// The error that is returned by [`Context::builtin`].
+    type Error: std::error::Error;
 
+    /// Given a function definition, get the builtin that it corresponds to (if one exists).
     fn builtin(&self, def: &BuiltinDef) -> Result<Arc<Self::Function>, Self::Error>;
 }
 
 impl Context for dyn ErasedContext {
-    type Entity = dyn ErasedEntity;
+    type Entity = dyn ErasedEntityHandle;
     type Function = dyn ErasedFunction;
     type Error = Arc<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -35,7 +41,9 @@ impl Context for dyn ErasedContext {
     }
 }
 
+/// A type-erased context that can be used for dynamic dispatch.
 pub trait ErasedContext: Any {
+    /// Dynamic version of [`Context::builtin`].
     fn dyn_builtin(&self, def: &BuiltinDef) -> anyhow::Result<Arc<dyn ErasedFunction>>;
 }
 
@@ -57,17 +65,25 @@ where
     T::Function: Sized + ErasedFunction,
 {
     fn dyn_builtin(&self, def: &BuiltinDef) -> anyhow::Result<Arc<dyn ErasedFunction>> {
-        Ok(self.builtin(def)? as Arc<dyn ErasedFunction>)
+        Ok(self.builtin(def).map_err(|e| anyhow::format_err!("{e}"))? as Arc<dyn ErasedFunction>)
     }
 }
 
+/// The type of values that can be used in the QuakeC runtime.
+///
+/// > *TODO*: Implement proper userdata support.
 pub trait QuakeCType: fmt::Debug {
-    fn type_(&self) -> ScalarType;
+    /// The QuakeC type of this value.
+    fn type_(&self) -> Type;
+    /// Whether this value should be considered null.
     fn is_null(&self) -> bool;
 }
 
+/// A dynamic form of [`PartialEq`] that can be used in type-erased contexts.
 pub trait DynEq: Any {
+    /// Dynamic version of [`PartialEq::eq`].
     fn dyn_eq(&self, other: &dyn Any) -> bool;
+    /// Dynamic version of [`PartialEq::ne`].
     fn dyn_ne(&self, other: &dyn Any) -> bool {
         !self.dyn_eq(other)
     }
@@ -86,41 +102,54 @@ where
     }
 }
 
-pub trait Entity: QuakeCType {
-    type Context: ?Sized + Context;
-    type Error: Display + std::error::Error + Send + Sync + 'static;
+/// A handle to a host entity. This should _not_ be the type that stores the actual entity
+/// data. All values in `qcvm` are immutable, the only mutable state is the context. This
+/// should be implemented for a handle to an entity, with the entity data itself being stored
+/// in the context.
+pub trait EntityHandle: QuakeCType {
+    /// The global context that holds the entity data.
+    type Context: ?Sized + Context<Entity = Self>;
+    /// The error returned from this
+    type Error: std::error::Error;
 
+    /// Get a field given this handle and reference to the context.
     fn get(&self, context: &Self::Context, field: &FieldDef) -> Result<Value, Self::Error>;
 
+    /// Set a field given this handle and a mutable reference to the context.
     fn set(
         &self,
         context: &mut Self::Context,
         field: &FieldDef,
-        offset: Option<FieldOffset>,
+        offset: Option<VectorField>,
         value: Value,
     ) -> Result<(), Self::Error>;
 }
 
-pub trait ErasedEntity: DynEq + fmt::Debug {
+/// Type-erased form of [`EntityHandle`], for dynamic dispatch.
+pub trait ErasedEntityHandle: DynEq + fmt::Debug {
+    /// Dynamic form of [`EntityHandle::get`].
     fn dyn_get(&self, context: &dyn Any, field: &FieldDef) -> anyhow::Result<Value>;
 
+    /// Dynamic form of [`EntityHandle::set`].
     fn dyn_set(
         &self,
         context: &mut dyn Any,
         field: &FieldDef,
-        offset: Option<FieldOffset>,
+        offset: Option<VectorField>,
         value: Value,
     ) -> anyhow::Result<()>;
 }
 
-impl<T> ErasedEntity for T
+impl<T> ErasedEntityHandle for T
 where
-    T: Entity + PartialEq + Any,
+    T: EntityHandle + PartialEq + Any,
     T::Context: Sized,
 {
     fn dyn_get(&self, context: &dyn Any, field: &FieldDef) -> anyhow::Result<Value> {
         match context.downcast_ref() {
-            Some(context) => Ok(self.get(context, field)?),
+            Some(context) => Ok(self
+                .get(context, field)
+                .map_err(|e| anyhow::format_err!("{e}"))?),
             None => bail!(
                 "Type mismatch for builtin context: expected {}, found {}",
                 std::any::type_name::<T::Context>(),
@@ -133,11 +162,13 @@ where
         &self,
         context: &mut dyn Any,
         field: &FieldDef,
-        offset: Option<FieldOffset>,
+        offset: Option<VectorField>,
         value: Value,
     ) -> anyhow::Result<()> {
         match context.downcast_mut() {
-            Some(context) => Ok(self.set(context, field, offset, value)?),
+            Some(context) => Ok(self
+                .set(context, field, offset, value)
+                .map_err(|e| anyhow::format_err!("{e}"))?),
             None => bail!(
                 "Type mismatch for builtin context: expected {}, found {}",
                 std::any::type_name::<T::Context>(),
@@ -147,33 +178,61 @@ where
     }
 }
 
+/// A function callable from QuakeC code. This may call further internal functions, and is
+/// passed a configurable context type.
 pub trait Function: QuakeCType {
-    type Context: ?Sized + Context;
-    type Error: std::error::Error + Send + Sync + 'static;
-    type Output: Into<Value>;
+    /// The user-provided context.
+    type Context: ?Sized + Context<Function = Self>;
+    /// The error returned by the methods in this trait.
+    type Error: std::error::Error;
 
-    fn signature(&self) -> Result<ArrayVec<ArgType, MAX_ARGS>, Self::Error>;
-    fn call(&self, context: FnCall<'_, Self::Context>) -> Result<Self::Output, Self::Error>;
+    /// Get the signature of the function. Note that only this number of arguments will
+    /// be passed to the function.
+    fn signature(&self) -> Result<ArrayVec<Type, MAX_ARGS>, Self::Error>;
+    /// Call the function.
+    fn call(&self, context: FnCall<'_, Self::Context>) -> Result<Value, Self::Error>;
 }
 
+/// The function call context, containing both the user context and the current VM context
+/// (which can be used to call into QuakeC functions).
 pub struct FnCall<'a, T: ?Sized = dyn ErasedContext> {
     pub(crate) execution:
         ExecutionCtx<'a, T, BumpScope<'a>, CallArgs<ArrayVec<VmScalar, MAX_ARGS>>>,
 }
 
-impl<T> FnCall<'_, T> {
-    pub fn context(&mut self) -> &mut T {
+impl<T: ?Sized> Deref for FnCall<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.execution.context
+    }
+}
+
+impl<T: ?Sized> DerefMut for FnCall<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.execution.context
+    }
+}
+
+impl<T: ?Sized> FnCall<'_, T> {
+    /// Explicitly get a mutable reference to the user-provided context. This
+    /// is also available via the `Deref`/`DerefMut` implementation
+    pub fn context_mut(&mut self) -> &mut T {
         self.execution.context
     }
 }
 
 impl<T> FnCall<'_, T>
 where
-    T: ?Sized + ErasedContext,
+    T: ?Sized + AsErasedContext,
 {
-    pub fn arguments(&self, args: &[ArgType]) -> impl Iterator<Item = Value> {
+    /// Get an iterator of the arguments to this function. For now, the signature
+    /// must be explicitly provided.
+    ///
+    /// > TODO: The signature should not need to be passed here.
+    pub fn arguments(&self, args: &[Type]) -> impl Iterator<Item = Value> {
         ARG_ADDRS.step_by(3).zip(args).map(|(i, ty)| match ty {
-            ArgType::Vector => {
+            Type::Vector => {
                 let [x, y, z] = self.execution.memory.get_vector(i).unwrap();
                 let vec = [
                     x.try_into().unwrap(),
@@ -205,16 +264,35 @@ impl<'a, T> FnCall<'a, T>
 where
     T: ErasedContext,
 {
-    pub fn into_erased(self) -> FnCall<'a> {
-        FnCall {
-            execution: self.execution.into_erased(),
-        }
+    /// Call a QuakeC function by index or name.
+    pub fn call<A, F>(&mut self, function_ref: F, args: A) -> anyhow::Result<Value>
+    where
+        F: Into<FunctionRef>,
+        A: QuakeCArgs,
+    {
+        let function_def = self
+            .execution
+            .functions
+            .get(function_ref)?
+            .clone()
+            .try_into_qc()
+            .map_err(|def| {
+                anyhow::format_err!("Function {:?} is not a QuakeC function", def.name)
+            })?;
+
+        self.execution
+            .with_args(&function_def.name, args, |mut exec| {
+                Ok(exec.execute_def(&function_def)?.try_into()?)
+            })
     }
 }
 
+/// Type-erased version of [`Function`], for dynamic dispatch.
 pub trait ErasedFunction: QuakeCType + Any + DynEq {
-    fn dyn_signature(&self) -> anyhow::Result<ArrayVec<ArgType, MAX_ARGS>>;
+    /// Dynamic version of [`Function::signature`].
+    fn dyn_signature(&self) -> anyhow::Result<ArrayVec<Type, MAX_ARGS>>;
 
+    /// Dynamic version of [`Function::call`].
     fn dyn_call<'a, 'b>(&'a self, context: FnCall<'b>) -> anyhow::Result<Value>;
 }
 
@@ -229,22 +307,21 @@ impl Function for dyn ErasedFunction {
     // For some reason, `Box<E> where E: Error` only implements `Error` itself if `E` is sized,
     // but `Arc` allows unsized inner values.
     type Error = Arc<dyn std::error::Error + Send + Sync + 'static>;
-    type Output = Value;
 
-    fn signature(&self) -> Result<ArrayVec<ArgType, MAX_ARGS>, Self::Error> {
+    fn signature(&self) -> Result<ArrayVec<Type, MAX_ARGS>, Self::Error> {
         self.dyn_signature()
             .map_err(|e| e.into_boxed_dyn_error().into())
     }
 
-    fn call(&self, context: FnCall<Self::Context>) -> Result<Self::Output, Self::Error> {
+    fn call(&self, context: FnCall<Self::Context>) -> Result<Value, Self::Error> {
         self.dyn_call(context)
             .map_err(|e| e.into_boxed_dyn_error().into())
     }
 }
 
-impl QuakeCType for dyn ErasedEntity {
-    fn type_(&self) -> ScalarType {
-        ScalarType::Entity
+impl QuakeCType for dyn ErasedEntityHandle {
+    fn type_(&self) -> Type {
+        Type::Entity
     }
 
     fn is_null(&self) -> bool {
@@ -252,13 +329,13 @@ impl QuakeCType for dyn ErasedEntity {
     }
 }
 
-impl PartialEq for dyn ErasedEntity {
+impl PartialEq for dyn ErasedEntityHandle {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self, other)
     }
 }
 
-impl Entity for dyn ErasedEntity {
+impl EntityHandle for dyn ErasedEntityHandle {
     type Context = dyn ErasedContext;
     type Error = Arc<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -271,7 +348,7 @@ impl Entity for dyn ErasedEntity {
         &self,
         context: &mut Self::Context,
         field: &FieldDef,
-        offset: Option<FieldOffset>,
+        offset: Option<VectorField>,
         value: Value,
     ) -> Result<(), Self::Error> {
         self.dyn_set(context, field, offset, value)
@@ -284,14 +361,14 @@ where
     T: Function + PartialEq + Any,
     T::Context: Sized,
 {
-    fn dyn_signature(&self) -> anyhow::Result<ArrayVec<ArgType, MAX_ARGS>> {
-        Ok(self.signature()?)
+    fn dyn_signature(&self) -> anyhow::Result<ArrayVec<Type, MAX_ARGS>> {
+        self.signature().map_err(|e| anyhow::format_err!("{e}"))
     }
 
     fn dyn_call(&self, context: FnCall) -> anyhow::Result<Value> {
         let type_name = std::any::type_name_of_val(context.execution.context);
         match context.downcast() {
-            Some(context) => Ok(self.call(context)?.into()),
+            Some(context) => Ok(self.call(context).map_err(|e| anyhow::format_err!("{e}"))?),
             None => bail!(
                 "Type mismatch for builtin context: expected {}, found {}",
                 std::any::type_name::<T::Context>(),

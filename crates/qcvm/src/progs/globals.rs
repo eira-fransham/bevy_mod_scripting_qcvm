@@ -1,22 +1,24 @@
 use std::{ffi::CStr, sync::Arc};
 
-use hashbrown::HashMap;
+use crate::HashMap;
 use itertools::Either;
 
-use crate::progs::{FieldName, GlobalDef, ScalarType, VmScalar};
+use crate::progs::{FieldName, GlobalDef, VmScalar, VmScalarType};
 
 #[derive(Clone, Debug)]
 pub struct Global {
+    // TODO
+    #[expect(dead_code)]
     pub name: FieldName,
 
     /// Should be same as `self.value.type_()`, but may get out of sync due to `Void`.
-    pub type_: ScalarType,
+    pub type_: VmScalarType,
     pub value: VmScalar,
 }
 
 impl Global {
     fn new(def: &GlobalDef) -> Either<Self, [Self; 3]> {
-        match ScalarType::try_from(def.type_) {
+        match VmScalarType::try_from(def.type_) {
             Ok(type_) => Either::Left(Global {
                 name: def.name.clone().into(),
                 type_,
@@ -125,6 +127,8 @@ impl GlobalRegistry {
         self.get(ptr).map(|glob| glob.value.clone())
     }
 
+    // TODO
+    #[expect(dead_code)]
     #[inline]
     pub fn get_vector<I>(&self, index: I) -> anyhow::Result<[f32; 3]>
     where
@@ -149,7 +153,9 @@ impl GlobalRegistry {
         self.get_with_index(ptr.try_into()?)
     }
 
+    // TODO
     #[inline]
+    #[allow(dead_code)]
     pub fn get_mut<P>(&mut self, ptr: P) -> anyhow::Result<&mut Global>
     where
         P: TryInto<u16>,

@@ -8,12 +8,12 @@ use std::{ffi::CStr, fmt, num::NonZeroIsize};
 use tracing::{debug, error};
 
 use crate::{
-    ARG_ADDRS, ArgType, ExecutionCtx, OpResult, Value,
+    ARG_ADDRS, ExecutionCtx, OpResult, Type, Value,
     progs::{
-        EntityField, EntityRef, FieldOffset, FieldPtr, FunctionRef, StringRef, VmScalar, VmValue,
+        EntityField, EntityRef, FieldPtr, StringRef, VectorField, VmFunctionRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
     },
-    userdata::{Context, Entity as _, ErasedFunction, FnCall, Function as _},
+    userdata::{Context, EntityHandle as _, ErasedFunction, FnCall, Function as _},
 };
 
 #[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq)]
@@ -180,13 +180,13 @@ impl ExecutionCtx<'_> {
             .take(num_args)
             .zip(sig)
             .map(|(addr, ty)| match ty {
-                ArgType::Vector => Ok(self.get_vec3(addr)?.into()),
-                ArgType::AnyScalar => Ok(self.get::<_, VmValue>(addr)?),
-                ArgType::Entity => Ok(self.get::<_, EntityRef>(addr)?.into()),
-                ArgType::Function => Ok(self.get::<_, FunctionRef>(addr)?.into()),
-                ArgType::Float => Ok(self.get::<_, f32>(addr)?.into()),
-                ArgType::String => Ok(self.get::<_, StringRef>(addr)?.into()),
-                ArgType::Void => Ok(Default::default()),
+                Type::Vector => Ok(self.get_vec3(addr)?.into()),
+                Type::AnyScalar => Ok(self.get::<_, VmValue>(addr)?),
+                Type::Entity => Ok(self.get::<_, EntityRef>(addr)?.into()),
+                Type::Function => Ok(self.get::<_, VmFunctionRef>(addr)?.into()),
+                Type::Float => Ok(self.get::<_, f32>(addr)?.into()),
+                Type::String => Ok(self.get::<_, StringRef>(addr)?.into()),
+                Type::Void => Ok(Default::default()),
             })
             .flat_map(|value| match value {
                 Ok(value) => Either::Left(<[VmScalar; 3]>::from(value).map(Ok).into_iter()),
@@ -195,7 +195,7 @@ impl ExecutionCtx<'_> {
             .collect::<anyhow::Result<ArrayVec<VmScalar, MAX_ARGS>>>()?;
 
         let vm_value: VmValue = self
-            .with_builtin_call_context(name, args, |ctx| {
+            .with_args(name, args, |ctx| {
                 builtin.dyn_call(FnCall { execution: ctx })
             })?
             .into();
@@ -227,12 +227,12 @@ impl ExecutionCtx<'_> {
             | O::Call6
             | O::Call7
             | O::Call8 => {
-                let func_ref: FunctionRef = self.get(a)?;
+                let func_ref: VmFunctionRef = self.get(a)?;
 
                 let num_args = op as usize - O::Call0 as usize;
 
                 let result = match func_ref {
-                    FunctionRef::Ptr(p) => {
+                    VmFunctionRef::Ptr(p) => {
                         match self.functions.get_by_index(p.0)?.clone().try_into_qc() {
                             Ok(quakec) => self.execute_def(&quakec)?,
                             Err(builtin) => self.enter_builtin(
@@ -242,7 +242,7 @@ impl ExecutionCtx<'_> {
                             )?,
                         }
                     }
-                    FunctionRef::Extern(func) => {
+                    VmFunctionRef::Extern(func) => {
                         self.enter_builtin(c"{anonymous}", &*func, num_args)?
                     }
                 };
@@ -353,9 +353,9 @@ impl ExecutionCtx<'_> {
 
         let scalar = match (value, field_def.field) {
             (Value::Vector(vec), Some(field)) => match field {
-                FieldOffset::X => vec.x.into(),
-                FieldOffset::Y => vec.y.into(),
-                FieldOffset::Z => vec.z.into(),
+                VectorField::X => vec.x.into(),
+                VectorField::Y => vec.y.into(),
+                VectorField::Z => vec.z.into(),
             },
             (_, Some(_)) => anyhow::bail!("Tried to get a field of a non-vector"),
             (value, None) => VmScalar::try_from(value)?,
@@ -615,7 +615,7 @@ impl ExecutionCtx<'_> {
         f2_ptr: i16,
         out_ptr: i16,
     ) -> anyhow::Result<()> {
-        self.scalar_eq::<FunctionRef>(f1_ptr, f2_ptr, out_ptr)
+        self.scalar_eq::<VmFunctionRef>(f1_ptr, f2_ptr, out_ptr)
     }
 
     fn scalar_ne<T>(&mut self, ptr1: i16, ptr2: i16, out_ptr: i16) -> anyhow::Result<()>
@@ -674,7 +674,7 @@ impl ExecutionCtx<'_> {
         f2_ptr: i16,
         out_ptr: i16,
     ) -> anyhow::Result<()> {
-        self.scalar_ne::<FunctionRef>(f1_ptr, f2_ptr, out_ptr)
+        self.scalar_ne::<VmFunctionRef>(f1_ptr, f2_ptr, out_ptr)
     }
 
     // LE: Less than or equal to comparison
@@ -844,21 +844,21 @@ mod test {
         sync::Arc,
     };
 
-    use hashbrown::HashMap;
+    use crate::HashMap;
     use itertools::Itertools;
 
     use crate::{
-        ArgType, EntityRef, Value,
+        EntityRef, Type, Value,
         entity::EntityTypeDef,
         load::{LoadFn, Progs},
         ops::test::assembler::{FunctionBodyBuilder, Reg},
         progs::{
-            FieldDef, FieldOffset, FieldPtr, GlobalDef, GlobalPtr, Ptr, ScalarType, StringTable,
-            Type,
+            FieldDef, FieldPtr, GlobalDef, GlobalPtr, Ptr, StringTable, VectorField, VmScalarType,
+            VmType,
             functions::{FunctionRegistry, MAX_ARGS, Statement},
             globals::GlobalRegistry,
         },
-        userdata::{Context, Entity, FnCall, Function, QuakeCType},
+        userdata::{Context, EntityHandle, FnCall, Function, QuakeCType},
     };
 
     mod assembler {
@@ -867,16 +867,16 @@ mod test {
         use num::FromPrimitive;
 
         use crate::{
-            ARG_ADDRS, ArgType,
+            ARG_ADDRS, Type,
             load::LoadFn,
             ops::Opcode,
-            progs::{ScalarType, Type, functions::Statement},
+            progs::{VmScalarType, VmType, functions::Statement},
         };
 
         /// Extremely bare-bones assembler for testing that makes no attempt to reuse registers.
         pub struct FunctionBodyBuilder<'a> {
             statements: &'a mut Vec<Statement>,
-            arguments: Vec<ArgType>,
+            arguments: Vec<Type>,
             arg_locals: Vec<Reg>,
             locals: Range<usize>,
             offset: usize,
@@ -886,11 +886,11 @@ mod test {
         #[derive(Copy, Clone, PartialEq, Eq)]
         pub struct Reg {
             offset: usize,
-            ty: ArgType,
+            ty: Type,
         }
 
         impl Reg {
-            pub fn new(offset: usize, ty: ArgType) -> Self {
+            pub fn new(offset: usize, ty: Type) -> Self {
                 Self { offset, ty }
             }
         }
@@ -900,7 +900,7 @@ mod test {
                 statements: &'a mut Vec<Statement>,
                 locals_start: usize,
                 name: Arc<CStr>,
-                arguments: Vec<ArgType>,
+                arguments: Vec<Type>,
             ) -> Self {
                 let offset = statements.len();
                 let mut cur_local = locals_start;
@@ -947,9 +947,9 @@ mod test {
                 self.arg_locals[n]
             }
 
-            fn allocate_scalar(&mut self, ty: ArgType) -> Reg {
+            fn allocate_scalar(&mut self, ty: Type) -> Reg {
                 let new_reg = self.locals.end;
-                self.locals.end += ty.num_elements();
+                self.locals.end += ty.arg_size() as usize;
                 Reg {
                     offset: new_reg,
                     ty,
@@ -960,16 +960,16 @@ mod test {
                 &mut self,
                 entity_ref: i16,
                 field_ref: i16,
-                ty: impl Into<Type>,
+                ty: impl Into<VmType>,
             ) -> Reg {
                 let ty = ty.into();
                 let opcode = match ty {
-                    Type::Vector => todo!(),
-                    Type::Scalar(ScalarType::Float) => Opcode::LoadF,
-                    Type::Scalar(ScalarType::String) => Opcode::LoadS,
-                    Type::Scalar(ScalarType::Entity) => Opcode::LoadEnt,
-                    Type::Scalar(ScalarType::FieldRef) => Opcode::LoadFld,
-                    Type::Scalar(ScalarType::Function) => Opcode::LoadFnc,
+                    VmType::Vector => todo!(),
+                    VmType::Scalar(VmScalarType::Float) => Opcode::LoadF,
+                    VmType::Scalar(VmScalarType::String) => Opcode::LoadS,
+                    VmType::Scalar(VmScalarType::Entity) => Opcode::LoadEnt,
+                    VmType::Scalar(VmScalarType::FieldRef) => Opcode::LoadFld,
+                    VmType::Scalar(VmScalarType::Function) => Opcode::LoadFnc,
                     _ => panic!("Unsupported field type!"),
                 };
 
@@ -987,16 +987,12 @@ mod test {
 
             pub fn mul(&mut self, in_a: Reg, in_b: Reg) -> Reg {
                 let (ty, opcode) = match (in_a.ty, in_b.ty) {
-                    (ArgType::Float | ArgType::AnyScalar, ArgType::Float | ArgType::AnyScalar) => {
-                        (ArgType::Float, Opcode::MulF)
+                    (Type::Float | Type::AnyScalar, Type::Float | Type::AnyScalar) => {
+                        (Type::Float, Opcode::MulF)
                     }
-                    (ArgType::Vector, ArgType::Vector) => (ArgType::Vector, Opcode::MulV),
-                    (ArgType::Vector, ArgType::Float | ArgType::AnyScalar) => {
-                        (ArgType::Vector, Opcode::MulVF)
-                    }
-                    (ArgType::Float | ArgType::AnyScalar, ArgType::Vector) => {
-                        (ArgType::Vector, Opcode::MulFV)
-                    }
+                    (Type::Vector, Type::Vector) => (Type::Vector, Opcode::MulV),
+                    (Type::Vector, Type::Float | Type::AnyScalar) => (Type::Vector, Opcode::MulVF),
+                    (Type::Float | Type::AnyScalar, Type::Vector) => (Type::Vector, Opcode::MulFV),
                     _ => panic!("Invalid args to `mul`"),
                 };
 
@@ -1025,10 +1021,10 @@ mod test {
                     arg3: 0,
                 }]);
 
-                self.ret_reg(ArgType::AnyScalar)
+                self.ret_reg(Type::AnyScalar)
             }
 
-            fn ret_reg(&self, ty: ArgType) -> Reg {
+            fn ret_reg(&self, ty: Type) -> Reg {
                 Reg {
                     offset: crate::RETURN_ADDRS.start,
                     ty,
@@ -1036,20 +1032,20 @@ mod test {
             }
 
             fn copy(&mut self, src: Reg, dst: Reg) {
-                let ty_to_check = if matches!(src.ty, ArgType::AnyScalar) {
+                let ty_to_check = if matches!(src.ty, Type::AnyScalar) {
                     dst.ty
                 } else {
                     src.ty
                 };
 
                 let opcode = match ty_to_check {
-                    ArgType::Vector => Opcode::StoreV,
-                    ArgType::String => Opcode::StoreS,
-                    ArgType::Function => Opcode::StoreF,
-                    ArgType::Entity => Opcode::StoreEnt,
-                    ArgType::Float => Opcode::StoreF,
-                    ArgType::Void => return,
-                    ArgType::AnyScalar => panic!("Can't copy any to any"),
+                    Type::Vector => Opcode::StoreV,
+                    Type::String => Opcode::StoreS,
+                    Type::Function => Opcode::StoreF,
+                    Type::Entity => Opcode::StoreEnt,
+                    Type::Float => Opcode::StoreF,
+                    Type::Void => return,
+                    Type::AnyScalar => panic!("Can't copy any to any"),
                 };
 
                 self.statements.extend([Statement {
@@ -1062,7 +1058,7 @@ mod test {
 
             pub fn ret(&mut self, ofs: Reg) {
                 let statement = match ofs.ty {
-                    ArgType::Vector => Statement {
+                    Type::Vector => Statement {
                         opcode: Opcode::Return,
                         arg1: ofs.offset as i16,
                         arg2: ofs.offset as i16 + 1,
@@ -1122,7 +1118,7 @@ mod test {
         fn push_global(
             &mut self,
             name: impl AsRef<str>,
-            ty: impl Into<Type>,
+            ty: impl Into<VmType>,
             value: impl AsRef<[u8]>,
         ) -> GlobalPtr {
             let name = name.as_ref();
@@ -1144,7 +1140,7 @@ mod test {
             GlobalPtr(Ptr(offset as _))
         }
 
-        fn push_field(&mut self, name: impl AsRef<str>, ty: impl Into<Type>) -> FieldPtr {
+        fn push_field(&mut self, name: impl AsRef<str>, ty: impl Into<VmType>) -> FieldPtr {
             let name = name.as_ref();
             let ty = ty.into();
 
@@ -1173,7 +1169,7 @@ mod test {
         fn push_builtin(
             &mut self,
             name: impl AsRef<str>,
-            args: impl IntoIterator<Item = ArgType>,
+            args: impl IntoIterator<Item = Type>,
         ) -> DefinedFunction {
             let name = name.as_ref();
             let offset = self.next_builtin;
@@ -1192,7 +1188,7 @@ mod test {
                 dynamic_id: self
                     .push_global(
                         format!("{name}$addr"),
-                        ScalarType::Function,
+                        VmScalarType::Function,
                         offset.to_le_bytes(),
                     )
                     .0,
@@ -1202,7 +1198,7 @@ mod test {
         fn push_function(
             &mut self,
             name: impl AsRef<str>,
-            args: impl IntoIterator<Item = ArgType>,
+            args: impl IntoIterator<Item = Type>,
             body: impl FnOnce(&mut FunctionBodyBuilder<'_>),
         ) -> DefinedFunction {
             let locals_start = self.locals_start;
@@ -1230,7 +1226,7 @@ mod test {
                 dynamic_id: self
                     .push_global(
                         format!("{name}$addr"),
-                        ScalarType::Function,
+                        VmScalarType::Function,
                         function_id.to_le_bytes(),
                     )
                     .0,
@@ -1242,7 +1238,7 @@ mod test {
                 globals: GlobalRegistry::new(self.globals, &self.global_values).unwrap(),
                 entity_def: EntityTypeDef::new(self.fields),
                 string_table: StringTable::new(self.strings).unwrap(),
-                functions: FunctionRegistry::new(self.statements.into(), self.functions).unwrap(),
+                functions: FunctionRegistry::new(self.statements.into(), &self.functions).unwrap(),
             }
         }
     }
@@ -1255,7 +1251,7 @@ mod test {
     type TestFnBody = dyn Fn(&[Value]) -> Value + Send + Sync;
 
     struct TestFn {
-        signature: &'static [ArgType],
+        signature: &'static [Type],
         body: Box<TestFnBody>,
     }
 
@@ -1297,8 +1293,8 @@ mod test {
     }
 
     impl QuakeCType for TestEnt {
-        fn type_(&self) -> ScalarType {
-            ScalarType::Entity
+        fn type_(&self) -> Type {
+            Type::Entity
         }
 
         fn is_null(&self) -> bool {
@@ -1306,7 +1302,7 @@ mod test {
         }
     }
 
-    impl Entity for TestEnt {
+    impl EntityHandle for TestEnt {
         type Context = TestContext;
         type Error = <TestContext as Context>::Error;
 
@@ -1326,7 +1322,7 @@ mod test {
             &self,
             context: &mut Self::Context,
             field: &FieldDef,
-            offset: Option<FieldOffset>,
+            offset: Option<VectorField>,
             value: Value,
         ) -> Result<(), Self::Error> {
             let existing_value: &mut Value = context
@@ -1346,8 +1342,8 @@ mod test {
     }
 
     impl QuakeCType for TestFn {
-        fn type_(&self) -> ScalarType {
-            ScalarType::Function
+        fn type_(&self) -> Type {
+            Type::Function
         }
 
         fn is_null(&self) -> bool {
@@ -1358,13 +1354,12 @@ mod test {
     impl Function for TestFn {
         type Context = TestContext;
         type Error = <TestContext as Context>::Error;
-        type Output = Value;
 
-        fn signature(&self) -> Result<arrayvec::ArrayVec<ArgType, MAX_ARGS>, Self::Error> {
+        fn signature(&self) -> Result<arrayvec::ArrayVec<Type, MAX_ARGS>, Self::Error> {
             Ok(self.signature.iter().copied().collect())
         }
 
-        fn call(&self, context: FnCall<'_, Self::Context>) -> Result<Self::Output, Self::Error> {
+        fn call(&self, context: FnCall<'_, Self::Context>) -> Result<Value, Self::Error> {
             let arguments = context.arguments(self.signature).collect::<Vec<_>>();
 
             Ok((self.body)(&arguments))
@@ -1382,7 +1377,7 @@ mod test {
         ) -> Result<std::sync::Arc<Self::Function>, Self::Error> {
             match def.name.to_bytes() {
                 b"mul" => Ok(Arc::new(TestFn {
-                    signature: &[ArgType::Float, ArgType::Float],
+                    signature: &[Type::Float, Type::Float],
                     body: Box::new(|args| {
                         let args: &[Value; 2] = args.try_into().unwrap();
                         let [a_f, b_f]: [f32; 2] =
@@ -1392,7 +1387,7 @@ mod test {
                     }),
                 })),
                 b"add" => Ok(Arc::new(TestFn {
-                    signature: &[ArgType::Float, ArgType::Float],
+                    signature: &[Type::Float, Type::Float],
                     body: Box::new(|args| {
                         let args: &[Value; 2] = args.try_into().unwrap();
                         let [a_f, b_f]: [f32; 2] =
@@ -1415,24 +1410,24 @@ mod test {
     fn test_basic() {
         let mut header_builder = HeaderBuilder::default();
 
-        let just_mul = header_builder.push_function(
-            "simple_mul_f",
-            [ArgType::Float, ArgType::Float],
-            |body| {
+        let just_mul =
+            header_builder.push_function("simple_mul_f", [Type::Float, Type::Float], |body| {
                 let arg_0 = body.arg(0);
                 let arg_1 = body.arg(1);
                 let result = body.mul(arg_0, arg_1);
                 body.ret(result);
-            },
-        );
+            });
 
         let executor = crate::QuakeCVm {
             progs: header_builder.build(),
         };
 
         let out: f32 = executor
-            .execution_ctx(&mut TestContext::default(), (3f32, 4f32))
-            .execute_by_index(just_mul.function_id.0 as _)
+            .run(
+                &mut TestContext::default(),
+                just_mul.function_id.0,
+                (3f32, 4f32),
+            )
             .unwrap()
             .try_into()
             .unwrap();
@@ -1445,34 +1440,34 @@ mod test {
         let mut header_builder = HeaderBuilder::default();
 
         let constant =
-            header_builder.push_global("my_const", ScalarType::Float, 10f32.to_le_bytes());
+            header_builder.push_global("my_const", VmScalarType::Float, 10f32.to_le_bytes());
 
-        let mul_by_10 = header_builder.push_function("mul_by_10", [ArgType::Float], |body| {
+        let mul_by_10 = header_builder.push_function("mul_by_10", [Type::Float], |body| {
             let arg_0 = body.arg(0);
-            let arg_1 = Reg::new(constant.0.0 as _, ArgType::Float);
+            let arg_1 = Reg::new(constant.0.0 as _, Type::Float);
             let result = body.mul(arg_0, arg_1);
             body.ret(result);
         });
 
-        let just_mul = header_builder.push_function(
-            "mul_two_by_10",
-            [ArgType::Float, ArgType::Float],
-            |body| {
+        let just_mul =
+            header_builder.push_function("mul_two_by_10", [Type::Float, Type::Float], |body| {
                 let arg_0 = body.arg(0);
                 let arg_1 = body.arg(1);
                 let ret = body.call(mul_by_10.dynamic_id.0 as _, &[arg_1]);
                 let result = body.mul(arg_0, ret);
                 body.ret(result);
-            },
-        );
+            });
 
         let executor = crate::QuakeCVm {
             progs: header_builder.build(),
         };
 
         let out: f32 = executor
-            .execution_ctx(&mut TestContext::default(), (3f32, 4f32))
-            .execute_by_index(just_mul.function_id.0 as _)
+            .run(
+                &mut TestContext::default(),
+                just_mul.function_id.0,
+                (3f32, 4f32),
+            )
             .unwrap()
             .try_into()
             .unwrap();
@@ -1484,11 +1479,11 @@ mod test {
     fn test_call_builtin() {
         let mut header_builder = HeaderBuilder::default();
 
-        let mul_builtin = header_builder.push_builtin("mul", [ArgType::Float]);
+        let mul_builtin = header_builder.push_builtin("mul", [Type::Float]);
 
         let just_mul = header_builder.push_function(
             "mul_three_with_builtin",
-            [ArgType::Float, ArgType::Float, ArgType::Float],
+            [Type::Float, Type::Float, Type::Float],
             |body| {
                 let arg_0 = body.arg(0);
                 let arg_1 = body.arg(1);
@@ -1504,8 +1499,11 @@ mod test {
         };
 
         let out: f32 = executor
-            .execution_ctx(&mut TestContext::default(), (3f32, 4f32, 5f32))
-            .execute_by_index(just_mul.function_id.0 as _)
+            .run(
+                &mut TestContext::default(),
+                just_mul.function_id.0,
+                (3f32, 4f32, 5f32),
+            )
             .unwrap()
             .try_into()
             .unwrap();
@@ -1518,25 +1516,34 @@ mod test {
         let mut header_builder = HeaderBuilder::default();
 
         let ent_global_0 =
-            header_builder.push_global("ent_id_0", ScalarType::Entity, 0i32.to_le_bytes());
+            header_builder.push_global("ent_id_0", VmScalarType::Entity, 0i32.to_le_bytes());
         let ent_global_1 =
-            header_builder.push_global("ent_id_1", ScalarType::Entity, 0i32.to_le_bytes());
+            header_builder.push_global("ent_id_1", VmScalarType::Entity, 0i32.to_le_bytes());
         let ent_global_2 =
-            header_builder.push_global("ent_id_1", ScalarType::Entity, 0i32.to_le_bytes());
-        let float_field = header_builder.push_field("float_field", ScalarType::Float);
+            header_builder.push_global("ent_id_1", VmScalarType::Entity, 0i32.to_le_bytes());
+        let float_field = header_builder.push_field("float_field", VmScalarType::Float);
         let field_ref = header_builder.push_global(
             "ent_field_float",
-            ScalarType::FieldRef,
+            VmScalarType::FieldRef,
             float_field.0.0.to_le_bytes(),
         );
 
         let _just_mul = header_builder.push_function("mul_three_from_fields", [], |body| {
-            let ent_0_fld =
-                body.load_field(ent_global_0.0.0 as _, field_ref.0.0 as _, ScalarType::Float);
-            let ent_1_fld =
-                body.load_field(ent_global_1.0.0 as _, field_ref.0.0 as _, ScalarType::Float);
-            let ent_2_fld =
-                body.load_field(ent_global_2.0.0 as _, field_ref.0.0 as _, ScalarType::Float);
+            let ent_0_fld = body.load_field(
+                ent_global_0.0.0 as _,
+                field_ref.0.0 as _,
+                VmScalarType::Float,
+            );
+            let ent_1_fld = body.load_field(
+                ent_global_1.0.0 as _,
+                field_ref.0.0 as _,
+                VmScalarType::Float,
+            );
+            let ent_2_fld = body.load_field(
+                ent_global_2.0.0 as _,
+                field_ref.0.0 as _,
+                VmScalarType::Float,
+            );
             let mul_tmp_0 = body.mul(ent_0_fld, ent_1_fld);
             let result = body.mul(mul_tmp_0, ent_2_fld);
             body.ret(result);
@@ -1566,8 +1573,7 @@ mod test {
             .value = EntityRef::Entity(Arc::new(TestEnt { id: 2 })).into();
 
         let out: f32 = executor
-            .execution_ctx(&mut TestContext::default(), ())
-            .execute_by_name(c"mul_three_from_fields")
+            .run(&mut TestContext::default(), c"mul_three_from_fields", ())
             .unwrap()
             .try_into()
             .unwrap();

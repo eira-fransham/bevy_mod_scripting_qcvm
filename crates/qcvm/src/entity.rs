@@ -1,12 +1,12 @@
 use std::{ffi::CStr, sync::Arc};
 
-use crate::progs::{FieldDef, FieldOffset, Ptr, ScalarType};
+use crate::progs::{FieldDef, Ptr, VectorField, VmScalarType};
 
 #[derive(Clone, Debug)]
 pub struct ScalarFieldDef {
-    pub field: Option<FieldOffset>,
+    pub field: Option<VectorField>,
     /// The type of the field.
-    pub type_: ScalarType,
+    pub type_: VmScalarType,
     pub def: FieldDef,
 }
 
@@ -57,14 +57,6 @@ impl EntityTypeDef {
         Self {
             scalars: fields.into(),
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.scalars.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     pub fn get(&self, field_ref: Ptr) -> anyhow::Result<&ScalarFieldDef> {

@@ -1,4 +1,4 @@
-# `quakec`
+# `qcvm`
 
 This is a clean-room [QuakeC](https://en.wikipedia.org/wiki/QuakeC) VM implementation,
 designed to be integrated into the [Seismon](https://github.com/eira-fransham/seismon)

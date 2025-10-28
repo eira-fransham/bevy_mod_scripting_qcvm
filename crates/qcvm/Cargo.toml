@@ -18,6 +18,7 @@ bimap.workspace = true
 bitflags.workspace = true
 bump-scope.workspace = true
 byteorder.workspace = true
+hash32.workspace = true
 hashbrown.workspace = true
 glam.workspace = true
 indexmap.workspace = true
