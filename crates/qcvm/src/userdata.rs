@@ -189,6 +189,7 @@ pub trait Function: QuakeCType {
     /// Get the signature of the function. Note that only this number of arguments will
     /// be passed to the function.
     fn signature(&self) -> Result<ArrayVec<Type, MAX_ARGS>, Self::Error>;
+
     /// Call the function.
     fn call(&self, context: FnCall<'_, Self::Context>) -> Result<Value, Self::Error>;
 }

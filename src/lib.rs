@@ -2,10 +2,11 @@
 //!
 //! The main engine is in the `qcvm` crate, work will continue here when that is done.
 
-use std::{borrow::Cow, ffi::CString, str::FromStr as _, sync::Arc};
+use std::{any::TypeId, borrow::Cow, ffi::CString, str::FromStr as _, sync::Arc};
 
 use bevy_ecs::world::WorldId;
 use bevy_log::error;
+use bevy_math::Vec3;
 use bevy_mod_scripting_asset::Language;
 use bevy_mod_scripting_bindings::{
     DynamicScriptFunction, DynamicScriptFunctionMut, ExternalError, FunctionCallContext,
@@ -109,7 +110,22 @@ impl qcvm::userdata::Function for BevyBuiltin {
     type Error = InteropError;
 
     fn signature(&self) -> Result<ArrayVec<qcvm::Type, { qcvm::MAX_ARGS }>, Self::Error> {
-        todo!()
+        let arg_info = match self {
+            BevyBuiltin::Ref(func) => &func.info.arg_info,
+            BevyBuiltin::Mut(func) => &func.info.arg_info,
+        };
+
+        Ok(arg_info
+            .iter()
+            .map(|arg| {
+                // TODO: Do we need to consider `Vec<Vec3>` or other `Vec3`-like types?
+                if arg.type_id == TypeId::of::<Vec3>() {
+                    qcvm::Type::Vector
+                } else {
+                    qcvm::Type::AnyScalar
+                }
+            })
+            .collect())
     }
 
     fn call(
