@@ -464,6 +464,7 @@ impl Deref for FieldPtr {
     }
 }
 
+// TODO: This could be very easily expressed with (64-bit) NaN-boxing
 #[derive(Default, Clone, Debug, PartialEq)]
 pub(crate) enum VmScalar {
     /// This can be converted to any of the other values, as it is just a general "0".
@@ -483,7 +484,7 @@ pub(crate) enum VmScalar {
     /// to a separate struct without increasing size even further,
     /// though.
     ///
-    /// > TODO: Could probably store as SoA to reduce cache misses
+    /// > TODO: NaN-boxing with SoA-style extra storage for larger variants
     EntityField(EntityRef, Ptr),
 }
 
