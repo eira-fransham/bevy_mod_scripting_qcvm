@@ -7,6 +7,7 @@ use std::{
     fmt,
     num::NonZeroIsize,
     ops::{ControlFlow, Range},
+    str::FromStr,
     sync::Arc,
 };
 
@@ -33,8 +34,12 @@ mod ops;
 mod progs;
 pub mod userdata;
 
+pub use arrayvec;
+
+pub use anyhow::{self, Error};
+
 pub use crate::progs::{
-    EntityRef, VectorField,
+    EntityRef, FieldDef, VectorField,
     functions::{Builtin, BuiltinDef, FunctionDef, FunctionRegistry, MAX_ARGS},
 };
 
@@ -169,9 +174,39 @@ impl Value {
     }
 }
 
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        if value { 1. } else { 0. }.into()
+    }
+}
+
 impl From<f32> for Value {
     fn from(value: f32) -> Self {
         Self::Float(value)
+    }
+}
+
+macro_rules! impl_from_by_casting_to_float {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl From<$t> for Value {
+                fn from(value: $t) -> Self {
+                    Self::Float(value as _)
+                }
+            }
+        )*
+    };
+}
+
+impl_from_by_casting_to_float!(
+    f64, i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
+);
+
+impl TryFrom<&str> for Value {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> anyhow::Result<Self> {
+        Ok(Self::String(CString::from_str(value)?.into()))
     }
 }
 
@@ -704,8 +739,10 @@ impl ExecutionMemory<'_> {
     }
 }
 
-const MAGIC_OP_STATE_IMPL_FUNC: &CStr = c"__state__";
-const MAGIC_OP_STATE_IMPL_NUM_ARGS: usize = 2;
+/// The name of the "magic function" implementing `OP_STATE`.
+pub const MAGIC_OP_STATE_IMPL_FUNC: &CStr = c"__state__";
+/// The number of arguments of the "magic function" implementing `OP_STATE`.
+pub const MAGIC_OP_STATE_IMPL_NUM_ARGS: usize = 2;
 
 #[derive(Debug)]
 struct ExecutionCtx<

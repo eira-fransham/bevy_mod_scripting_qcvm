@@ -42,6 +42,8 @@ tracing = "^0.1"
 bevy_reflect = "0.18"
 
 [dependencies]
+qcvm = { path = "crates/qcvm" }
+
 bevy_ecs = "0.18"
 bevy_asset = "0.18"
 bevy_app = "0.18"
@@ -51,6 +53,7 @@ bevy_platform = "0.18"
 
 # Pending update to 0.17
 bevy_mod_scripting_core = "0.19"
+bevy_mod_scripting_script = "0.19"
 bevy_mod_scripting_display = "0.19"
 bevy_mod_scripting_bindings = "0.19"
 bevy_mod_scripting_asset = "0.19"

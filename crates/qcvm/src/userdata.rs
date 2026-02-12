@@ -126,7 +126,7 @@ pub trait EntityHandle: QuakeCType {
 }
 
 /// Type-erased form of [`EntityHandle`], for dynamic dispatch.
-pub trait ErasedEntityHandle: DynEq + fmt::Debug {
+pub trait ErasedEntityHandle: DynEq + Send + Sync + fmt::Debug {
     /// Dynamic form of [`EntityHandle::get`].
     fn dyn_get(&self, context: &dyn Any, field: &FieldDef) -> anyhow::Result<Value>;
 
@@ -142,7 +142,7 @@ pub trait ErasedEntityHandle: DynEq + fmt::Debug {
 
 impl<T> ErasedEntityHandle for T
 where
-    T: EntityHandle + PartialEq + Any,
+    T: EntityHandle + Send + Sync + PartialEq + Any,
     T::Context: Sized,
 {
     fn dyn_get(&self, context: &dyn Any, field: &FieldDef) -> anyhow::Result<Value> {
@@ -288,7 +288,7 @@ where
 }
 
 /// Type-erased version of [`Function`], for dynamic dispatch.
-pub trait ErasedFunction: QuakeCType + Any + DynEq {
+pub trait ErasedFunction: QuakeCType + Send + Sync + DynEq {
     /// Dynamic version of [`Function::signature`].
     fn dyn_signature(&self) -> anyhow::Result<ArrayVec<Type, MAX_ARGS>>;
 
@@ -358,7 +358,7 @@ impl EntityHandle for dyn ErasedEntityHandle {
 
 impl<T> ErasedFunction for T
 where
-    T: Function + PartialEq + Any,
+    T: Function + PartialEq + Any + Send + Sync,
     T::Context: Sized,
 {
     fn dyn_signature(&self) -> anyhow::Result<ArrayVec<Type, MAX_ARGS>> {

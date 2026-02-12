@@ -239,6 +239,7 @@ impl VectorField {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FieldName {
+    // TODO: `CStr` is a pain in the ass to use, we should also support regular strs even if we internally store CStr
     pub name: Arc<CStr>,
     /// For vectors, we want to take the "raw" global definition
     /// and make each field addressable individually, so we only
@@ -281,12 +282,16 @@ impl fmt::Display for GlobalDef {
 /// known at compile time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDef {
+    /// The defined type of the field
     pub type_: VmType,
+    /// The byte offset of the field (usually not used in host bindings)
     pub offset: u16,
+    /// The name of the field
     pub name: Arc<CStr>,
 }
 
 impl FieldDef {
+    /// Extract a scalar field def from a field def that is either a scalar or a vector
     pub fn to_scalar(&self) -> Result<ScalarFieldDef, [ScalarFieldDef; 3]> {
         match VmScalarType::try_from(self.type_) {
             Err(fields) => Err(fields.map(|(type_, field)| ScalarFieldDef {
