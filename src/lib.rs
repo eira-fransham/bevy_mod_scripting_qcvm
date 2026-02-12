@@ -4,13 +4,14 @@
 
 use std::{any::TypeId, borrow::Cow, ffi::CString, str::FromStr as _, sync::Arc};
 
-use bevy_ecs::world::WorldId;
+use bevy_ecs::{component::Component, world::WorldId};
 use bevy_log::error;
 use bevy_math::Vec3;
 use bevy_mod_scripting_asset::Language;
 use bevy_mod_scripting_bindings::{
     DynamicScriptFunction, DynamicScriptFunctionMut, ExternalError, FunctionCallContext,
-    InteropError, ReflectBase, ReflectBaseType, ReflectReference, ScriptValue,
+    InteropError, IntoNamespace, Namespace, ReflectAccessId, ReflectBase, ReflectBaseType,
+    ReflectReference, ScriptValue, ThreadWorldContainer,
 };
 use bevy_mod_scripting_core::{
     IntoScriptPluginParams, ScriptingPlugin,
@@ -46,31 +47,120 @@ impl QuakeCType for BevyEntityHandle {
     }
 }
 
+#[derive(Component)]
+pub struct QcEntity;
+
 impl qcvm::userdata::EntityHandle for BevyEntityHandle {
     type Context = BevyScriptContext;
     type Error = InteropError;
 
-    fn get(&self, _: &Self::Context, _: &FieldDef) -> Result<qcvm::Value, Self::Error> {
-        todo!()
+    fn get(&self, _: &Self::Context, field: &FieldDef) -> Result<qcvm::Value, Self::Error> {
+        // TODO: We could do this just once when initialising the context, which would be significantly more efficient
+        let world = ThreadWorldContainer.try_get_context()?.world;
+
+        let function_registry = world.script_function_registry();
+        let function_registry = function_registry.read();
+
+        // TODO: We unfortunately need global access for now, since we don't know what components a getter will access.
+        //       We can add optimised getter/setter configuration later.
+        world
+            .with_read_access(ReflectAccessId::for_global(), |world| {
+                let key = if field.name.is_empty() {
+                    ScriptValue::Integer(field.offset as i64)
+                } else {
+                    ScriptValue::String(field.name.to_string_lossy().into_owned().into())
+                };
+
+                (function_registry.magic_functions.get)(
+                    FUNCTION_CALL_CONTEXT,
+                    ReflectReference::new_component_ref::<QcEntity>(self.0, world.clone())?,
+                    key,
+                )
+                .and_then(|v| bms_script_value_to_qcvm_script_value(&v))
+            })
+            .map_err(|()| InteropError::MissingWorld)?
     }
 
     fn set(
         &self,
         _context: &mut Self::Context,
-        _field: &FieldDef,
-        _offset: Option<qcvm::VectorField>,
-        _value: qcvm::Value,
+        field: &FieldDef,
+        offset: Option<qcvm::VectorField>,
+        value: qcvm::Value,
     ) -> Result<(), Self::Error> {
-        todo!()
+        // TODO: We could do this just once when initialising the context, which would be significantly more efficient
+        let world = ThreadWorldContainer.try_get_context()?.world;
+
+        let function_registry = world.script_function_registry();
+        let function_registry = function_registry.read();
+
+        // TODO: We unfortunately need global access for now, since we don't know what components a getter will access.
+        //       We can add optimised getter/setter configuration later.
+        world
+            .with_read_access(ReflectAccessId::for_global(), |world| {
+                let key = if field.name.is_empty() {
+                    ScriptValue::Integer(field.offset as i64)
+                } else {
+                    ScriptValue::String(field.name.to_string_lossy().into_owned().into())
+                };
+
+                let new_value = if let Some(offset) = offset {
+                    // Get old value
+                    let mut old = (function_registry.magic_functions.get)(
+                        FUNCTION_CALL_CONTEXT,
+                        ReflectReference::new_component_ref::<QcEntity>(self.0, world.clone())?,
+                        key.clone(),
+                    )
+                    .and_then(|v| bms_script_value_to_qcvm_script_value(&v))?;
+
+                    old.set(Some(offset), value)
+                        // TODO
+                        .map_err(|_| InteropError::NotImplemented)?;
+
+                    old
+                } else {
+                    value
+                };
+
+                let new_value = qcvm_script_value_to_bms_script_value(&new_value)?;
+
+                (function_registry.magic_functions.set)(
+                    FUNCTION_CALL_CONTEXT,
+                    ReflectReference::new_component_ref::<QcEntity>(self.0, world.clone())?,
+                    key,
+                    new_value,
+                )
+            })
+            .map_err(|()| InteropError::MissingWorld)?
     }
 }
+
+pub struct QcBuiltinNamespace;
 
 impl qcvm::userdata::Context for BevyScriptContext {
     fn builtin(
         &self,
-        _def: &qcvm::BuiltinDef,
+        def: &qcvm::BuiltinDef,
     ) -> Result<std::sync::Arc<Self::Function>, Self::Error> {
-        todo!()
+        // TODO: We could do this just once when initialising the context, which would be significantly more efficient (especially
+        //       when we need to look at both builtin and global namespaces).
+        let world = ThreadWorldContainer.try_get_context()?.world;
+
+        let function_registry = world.script_function_registry();
+        let function_registry = function_registry.read();
+
+        // TODO: This is a wasteful way to do lookup, but the API of `bevy_mod_scripting` doesn't really give us a choice
+        let def_name = def.name.to_string_lossy().into_owned();
+
+        if let Ok(func) =
+            function_registry.get_function(QcBuiltinNamespace::into_namespace(), def_name.clone())
+        {
+            Ok(Arc::new(BevyBuiltin::Ref(func.clone())))
+        } else if let Ok(func) = function_registry.get_function(Namespace::Global, def_name) {
+            Ok(Arc::new(BevyBuiltin::Ref(func.clone())))
+        } else {
+            Err(InteropError::NotImplemented)
+        }
     }
 
     type Entity = BevyEntityHandle;
@@ -130,21 +220,20 @@ impl qcvm::userdata::Function for BevyBuiltin {
 
     fn call(
         &self,
-        _context: qcvm::userdata::FnCall<'_, Self::Context>,
+        context: qcvm::userdata::FnCall<'_, Self::Context>,
     ) -> Result<qcvm::Value, Self::Error> {
+        let sig = self.signature()?;
+        let args = context.arguments(&sig);
+        let args = args
+            .map(|val| qcvm_script_value_to_bms_script_value(&val))
+            .collect::<Result<ArrayVec<_, { qcvm::MAX_ARGS }>, _>>()?;
         match self {
-            BevyBuiltin::Ref(func) => {
-                // TODO
-                let args = [];
-                func.call(args, FUNCTION_CALL_CONTEXT)
-                    .and_then(|val| bms_script_value_to_qcvm_script_value(&val))
-            }
-            BevyBuiltin::Mut(func) => {
-                // TODO
-                let args = [];
-                func.call(args, FUNCTION_CALL_CONTEXT)
-                    .and_then(|val| bms_script_value_to_qcvm_script_value(&val))
-            }
+            BevyBuiltin::Ref(func) => func
+                .call(args, FUNCTION_CALL_CONTEXT)
+                .and_then(|val| bms_script_value_to_qcvm_script_value(&val)),
+            BevyBuiltin::Mut(func) => func
+                .call(args, FUNCTION_CALL_CONTEXT)
+                .and_then(|val| bms_script_value_to_qcvm_script_value(&val)),
         }
     }
 }
