@@ -484,9 +484,8 @@ impl TryFrom<VmScalarType> for Type {
             VmScalarType::Float => Type::Float,
             VmScalarType::Entity => Type::Entity,
             VmScalarType::Function => Type::Function,
-            VmScalarType::FieldRef => anyhow::bail!("We don't support `FieldRef` in host bindings"),
-            VmScalarType::GlobalRef => {
-                anyhow::bail!("We don't support `GlobalRef` in host bindings")
+            VmScalarType::FieldRef | VmScalarType::GlobalRef | VmScalarType::EntityFieldRef => {
+                anyhow::bail!("We don't support `{value}` in host bindings")
             }
         })
     }
@@ -704,6 +703,9 @@ impl ExecutionMemory<'_> {
         self.local.set_vector(index, values)
     }
 }
+
+const MAGIC_OP_STATE_IMPL_FUNC: &CStr = c"__state__";
+const MAGIC_OP_STATE_IMPL_NUM_ARGS: usize = 2;
 
 #[derive(Debug)]
 struct ExecutionCtx<

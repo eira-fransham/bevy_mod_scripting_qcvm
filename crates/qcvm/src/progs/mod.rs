@@ -93,7 +93,7 @@ impl From<i16> for Ptr {
     }
 }
 
-#[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "reflect", derive(Reflect))]
 #[repr(u8)]
 pub enum VmScalarType {
@@ -106,6 +106,41 @@ pub enum VmScalarType {
     FieldRef = 5,
     Function = 6,
     GlobalRef = 7,
+
+    /// Fake type, only used internally
+    EntityFieldRef = 255,
+}
+
+impl FromPrimitive for VmScalarType {
+    fn from_i64(n: i64) -> Option<Self> {
+        match n {
+            0 => Some(Self::Void),
+            1 => Some(Self::String),
+            2 => Some(Self::Float),
+            4 => Some(Self::Entity),
+
+            5 => Some(Self::FieldRef),
+            6 => Some(Self::Function),
+            7 => Some(Self::GlobalRef),
+            // `EntityFieldRef` invalid when converting from byte
+            _ => None,
+        }
+    }
+
+    fn from_u64(n: u64) -> Option<Self> {
+        match n {
+            0 => Some(Self::Void),
+            1 => Some(Self::String),
+            2 => Some(Self::Float),
+            4 => Some(Self::Entity),
+
+            5 => Some(Self::FieldRef),
+            6 => Some(Self::Function),
+            7 => Some(Self::GlobalRef),
+            // `EntityFieldRef` invalid when converting from byte
+            _ => None,
+        }
+    }
 }
 
 const VECTOR_TAG: u8 = 3;
@@ -115,7 +150,7 @@ const VECTOR_TAG: u8 = 3;
 #[repr(u8)]
 pub enum VmType {
     Scalar(VmScalarType),
-    Vector = 3,
+    Vector = VECTOR_TAG,
 }
 
 impl From<VmScalarType> for VmType {
@@ -171,6 +206,7 @@ impl fmt::Display for VmScalarType {
             Self::FieldRef => write!(f, "field"),
             Self::Function => write!(f, "function"),
             Self::GlobalRef => write!(f, "pointer"),
+            Self::EntityFieldRef => write!(f, "entityfield"),
         }
     }
 }
@@ -642,8 +678,7 @@ impl VmScalar {
             VmScalar::Function(_) => VmScalarType::Function,
             VmScalar::Global(_) => VmScalarType::GlobalRef,
             VmScalar::Field(_) => VmScalarType::FieldRef,
-            // TODO: Probably not correct.
-            VmScalar::EntityField(..) => VmScalarType::FieldRef,
+            VmScalar::EntityField(..) => VmScalarType::EntityFieldRef,
         }
     }
 
@@ -673,6 +708,10 @@ impl VmScalar {
 
             VmScalarType::FieldRef => Ok(VmScalar::Field(Ptr(i32::from_le_bytes(bytes)))),
             VmScalarType::GlobalRef => Ok(VmScalar::Global(Ptr(i32::from_le_bytes(bytes)))),
+
+            VmScalarType::EntityFieldRef => Err(anyhow::Error::msg(
+                "`entityfield` is invalid in literal instantiation",
+            )),
         }
     }
 }

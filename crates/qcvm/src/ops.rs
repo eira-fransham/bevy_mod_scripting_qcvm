@@ -8,7 +8,8 @@ use std::{ffi::CStr, fmt, num::NonZeroIsize};
 use tracing::{debug, error};
 
 use crate::{
-    ARG_ADDRS, ExecutionCtx, OpResult, Type, Value,
+    ARG_ADDRS, ExecutionCtx, MAGIC_OP_STATE_IMPL_FUNC, MAGIC_OP_STATE_IMPL_NUM_ARGS, OpResult,
+    Type, Value,
     progs::{
         EntityField, EntityRef, FieldPtr, StringRef, VectorField, VmFunctionRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
@@ -304,7 +305,7 @@ impl ExecutionCtx<'_> {
         })
     }
 
-    pub(crate) fn op_if(&mut self, a: i16, b: i16, _c: i16) -> anyhow::Result<OpResult> {
+    fn op_if(&mut self, a: i16, b: i16, _c: i16) -> anyhow::Result<OpResult> {
         let cond = !self.get::<_, VmScalar>(a)?.is_null();
         // debug!("{op}: cond == {cond}");
 
@@ -317,7 +318,7 @@ impl ExecutionCtx<'_> {
         }
     }
 
-    pub(crate) fn op_if_not(&mut self, a: i16, b: i16, _c: i16) -> anyhow::Result<OpResult> {
+    fn op_if_not(&mut self, a: i16, b: i16, _c: i16) -> anyhow::Result<OpResult> {
         let cond = !self.get::<_, VmScalar>(a)?.is_null();
         // debug!("{op}: cond == {cond}");
 
@@ -330,13 +331,13 @@ impl ExecutionCtx<'_> {
         }
     }
 
-    pub(crate) fn op_goto(&mut self, a: i16, _b: i16, _c: i16) -> anyhow::Result<OpResult> {
+    fn op_goto(&mut self, a: i16, _b: i16, _c: i16) -> anyhow::Result<OpResult> {
         Ok(OpResult::Jump(NonZeroIsize::new(a as isize).ok_or_else(
             || anyhow::Error::msg("Tried to jump with an offset of 0"),
         )?))
     }
 
-    pub(crate) fn op_return(&mut self, a: i16, b: i16, c: i16) -> anyhow::Result<[VmScalar; 3]> {
+    fn op_return(&mut self, a: i16, b: i16, c: i16) -> anyhow::Result<[VmScalar; 3]> {
         let val1: VmScalar = self.get(a).unwrap_or_default();
         let val2: VmScalar = self.get(b).unwrap_or_default();
         let val3: VmScalar = self.get(c).unwrap_or_default();
@@ -365,12 +366,7 @@ impl ExecutionCtx<'_> {
     }
 
     // LOAD_V: load vector field from entity
-    pub(crate) fn op_load_v(
-        &mut self,
-        entity: i16,
-        field: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_load_v(&mut self, entity: i16, field: i16, out_ptr: i16) -> anyhow::Result<()> {
         let ent: EntityRef = self.get(entity)?;
         let FieldPtr(ptr) = self.get(field)?;
         let field = self.entity_def.get(ptr)?;
@@ -383,12 +379,7 @@ impl ExecutionCtx<'_> {
         self.set_vector(out_ptr, value.into())
     }
 
-    pub(crate) fn op_address(
-        &mut self,
-        entity: i16,
-        field: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_address(&mut self, entity: i16, field: i16, out_ptr: i16) -> anyhow::Result<()> {
         let entity: EntityRef = self.get(entity)?;
         let field_offset: FieldPtr = self.get(field)?;
 
@@ -418,12 +409,7 @@ impl ExecutionCtx<'_> {
             .dyn_set(self.context, &field_def.def, field_def.field, value)
     }
 
-    pub(crate) fn op_storep_v(
-        &mut self,
-        src_ptr: i16,
-        out_ptr: i16,
-        unused: i16,
-    ) -> anyhow::Result<()> {
+    fn op_storep_v(&mut self, src_ptr: i16, out_ptr: i16, unused: i16) -> anyhow::Result<()> {
         if unused != 0 {
             return Err(anyhow::Error::msg("storep_f: nonzero arg3"));
         }
@@ -458,17 +444,12 @@ impl ExecutionCtx<'_> {
     }
 
     // MUL_F: Float multiplication
-    pub(crate) fn op_mul_f(
-        &mut self,
-        f1_ptr: i16,
-        f2_ptr: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_mul_f(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| a * b)
     }
 
     // MUL_V: Vector dot-product
-    pub(crate) fn op_mul_v(&mut self, v1_id: i16, v2_id: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_mul_v(&mut self, v1_id: i16, v2_id: i16, out_ptr: i16) -> anyhow::Result<()> {
         let v1 = self.get_vec3(v1_id)?;
         let v2 = self.get_vec3(v2_id)?;
 
@@ -480,7 +461,7 @@ impl ExecutionCtx<'_> {
     }
 
     // MUL_FV: Component-wise multiplication of vector by scalar
-    pub(crate) fn op_mul_fv(&mut self, f_id: i16, v_id: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_mul_fv(&mut self, f_id: i16, v_id: i16, out_ptr: i16) -> anyhow::Result<()> {
         let f: f32 = self.get(f_id)?;
         let v = self.get_vec3(v_id)?;
 
@@ -492,7 +473,7 @@ impl ExecutionCtx<'_> {
     }
 
     // MUL_VF: Component-wise multiplication of vector by scalar
-    pub(crate) fn op_mul_vf(&mut self, v_id: i16, f_id: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_mul_vf(&mut self, v_id: i16, f_id: i16, out_ptr: i16) -> anyhow::Result<()> {
         let v = self.get_vec3(v_id)?;
         let f: f32 = self.get(f_id)?;
 
@@ -504,27 +485,17 @@ impl ExecutionCtx<'_> {
     }
 
     // DIV: Float division
-    pub(crate) fn op_div(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_div(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| a / b)
     }
 
     // ADD_F: Float addition
-    pub(crate) fn op_add_f(
-        &mut self,
-        f1_ptr: i16,
-        f2_ptr: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_add_f(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| a + b)
     }
 
     // ADD_V: Vector addition
-    pub(crate) fn op_add_v(
-        &mut self,
-        v1_ptr: i16,
-        v2_ptr: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_add_v(&mut self, v1_ptr: i16, v2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         let v1 = self.get_vec3(v1_ptr)?;
         let v2 = self.get_vec3(v2_ptr)?;
 
@@ -536,17 +507,12 @@ impl ExecutionCtx<'_> {
     }
 
     // SUB_F: Float subtraction
-    pub(crate) fn op_sub_f(
-        &mut self,
-        f1_ptr: i16,
-        f2_ptr: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_sub_f(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| a - b)
     }
 
     // SUB_V: Vector subtraction
-    pub(crate) fn op_sub_v(&mut self, v1_id: i16, v2_id: i16, diff_id: i16) -> anyhow::Result<()> {
+    fn op_sub_v(&mut self, v1_id: i16, v2_id: i16, diff_id: i16) -> anyhow::Result<()> {
         let v1 = self.get_vec3(v1_id)?;
         let v2 = self.get_vec3(v2_id)?;
 
@@ -567,12 +533,12 @@ impl ExecutionCtx<'_> {
     }
 
     // EQ_F: Test equality of two floats
-    pub(crate) fn op_eq_f(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_eq_f(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_eq::<f32>(f1_ptr, f2_ptr, out_ptr)
     }
 
     // EQ_V: Test equality of two vectors
-    pub(crate) fn op_eq_v(&mut self, v1_ptr: i16, v2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_eq_v(&mut self, v1_ptr: i16, v2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         let v1 = self.get_vec3(v1_ptr)?;
         let v2 = self.get_vec3(v2_ptr)?;
 
@@ -584,7 +550,7 @@ impl ExecutionCtx<'_> {
     }
 
     // EQ_S: Test equality of two strings
-    pub(crate) fn op_eq_s(&mut self, s1_ptr: i16, s2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_eq_s(&mut self, s1_ptr: i16, s2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         let s1: StringRef = self.get(s1_ptr)?;
         let s2: StringRef = self.get(s2_ptr)?;
 
@@ -599,22 +565,12 @@ impl ExecutionCtx<'_> {
     }
 
     // EQ_ENT: Test equality of two entities (by identity)
-    pub(crate) fn op_eq_ent(
-        &mut self,
-        e1_ptr: i16,
-        e2_ptr: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_eq_ent(&mut self, e1_ptr: i16, e2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_eq::<EntityRef>(e1_ptr, e2_ptr, out_ptr)
     }
 
     // EQ_FNC: Test equality of two functions (by identity)
-    pub(crate) fn op_eq_fnc(
-        &mut self,
-        f1_ptr: i16,
-        f2_ptr: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_eq_fnc(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_eq::<VmFunctionRef>(f1_ptr, f2_ptr, out_ptr)
     }
 
@@ -628,12 +584,12 @@ impl ExecutionCtx<'_> {
     }
 
     // NE_F: Test inequality of two floats
-    pub(crate) fn op_ne_f(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_ne_f(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_ne::<f32>(f1_ptr, f2_ptr, out_ptr)
     }
 
     // NE_V: Test inequality of two vectors
-    pub(crate) fn op_ne_v(&mut self, v1_ofs: i16, v2_ofs: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_ne_v(&mut self, v1_ofs: i16, v2_ofs: i16, out_ptr: i16) -> anyhow::Result<()> {
         let v1 = self.get_vec3(v1_ofs)?;
         let v2 = self.get_vec3(v2_ofs)?;
 
@@ -645,7 +601,7 @@ impl ExecutionCtx<'_> {
     }
 
     // NE_S: Test inequality of two strings
-    pub(crate) fn op_ne_s(&mut self, s1_ptr: i16, s2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_ne_s(&mut self, s1_ptr: i16, s2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         let s1: StringRef = self.get(s1_ptr)?;
         let s2: StringRef = self.get(s2_ptr)?;
 
@@ -659,41 +615,31 @@ impl ExecutionCtx<'_> {
         Ok(())
     }
 
-    pub(crate) fn op_ne_ent(
-        &mut self,
-        e1_ptr: i16,
-        e2_ptr: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_ne_ent(&mut self, e1_ptr: i16, e2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_ne::<EntityRef>(e1_ptr, e2_ptr, out_ptr)
     }
 
-    pub(crate) fn op_ne_fnc(
-        &mut self,
-        f1_ptr: i16,
-        f2_ptr: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_ne_fnc(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_ne::<VmFunctionRef>(f1_ptr, f2_ptr, out_ptr)
     }
 
     // LE: Less than or equal to comparison
-    pub(crate) fn op_le(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_le(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| a <= b)
     }
 
     // GE: Greater than or equal to comparison
-    pub(crate) fn op_ge(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_ge(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| a >= b)
     }
 
     // LT: Less than comparison
-    pub(crate) fn op_lt(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_lt(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| a < b)
     }
 
     // GT: Greater than comparison
-    pub(crate) fn op_gt(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_gt(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| a > b)
     }
 
@@ -702,12 +648,7 @@ impl ExecutionCtx<'_> {
     }
 
     // STORE_V
-    pub(crate) fn op_store_v(
-        &mut self,
-        src_ofs: i16,
-        dest_ofs: i16,
-        unused: i16,
-    ) -> anyhow::Result<()> {
+    fn op_store_v(&mut self, src_ofs: i16, dest_ofs: i16, unused: i16) -> anyhow::Result<()> {
         if unused != 0 {
             return Err(anyhow::Error::msg("Nonzero arg3 to STORE_V"));
         }
@@ -722,7 +663,7 @@ impl ExecutionCtx<'_> {
     }
 
     // NOT_V: Compare vec to { 0.0, 0.0, 0.0 }
-    pub(crate) fn op_not_v(&mut self, v_id: i16, unused: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_not_v(&mut self, v_id: i16, unused: i16, out_ptr: i16) -> anyhow::Result<()> {
         if unused != 0 {
             return Err(anyhow::Error::msg("Nonzero arg2 to NOT_V"));
         }
@@ -731,7 +672,7 @@ impl ExecutionCtx<'_> {
     }
 
     // NOT_S: Compare string to null string
-    pub(crate) fn op_not_s(&mut self, s_ofs: i16, unused: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_not_s(&mut self, s_ofs: i16, unused: i16, out_ptr: i16) -> anyhow::Result<()> {
         if unused != 0 {
             return Err(anyhow::Error::msg("Nonzero arg2 to NOT_S"));
         }
@@ -744,7 +685,7 @@ impl ExecutionCtx<'_> {
     }
 
     // NOT_F: Compare float to 0.0
-    pub(crate) fn op_not_f(&mut self, f_id: i16, unused: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_not_f(&mut self, f_id: i16, unused: i16, out_ptr: i16) -> anyhow::Result<()> {
         if unused != 0 {
             return Err(anyhow::Error::msg("Nonzero arg2 to NOT_F"));
         }
@@ -753,12 +694,7 @@ impl ExecutionCtx<'_> {
     }
 
     // NOT_FNC: Compare function to null function (0)
-    pub(crate) fn op_not_fnc(
-        &mut self,
-        fnc_id_ptr: i16,
-        unused: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_not_fnc(&mut self, fnc_id_ptr: i16, unused: i16, out_ptr: i16) -> anyhow::Result<()> {
         if unused != 0 {
             return Err(anyhow::Error::msg("Nonzero arg2 to NOT_FNC"));
         }
@@ -767,12 +703,7 @@ impl ExecutionCtx<'_> {
     }
 
     // NOT_ENT: Compare entity to null entity (0)
-    pub(crate) fn op_not_ent(
-        &mut self,
-        ent_ptr: i16,
-        unused: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_not_ent(&mut self, ent_ptr: i16, unused: i16, out_ptr: i16) -> anyhow::Result<()> {
         if unused != 0 {
             return Err(anyhow::Error::msg("Nonzero arg2 to NOT_ENT"));
         }
@@ -781,58 +712,76 @@ impl ExecutionCtx<'_> {
     }
 
     // AND: Logical AND
-    pub(crate) fn op_and(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_and(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: VmScalar, b: VmScalar| {
             !a.is_null() && !b.is_null()
         })
     }
 
     // OR: Logical OR
-    pub(crate) fn op_or(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
+    fn op_or(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: VmScalar, b: VmScalar| {
             !a.is_null() || !b.is_null()
         })
     }
 
     // BIT_AND: Bitwise AND
-    pub(crate) fn op_bit_and(
-        &mut self,
-        f1_ptr: i16,
-        f2_ptr: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_bit_and(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| {
             (a as usize & b as usize) as f32
         })
     }
 
     // BIT_OR: Bitwise OR
-    pub(crate) fn op_bit_or(
-        &mut self,
-        f1_ptr: i16,
-        f2_ptr: i16,
-        out_ptr: i16,
-    ) -> anyhow::Result<()> {
+    fn op_bit_or(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| {
             (a as usize | b as usize) as f32
         })
     }
 
-    pub(crate) fn op_state(
+    fn op_state(
         &mut self,
-        _frame_id_addr: i16,
-        _think_function_addr: i16,
-        unused_c: i16,
+        frame_id_addr: i16,
+        think_function_addr: i16,
+        _unused_c: i16,
     ) -> anyhow::Result<()> {
-        if unused_c != 0 {
-            return Err(anyhow::Error::msg(format!(
-                "state: nonzero arg3 ({unused_c})"
-            )));
+        let arg_addrs = [0, 1].map(|i| ARG_ADDRS.step_by(3).nth(i).unwrap());
+
+        let old_args: [Result<[VmScalar; 3], _>; 2] = arg_addrs.map(|i| self.get_vector(i));
+        let frame_id: f32 = self.get(frame_id_addr)?;
+        let think_function: VmFunctionRef = self.get(think_function_addr)?;
+
+        self.set(arg_addrs[0], frame_id)?;
+        self.set(arg_addrs[1], think_function)?;
+
+        let result = match self
+            .functions
+            .get_by_name(MAGIC_OP_STATE_IMPL_FUNC)
+            .map_err(|e| anyhow::Error::msg("Magic `__state__` function was unset").context(e))?
+            .clone()
+            .try_into_qc()
+        {
+            Ok(quakec) => self.execute_def(&quakec)?,
+            Err(builtin) => self.enter_builtin(
+                &builtin.name,
+                &*self.context.builtin(&builtin)?,
+                MAGIC_OP_STATE_IMPL_NUM_ARGS,
+            )?,
+        };
+
+        if !matches!(result, [VmScalar::Void, VmScalar::Void, VmScalar::Void]) {
+            error!("State magic function returned something other than `void`");
         }
 
-        // `state` is the only opcode that makes assumptions about the entity layout.
-        // We should make it configurable by the consumer.
-        todo!("`OP_STATE` not implemented - should be a builtin");
+        for (i, old_arg) in arg_addrs.iter().zip(old_args) {
+            if let Ok(old_arg) = old_arg {
+                for (j, elem) in old_arg.into_iter().enumerate() {
+                    self.set(i + j, elem)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
