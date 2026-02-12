@@ -347,7 +347,7 @@ impl fmt::Display for FieldDef {
 #[derive(Debug, Default, Clone)]
 pub enum EntityRef {
     /// The zero value for an entity reference - it is invalid to read or write fields on
-    /// this type, but it can be useful to pass it as an argument to builtins.
+    /// this type (TODO: is this true?), but it can be useful to pass it as an argument to builtins.
     #[default]
     Worldspawn,
     /// We use `Entity` rather than an index here so entities that aren't managed by the VM
@@ -385,6 +385,8 @@ pub enum VmFunctionRef {
     /// A reference to a function that is statically known by QuakeC
     Ptr(Ptr),
     /// An inline reference to an external function.
+    ///
+    /// > TODO: This shouldn't be in the actual `VmScalar` type, it should be elsewhere
     Extern(Arc<dyn ErasedFunction>),
 }
 
@@ -464,7 +466,30 @@ impl Deref for FieldPtr {
     }
 }
 
-// TODO: This could be very easily expressed with (64-bit) NaN-boxing
+// TODO: This could be very easily expressed with NaN-boxing
+//
+// Suggested scheme:
+//
+// 3 bit tag, 20 bit payload. 1 bit of 24-bit mantissa reserved for quiet bit, to ensure it
+// doesn't get overwritten (as the quiet bit is allowed by the spec to be overwritten at
+// any point)
+//
+// Tag:
+// 0 - entity
+// 1 - string (static)
+// 2 - string (temp)
+// 3 - function (global)
+// 4 - function (extern)
+// 5 - global (always inline)
+// 6 - field (always inline)
+// 7 - entity field
+//
+// Payload:
+// static string, global function, global/field ref: see `Ref`.
+// entity, temp string, extern function: index into per-type vector stored on VM context
+//   TODO: This needs some kind of garbage collection system, which makes everything way more complicated.
+// entity field: these can only be temps, so we can have a 4-bit index into a 16-element list which is cleared when the function
+//               returns and a 16 bit field reference
 #[derive(Default, Clone, Debug, PartialEq)]
 pub(crate) enum VmScalar {
     /// This can be converted to any of the other values, as it is just a general "0".
