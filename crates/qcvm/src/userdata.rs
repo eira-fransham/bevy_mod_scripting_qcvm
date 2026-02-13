@@ -17,9 +17,16 @@ use crate::{
     progs::{FieldDef, VectorField, VmScalar, VmValue},
 };
 
+/// A type-erased entity handle.
+#[repr(transparent)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub struct ErasedEntityHandle(pub u64);
+
 /// User-provided global context. This is passed in to all functions and entity getters/setters.
 pub trait Context {
     /// The type of entity handles.
+    // TODO: It might be better to somehow handle this in a way that doesn't require wrapping it in an `Arc`,
+    //       as usually entity handles will just be a simple number.
     type Entity: ?Sized + EntityHandle<Context = Self>;
     /// The type of host-provided builtin functions.
     type Function: ?Sized + Function<Context = Self>;
@@ -31,7 +38,7 @@ pub trait Context {
 }
 
 impl Context for dyn ErasedContext {
-    type Entity = dyn ErasedEntityHandle;
+    type Entity = ErasedEntityHandle;
     type Function = dyn ErasedFunction;
     type Error = Arc<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -45,6 +52,18 @@ impl Context for dyn ErasedContext {
 pub trait ErasedContext: Any {
     /// Dynamic version of [`Context::builtin`].
     fn dyn_builtin(&self, def: &BuiltinDef) -> anyhow::Result<Arc<dyn ErasedFunction>>;
+
+    /// Dynamic version of `<Context::Entity as EntityHandle>::get`.
+    fn dyn_entity_get(&self, erased_ent: u64, field: &FieldDef) -> anyhow::Result<Value>;
+
+    /// Dynamic version of `<Context::Entity as EntityHandle>::set`.
+    fn dyn_entity_set(
+        &mut self,
+        erased_ent: u64,
+        field: &FieldDef,
+        offset: Option<VectorField>,
+        value: Value,
+    ) -> anyhow::Result<()>;
 }
 
 impl fmt::Debug for &'_ mut dyn ErasedContext {
@@ -66,6 +85,26 @@ where
 {
     fn dyn_builtin(&self, def: &BuiltinDef) -> anyhow::Result<Arc<dyn ErasedFunction>> {
         Ok(self.builtin(def).map_err(|e| anyhow::format_err!("{e}"))? as Arc<dyn ErasedFunction>)
+    }
+
+    fn dyn_entity_get(&self, erased_ent: u64, field: &FieldDef) -> anyhow::Result<Value> {
+        <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| ent.get(self, field))
+            .map_err(|e| anyhow::format_err!("{e}"))?
+            .map_err(|e| anyhow::format_err!("{e}"))
+    }
+
+    fn dyn_entity_set(
+        &mut self,
+        erased_ent: u64,
+        field: &FieldDef,
+        offset: Option<VectorField>,
+        value: Value,
+    ) -> anyhow::Result<()> {
+        <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| {
+            ent.set(self, field, offset, value)
+        })
+        .map_err(|e| anyhow::format_err!("{e}"))?
+        .map_err(|e| anyhow::format_err!("{e}"))
     }
 }
 
@@ -112,6 +151,22 @@ pub trait EntityHandle: QuakeCType {
     /// The error returned from this
     type Error: std::error::Error;
 
+    /// Convert from an opaque handle to a reference to this type (must be a reference in order to allow unsized handles)
+    fn from_erased<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
+    where
+        F: FnOnce(&Self) -> O,
+    {
+        Self::from_erased_mut(erased, |this| callback(&*this))
+    }
+
+    /// Convert from an opaque handle to a mutable reference to this type (must be a reference in order to allow unsized handles)
+    fn from_erased_mut<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
+    where
+        F: FnOnce(&mut Self) -> O;
+
+    /// Convert this type to an opaque handle
+    fn to_erased(&self) -> u64;
+
     /// Get a field given this handle and reference to the context.
     fn get(&self, context: &Self::Context, field: &FieldDef) -> Result<Value, Self::Error>;
 
@@ -123,59 +178,6 @@ pub trait EntityHandle: QuakeCType {
         offset: Option<VectorField>,
         value: Value,
     ) -> Result<(), Self::Error>;
-}
-
-/// Type-erased form of [`EntityHandle`], for dynamic dispatch.
-pub trait ErasedEntityHandle: DynEq + Send + Sync + fmt::Debug {
-    /// Dynamic form of [`EntityHandle::get`].
-    fn dyn_get(&self, context: &dyn Any, field: &FieldDef) -> anyhow::Result<Value>;
-
-    /// Dynamic form of [`EntityHandle::set`].
-    fn dyn_set(
-        &self,
-        context: &mut dyn Any,
-        field: &FieldDef,
-        offset: Option<VectorField>,
-        value: Value,
-    ) -> anyhow::Result<()>;
-}
-
-impl<T> ErasedEntityHandle for T
-where
-    T: EntityHandle + Send + Sync + PartialEq + Any,
-    T::Context: Sized,
-{
-    fn dyn_get(&self, context: &dyn Any, field: &FieldDef) -> anyhow::Result<Value> {
-        match context.downcast_ref() {
-            Some(context) => Ok(self
-                .get(context, field)
-                .map_err(|e| anyhow::format_err!("{e}"))?),
-            None => bail!(
-                "Type mismatch for builtin context: expected {}, found {}",
-                std::any::type_name::<T::Context>(),
-                std::any::type_name_of_val(context)
-            ),
-        }
-    }
-
-    fn dyn_set(
-        &self,
-        context: &mut dyn Any,
-        field: &FieldDef,
-        offset: Option<VectorField>,
-        value: Value,
-    ) -> anyhow::Result<()> {
-        match context.downcast_mut() {
-            Some(context) => Ok(self
-                .set(context, field, offset, value)
-                .map_err(|e| anyhow::format_err!("{e}"))?),
-            None => bail!(
-                "Type mismatch for builtin context: expected {}, found {}",
-                std::any::type_name::<T::Context>(),
-                std::any::type_name_of_val(context)
-            ),
-        }
-    }
 }
 
 /// A function callable from QuakeC code. This may call further internal functions, and is
@@ -320,7 +322,7 @@ impl Function for dyn ErasedFunction {
     }
 }
 
-impl QuakeCType for dyn ErasedEntityHandle {
+impl QuakeCType for ErasedEntityHandle {
     fn type_(&self) -> Type {
         Type::Entity
     }
@@ -330,18 +332,13 @@ impl QuakeCType for dyn ErasedEntityHandle {
     }
 }
 
-impl PartialEq for dyn ErasedEntityHandle {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self, other)
-    }
-}
-
-impl EntityHandle for dyn ErasedEntityHandle {
+impl EntityHandle for ErasedEntityHandle {
     type Context = dyn ErasedContext;
     type Error = Arc<dyn std::error::Error + Send + Sync + 'static>;
 
     fn get(&self, context: &Self::Context, field: &FieldDef) -> Result<Value, Self::Error> {
-        self.dyn_get(context, field)
+        context
+            .dyn_entity_get(self.0, field)
             .map_err(|e| e.into_boxed_dyn_error().into())
     }
 
@@ -352,8 +349,20 @@ impl EntityHandle for dyn ErasedEntityHandle {
         offset: Option<VectorField>,
         value: Value,
     ) -> Result<(), Self::Error> {
-        self.dyn_set(context, field, offset, value)
+        context
+            .dyn_entity_set(self.0, field, offset, value)
             .map_err(|e| e.into_boxed_dyn_error().into())
+    }
+
+    fn from_erased_mut<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
+    where
+        F: FnOnce(&mut Self) -> O,
+    {
+        Ok(callback(&mut Self(erased)))
+    }
+
+    fn to_erased(&self) -> u64 {
+        self.0
     }
 }
 

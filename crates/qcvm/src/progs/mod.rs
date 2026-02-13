@@ -3,7 +3,10 @@ pub mod globals;
 
 use std::{cmp::Ordering, ffi::CStr, fmt, ops::Deref, sync::Arc};
 
-use crate::HashMap;
+use crate::{
+    HashMap,
+    userdata::{DynEq as _, EntityHandle},
+};
 #[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
 use glam::Vec3;
@@ -352,12 +355,17 @@ pub enum EntityRef {
     Worldspawn,
     /// We use `Entity` rather than an index here so entities that aren't managed by the VM
     /// can still be passed to QuakeC functions.
-    Entity(Arc<dyn ErasedEntityHandle>),
+    Entity(ErasedEntityHandle),
 }
 
 impl EntityRef {
+    /// Create an `EntityRef` from a `T: EntityHandle`.
+    pub fn new<T: EntityHandle>(value: T) -> Self {
+        Self::Entity(ErasedEntityHandle(value.to_erased()))
+    }
+
     /// If the entity reference is not `Worldspawn`, return the inner entity.
-    pub fn non_null(self) -> anyhow::Result<Arc<dyn ErasedEntityHandle>> {
+    pub fn non_null(self) -> anyhow::Result<ErasedEntityHandle> {
         match self {
             Self::Worldspawn => anyhow::bail!("Tried to access fields on worldspawn entity"),
             Self::Entity(ent) => Ok(ent),
@@ -374,7 +382,7 @@ impl PartialEq for EntityRef {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Worldspawn, Self::Worldspawn) => true,
-            (Self::Entity(lhs), Self::Entity(rhs)) => lhs.dyn_eq(&**rhs),
+            (Self::Entity(lhs), Self::Entity(rhs)) => lhs.dyn_eq(rhs),
             _ => false,
         }
     }

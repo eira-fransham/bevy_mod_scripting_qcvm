@@ -5,7 +5,6 @@
 use std::{any::TypeId, borrow::Cow, ffi::CString, str::FromStr as _, sync::Arc};
 
 use bevy_ecs::{component::Component, world::WorldId};
-use bevy_log::error;
 use bevy_math::Vec3;
 use bevy_mod_scripting_asset::Language;
 use bevy_mod_scripting_bindings::{
@@ -104,6 +103,8 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
                     ScriptValue::String(field.name.to_string_lossy().into_owned().into())
                 };
 
+                // TODO: This whole process is horribly wasteful for the very-common case of setting a single field of a vector.
+                //       While it is built for flexibility over speed, this feels like a bit much.
                 let new_value = if let Some(offset) = offset {
                     // Get old value
                     let mut old = (function_registry.magic_functions.get)(
@@ -132,6 +133,19 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
                 )
             })
             .map_err(|()| InteropError::MissingWorld)?
+    }
+
+    fn from_erased_mut<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
+    where
+        F: FnOnce(&mut Self) -> O,
+    {
+        let ent_id = bevy_ecs::entity::Entity::from_bits(erased);
+
+        Ok(callback(&mut Self(ent_id)))
+    }
+
+    fn to_erased(&self) -> u64 {
+        self.0.to_bits()
     }
 }
 
@@ -264,8 +278,8 @@ fn bms_script_value_to_qcvm_script_value(
                     ..
                 },
             ..
-        }) => Ok(qcvm::Value::Entity(qcvm::EntityRef::Entity(Arc::new(
-            BevyEntityHandle(*ent),
+        }) => Ok(qcvm::Value::Entity(qcvm::EntityRef::new(BevyEntityHandle(
+            *ent,
         )))),
         ScriptValue::FunctionMut(_) => todo!(),
         ScriptValue::Function(_) => todo!(),
@@ -327,22 +341,23 @@ impl IntoScriptPluginParams for QcScriptingPlugin {
     fn handler() -> bevy_mod_scripting_core::handler::HandlerFn<Self> {
         fn qc_callback_handler(
             args: Vec<ScriptValue>,
-            context_key: &ScriptAttachment,
+            _context_key: &ScriptAttachment,
             callback: &CallbackLabel,
             context: &mut qcvm::QuakeCVm,
             world_id: WorldId,
         ) -> Result<ScriptValue, InteropError> {
-            if matches!(context_key, ScriptAttachment::StaticScript(_)) {
-                error!(
-                    "QuakeC script used as static script - it should be attached to the worldspawn entity"
-                );
-                return Err(InteropError::NotImplemented);
-            }
+            // TODO: Is this necessary?
+            // if matches!(context_key, ScriptAttachment::StaticScript(_)) {
+            //     error!(
+            //         "QuakeC script used as static script - it should be attached to the worldspawn entity"
+            //     );
+            //     return Err(InteropError::NotImplemented);
+            // }
 
             let callback_cstr = CString::from_str(callback.as_ref()).map_err(|_| {
-                InteropError::Invariant(Box::new(format!(
-                    "Callback name string contained internal NUL"
-                )))
+                InteropError::Invariant(Box::new(
+                    "Callback name string contained internal NUL".to_string(),
+                ))
             })?;
 
             let val = context
@@ -365,7 +380,7 @@ impl IntoScriptPluginParams for QcScriptingPlugin {
             content: &[u8],
             _world_id: WorldId,
         ) -> Result<qcvm::QuakeCVm, InteropError> {
-            Ok(qcvm::QuakeCVm::load(std::io::Cursor::new(content)).map_err(qc_interop_error)?)
+            qcvm::QuakeCVm::load(std::io::Cursor::new(content)).map_err(qc_interop_error)
         }
 
         qc_context_loader

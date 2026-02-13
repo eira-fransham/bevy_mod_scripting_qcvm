@@ -406,7 +406,9 @@ impl ExecutionCtx<'_> {
 
         entity
             .non_null()?
-            .dyn_set(self.context, &field_def.def, field_def.field, value)
+            .set(self.context, &field_def.def, field_def.field, value)?;
+
+        Ok(())
     }
 
     fn op_storep_v(&mut self, src_ptr: i16, out_ptr: i16, unused: i16) -> anyhow::Result<()> {
@@ -421,7 +423,9 @@ impl ExecutionCtx<'_> {
 
         entity
             .non_null()?
-            .dyn_set(self.context, &field_def.def, None, f.into())
+            .set(self.context, &field_def.def, None, f.into())?;
+
+        Ok(())
     }
 
     fn scalar_binop<T, F, O>(
@@ -793,7 +797,7 @@ mod test {
         sync::Arc,
     };
 
-    use crate::HashMap;
+    use crate::{HashMap, userdata::ErasedEntityHandle};
     use itertools::Itertools;
 
     use crate::{
@@ -1288,6 +1292,24 @@ mod test {
 
             Ok(())
         }
+
+        fn from_erased<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
+        where
+            F: FnOnce(&Self) -> O,
+        {
+            todo!()
+        }
+
+        fn from_erased_mut<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
+        where
+            F: FnOnce(&mut Self) -> O,
+        {
+            todo!()
+        }
+
+        fn to_erased(&self) -> u64 {
+            todo!()
+        }
     }
 
     impl QuakeCType for TestFn {
@@ -1507,19 +1529,19 @@ mod test {
             .globals
             .get_mut(ent_global_0.0.0)
             .unwrap()
-            .value = EntityRef::Entity(Arc::new(TestEnt { id: 0 })).into();
+            .value = EntityRef::Entity(ErasedEntityHandle(0)).into();
         executor
             .progs
             .globals
             .get_mut(ent_global_1.0.0)
             .unwrap()
-            .value = EntityRef::Entity(Arc::new(TestEnt { id: 1 })).into();
+            .value = EntityRef::Entity(ErasedEntityHandle(1)).into();
         executor
             .progs
             .globals
             .get_mut(ent_global_2.0.0)
             .unwrap()
-            .value = EntityRef::Entity(Arc::new(TestEnt { id: 2 })).into();
+            .value = EntityRef::Entity(ErasedEntityHandle(2)).into();
 
         let out: f32 = executor
             .run(&mut TestContext::default(), c"mul_three_from_fields", ())

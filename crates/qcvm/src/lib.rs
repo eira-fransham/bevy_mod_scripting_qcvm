@@ -222,8 +222,8 @@ impl From<EntityRef> for Value {
     }
 }
 
-impl From<Arc<dyn ErasedEntityHandle>> for Value {
-    fn from(value: Arc<dyn ErasedEntityHandle>) -> Self {
+impl From<ErasedEntityHandle> for Value {
+    fn from(value: ErasedEntityHandle) -> Self {
         Self::Entity(EntityRef::Entity(value))
     }
 }
