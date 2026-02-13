@@ -64,6 +64,7 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
         //       We can add optimised getter/setter configuration later.
         world
             .with_read_access(ReflectAccessId::for_global(), |world| {
+                // TODO: We can probably use the `quake1` module defs somehow here(?)
                 let key = if field.name.is_empty() {
                     ScriptValue::Integer(field.offset as i64)
                 } else {
@@ -166,6 +167,8 @@ impl qcvm::userdata::Context for BevyScriptContext {
         // TODO: This is a wasteful way to do lookup, but the API of `bevy_mod_scripting` doesn't really give us a choice
         let def_name = def.name.to_string_lossy().into_owned();
 
+        // TODO: Just in case some progs.dats use renamed builtins, we should have some way of looking up via
+        //       index, not just name.
         if let Ok(func) =
             function_registry.get_function(QcBuiltinNamespace::into_namespace(), def_name.clone())
         {

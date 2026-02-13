@@ -789,7 +789,8 @@ impl ExecutionCtx<'_> {
     }
 }
 
-#[cfg(test)]
+// Need `quake1` feature for tests.
+#[cfg(all(test, feature = "quake1"))]
 mod test {
     use std::{
         ffi::{CStr, CString},
@@ -1293,22 +1294,15 @@ mod test {
             Ok(())
         }
 
-        fn from_erased<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
-        where
-            F: FnOnce(&Self) -> O,
-        {
-            todo!()
-        }
-
         fn from_erased_mut<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
         where
             F: FnOnce(&mut Self) -> O,
         {
-            todo!()
+            Ok(callback(&mut Self { id: erased as _ }))
         }
 
         fn to_erased(&self) -> u64 {
-            todo!()
+            self.id as _
         }
     }
 
