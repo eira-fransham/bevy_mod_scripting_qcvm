@@ -224,10 +224,11 @@ impl fmt::Display for VmType {
 }
 
 /// An individual field of a vector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, FromPrimitive)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, FromPrimitive)]
 #[cfg_attr(feature = "reflect", derive(Reflect))]
 pub enum VectorField {
     /// The x component.
+    #[default]
     X = 0,
     /// The y component.
     Y = 1,

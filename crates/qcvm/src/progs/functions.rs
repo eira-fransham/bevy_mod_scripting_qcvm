@@ -1,7 +1,7 @@
 use std::ffi::CStr;
 use std::{fmt, ops::Range, sync::Arc};
 
-use crate::{FunctionRef, HashMap, Type};
+use crate::{ArgType, FunctionRef, HashMap, Type, VectorField, callback_args, function_args};
 use arc_slice::ArcSlice;
 use arrayvec::ArrayVec;
 #[cfg(feature = "reflect")]
@@ -11,10 +11,10 @@ use itertools::Itertools;
 use num::FromPrimitive as _;
 use num_derive::FromPrimitive;
 
+use crate::QCMemory;
 use crate::load::LoadFn;
 use crate::ops::Opcode;
 use crate::progs::{VmScalar, VmScalarType};
-use crate::{ARG_ADDRS, QuakeCMemory};
 
 /// The maximum number of arguments supported by the runtime.
 pub const MAX_ARGS: usize = 8;
@@ -70,7 +70,7 @@ impl std::fmt::Display for ArgSize {
 
 #[derive(Debug)]
 pub(crate) struct FunctionExecutionCtx<'a> {
-    arguments: FixedBumpVec<'a, VmScalar>,
+    params: FixedBumpVec<'a, VmScalar>,
     local_storage: FixedBumpVec<'a, VmScalar>,
     /// If the progs try to access a value within this range, it will access `local_storage` instead of globals.
     ///
@@ -90,20 +90,12 @@ impl FunctionExecutionCtx<'_> {
 
 const LOCAL_STORAGE_ERR: &str =
     "Programmer error: `local_storage` was too small for `local_range`. This is a bug!";
-const ARG_STORAGE_ERR: &str =
-    "Programmer error: `arguments` was too small for `ARG_ADDRS`. This is a bug!";
 
-impl QuakeCMemory for FunctionExecutionCtx<'_> {
+impl QCMemory for FunctionExecutionCtx<'_> {
     type Scalar = Option<VmScalar>;
 
     fn get(&self, index: usize) -> anyhow::Result<Option<VmScalar>> {
-        if ARG_ADDRS.contains(&index) {
-            let index = index - ARG_ADDRS.start;
-
-            Ok(Some(
-                self.arguments.get(index).expect(ARG_STORAGE_ERR).clone(),
-            ))
-        } else if self.local_range.contains(&index) {
+        if self.local_range.contains(&index) {
             let index = index - self.local_range.start;
 
             Ok(Some(
@@ -113,7 +105,16 @@ impl QuakeCMemory for FunctionExecutionCtx<'_> {
                     .clone(),
             ))
         } else {
-            Ok(None)
+            let Ok(index) = u16::try_from(index) else {
+                return Ok(None);
+            };
+
+            match callback_args().find_map(|arg| arg.try_match_scalar(index)) {
+                Some((ArgType::FunctionArg(arg_index), ofs)) => {
+                    Ok(self.params.get(arg_index * 3 + ofs as usize).cloned())
+                }
+                _ => Ok(None),
+            }
         }
     }
 }
@@ -124,20 +125,31 @@ impl FunctionExecutionCtx<'_> {
             return Ok(());
         }
 
-        if ARG_ADDRS.contains(&index) {
-            let index = index - ARG_ADDRS.start;
-
-            let local = self.arguments.get_mut(index).expect(ARG_STORAGE_ERR);
-
-            *local = value;
-        } else if self.local_range.contains(&index) {
+        if self.local_range.contains(&index) {
             let index = index - self.local_range.start;
 
             let local = self.local_storage.get_mut(index).expect(LOCAL_STORAGE_ERR);
 
             *local = value;
         } else {
-            anyhow::bail!("Global {index} is out of range");
+            let out_of_range = || anyhow::bail!("Global {index} is out of range");
+
+            let Ok(index) = u16::try_from(index) else {
+                return out_of_range();
+            };
+
+            match callback_args().find_map(|arg| arg.try_match_scalar(index)) {
+                Some((ArgType::FunctionArg(arg_index), ofs)) => {
+                    if let Some(param) = self.params.get_mut(arg_index * 3 + ofs as usize) {
+                        *param = value;
+                    } else {
+                        return out_of_range();
+                    }
+                }
+                _ => {
+                    return out_of_range();
+                }
+            }
         }
 
         Ok(())
@@ -175,7 +187,7 @@ impl FunctionBody {
     }
 }
 
-pub type QuakeCFunctionDef = FunctionDef<QuakeCFunctionBody>;
+pub type QCFunctionDef = FunctionDef<QuakeCFunctionBody>;
 
 /// Definition for a QuakeC function.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,9 +214,9 @@ pub struct Builtin;
 pub type BuiltinDef = FunctionDef<Builtin>;
 
 impl FunctionDef {
-    pub(crate) fn try_into_qc(self) -> Result<QuakeCFunctionDef, FunctionDef<Builtin>> {
+    pub(crate) fn try_into_qc(self) -> Result<QCFunctionDef, FunctionDef<Builtin>> {
         match self.body.try_into_qc() {
-            Ok(quakec) => Ok(QuakeCFunctionDef {
+            Ok(quakec) => Ok(QCFunctionDef {
                 offset: self.offset,
                 name: self.name,
                 source: self.source,
@@ -222,14 +234,17 @@ impl FunctionDef {
     }
 }
 
-impl QuakeCFunctionDef {
+impl QCFunctionDef {
     pub(crate) fn ctx<'scope>(
         &self,
         mut alloc: impl BumpAllocatorScopeExt<'scope>,
     ) -> FunctionExecutionCtx<'scope> {
         FunctionExecutionCtx {
-            arguments: FixedBumpVec::from_iter_exact_in(
-                std::iter::repeat_n(VmScalar::Void, ARG_ADDRS.len()),
+            params: FixedBumpVec::from_iter_exact_in(
+                std::iter::repeat_n(
+                    VmScalar::Void,
+                    function_args().len() * VectorField::FIELDS.len(),
+                ),
                 &mut alloc,
             ),
             local_storage: FixedBumpVec::from_iter_exact_in(

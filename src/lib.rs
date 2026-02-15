@@ -19,7 +19,9 @@ use bevy_mod_scripting_core::{
     make_plugin_config_static,
 };
 use bevy_mod_scripting_script::ScriptAttachment;
-use qcvm::{FieldDef, QuakeCArgs, arrayvec::ArrayVec, userdata::QuakeCType};
+use qcvm::{
+    ArgError, FieldDef, QCParams, SpecialArgs, anyhow, arrayvec::ArrayVec, userdata::QuakeCType,
+};
 
 pub struct QcScriptingPlugin {
     pub scripting_plugin: ScriptingPlugin<QcScriptingPlugin>,
@@ -188,7 +190,7 @@ impl qcvm::userdata::Context for BevyScriptContext {
 }
 
 #[derive(Debug)]
-struct BevyScriptArgs(Vec<ScriptValue>);
+struct BevyScriptArgs<'a>(&'a [ScriptValue]);
 
 // TODO
 #[expect(dead_code)]
@@ -310,19 +312,20 @@ fn qcvm_script_value_to_bms_script_value(
     }
 }
 
-impl QuakeCArgs for BevyScriptArgs {
+impl QCParams for BevyScriptArgs<'_> {
     type Error = InteropError;
 
-    fn nth(&self, index: usize) -> Result<qcvm::Value, Self::Error> {
-        let arg = self
-            .0
-            .get(index)
-            .ok_or(InteropError::ArgumentCountMismatch {
-                expected: index,
-                got: self.0.len(),
-            })?;
+    fn nth(&self, index: usize) -> Result<qcvm::Value, ArgError<Self::Error>> {
+        let arg = self.0.get(index).ok_or_else(|| ArgError::ArgOutOfRange {
+            len: self.count(),
+            index,
+        })?;
 
-        bms_script_value_to_qcvm_script_value(arg)
+        Ok(bms_script_value_to_qcvm_script_value(arg)?)
+    }
+
+    fn count(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -357,6 +360,49 @@ impl IntoScriptPluginParams for QcScriptingPlugin {
             //     return Err(InteropError::NotImplemented);
             // }
 
+            let mut args_ref = &args[..];
+
+            let special = match args_ref.get(0) {
+                // QuakeC does not support structs, so if any parameter is a struct then we can treat it as
+                // special args. We only support passing special args in the first arg slot though, for
+                // consistency.
+                Some(ScriptValue::Map(map)) => {
+                    let self_ = map
+                        .get("self_")
+                        .map(bms_script_value_to_qcvm_script_value)
+                        .transpose()?;
+                    let other = map
+                        .get("other")
+                        .map(bms_script_value_to_qcvm_script_value)
+                        .transpose()?;
+
+                    args_ref = &args_ref[1..];
+
+                    SpecialArgs {
+                        self_: self_
+                            .map(|val| {
+                                val.try_into().map_err(|e: anyhow::Error| {
+                                    InteropError::External(ExternalError(
+                                        e.into_boxed_dyn_error().into(),
+                                    ))
+                                })
+                            })
+                            .transpose()?,
+                        other: other
+                            .map(|val| {
+                                val.try_into().map_err(|e: anyhow::Error| {
+                                    InteropError::External(ExternalError(
+                                        e.into_boxed_dyn_error().into(),
+                                    ))
+                                })
+                            })
+                            .transpose()?,
+                    }
+                }
+
+                _ => Default::default(),
+            };
+
             let callback_cstr = CString::from_str(callback.as_ref()).map_err(|_| {
                 InteropError::Invariant(Box::new(
                     "Callback name string contained internal NUL".to_string(),
@@ -367,7 +413,10 @@ impl IntoScriptPluginParams for QcScriptingPlugin {
                 .run(
                     &mut BevyScriptContext { world_id },
                     callback_cstr,
-                    BevyScriptArgs(args),
+                    qcvm::CallArgs {
+                        params: BevyScriptArgs(args_ref),
+                        special,
+                    },
                 )
                 .map_err(qc_interop_error)?;
 

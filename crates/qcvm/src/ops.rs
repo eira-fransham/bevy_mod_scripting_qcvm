@@ -2,14 +2,13 @@ use arrayvec::ArrayVec;
 #[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
 use glam::Vec3;
-use itertools::Either;
 use num_derive::FromPrimitive;
 use std::{ffi::CStr, fmt, num::NonZeroIsize};
 use tracing::{debug, error};
 
 use crate::{
-    ARG_ADDRS, ExecutionCtx, MAGIC_OP_STATE_IMPL_FUNC, MAGIC_OP_STATE_IMPL_NUM_ARGS, OpResult,
-    Type, Value,
+    ArgAddr, CallArgs, ExecutionCtx, MAGIC_OP_STATE_IMPL_FUNC, MAGIC_OP_STATE_IMPL_NUM_ARGS,
+    OpResult, Type, Value, function_args,
     progs::{
         EntityField, EntityRef, FieldPtr, StringRef, VectorField, VmFunctionRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
@@ -176,11 +175,11 @@ impl ExecutionCtx<'_> {
             );
         }
 
-        let args = ARG_ADDRS
-            .step_by(3)
+        let params = function_args()
+            .into_iter()
             .take(num_args)
             .zip(sig)
-            .map(|(addr, ty)| match ty {
+            .map(|(ArgAddr { addr, .. }, ty)| match ty {
                 Type::Vector => Ok(self.get_vec3(addr)?.into()),
                 Type::AnyScalar => Ok(self.get::<_, VmValue>(addr)?),
                 Type::Entity => Ok(self.get::<_, EntityRef>(addr)?.into()),
@@ -189,16 +188,21 @@ impl ExecutionCtx<'_> {
                 Type::String => Ok(self.get::<_, StringRef>(addr)?.into()),
                 Type::Void => Ok(Default::default()),
             })
-            .flat_map(|value| match value {
-                Ok(value) => Either::Left(<[VmScalar; 3]>::from(value).map(Ok).into_iter()),
-                Err(e) => Either::Right(std::iter::once(Err(e))),
+            .map(|value| match value {
+                Ok(value) => Ok(<[VmScalar; 3]>::from(value)),
+                Err(e) => Err(e),
             })
-            .collect::<anyhow::Result<ArrayVec<VmScalar, MAX_ARGS>>>()?;
+            .collect::<anyhow::Result<ArrayVec<[VmScalar; 3], MAX_ARGS>>>()?;
 
         let vm_value: VmValue = self
-            .with_args(name, args, |ctx| {
-                builtin.dyn_call(FnCall { execution: ctx })
-            })?
+            .with_args(
+                name,
+                CallArgs {
+                    params,
+                    special: Default::default(),
+                },
+                |ctx| builtin.dyn_call(FnCall { execution: ctx }),
+            )?
             .into();
 
         Ok(vm_value.into())
@@ -749,14 +753,23 @@ impl ExecutionCtx<'_> {
         think_function_addr: i16,
         _unused_c: i16,
     ) -> anyhow::Result<()> {
-        let arg_addrs = [0, 1].map(|i| ARG_ADDRS.step_by(3).nth(i).unwrap());
+        let mut arg_addrs = function_args().into_iter().take(2);
+        let arg_addrs = [
+            arg_addrs
+                .next()
+                .expect("Programmer error: fewer than 2 arg slots"),
+            arg_addrs
+                .next()
+                .expect("Programmer error: fewer than 2 arg slots"),
+        ];
 
-        let old_args: [Result<[VmScalar; 3], _>; 2] = arg_addrs.map(|i| self.get_vector(i));
+        let old_args: [Result<[VmScalar; 3], _>; 2] =
+            arg_addrs.map(|i| self.get_vector(i.addr as usize));
         let frame_id: f32 = self.get(frame_id_addr)?;
         let think_function: VmFunctionRef = self.get(think_function_addr)?;
 
-        self.set(arg_addrs[0], frame_id)?;
-        self.set(arg_addrs[1], think_function)?;
+        self.set(arg_addrs[0].addr as usize, frame_id)?;
+        self.set(arg_addrs[1].addr as usize, think_function)?;
 
         let result = match self
             .functions
@@ -780,7 +793,7 @@ impl ExecutionCtx<'_> {
         for (i, old_arg) in arg_addrs.iter().zip(old_args) {
             if let Ok(old_arg) = old_arg {
                 for (j, elem) in old_arg.into_iter().enumerate() {
-                    self.set(i + j, elem)?;
+                    self.set(i.addr as usize + j, elem)?;
                 }
             }
         }
@@ -798,7 +811,7 @@ mod test {
         sync::Arc,
     };
 
-    use crate::{HashMap, userdata::ErasedEntityHandle};
+    use crate::{CallArgs, HashMap, userdata::ErasedEntityHandle};
     use itertools::Itertools;
 
     use crate::{
@@ -821,7 +834,7 @@ mod test {
         use num::FromPrimitive;
 
         use crate::{
-            ARG_ADDRS, Type,
+            Type, function_args,
             load::LoadFn,
             ops::Opcode,
             progs::{VmScalarType, VmType, functions::Statement},
@@ -964,8 +977,8 @@ mod test {
 
             pub fn call(&mut self, idx: i16, args: &[Reg]) -> Reg {
                 let opcode = Opcode::from_usize(Opcode::Call0 as usize + args.len()).unwrap();
-                for (arg, dst) in args.iter().zip(ARG_ADDRS.step_by(3)) {
-                    self.copy(*arg, Reg::new(dst, arg.ty));
+                for (arg, dst) in args.iter().zip(function_args()) {
+                    self.copy(*arg, Reg::new(dst.addr as usize, arg.ty));
                 }
 
                 self.statements.extend([Statement {
@@ -1391,7 +1404,10 @@ mod test {
             .run(
                 &mut TestContext::default(),
                 just_mul.function_id.0,
-                (3f32, 4f32),
+                CallArgs {
+                    params: (3f32, 4f32),
+                    special: Default::default(),
+                },
             )
             .unwrap()
             .try_into()
@@ -1431,7 +1447,10 @@ mod test {
             .run(
                 &mut TestContext::default(),
                 just_mul.function_id.0,
-                (3f32, 4f32),
+                CallArgs {
+                    params: (3f32, 4f32),
+                    special: Default::default(),
+                },
             )
             .unwrap()
             .try_into()
@@ -1467,7 +1486,10 @@ mod test {
             .run(
                 &mut TestContext::default(),
                 just_mul.function_id.0,
-                (3f32, 4f32, 5f32),
+                CallArgs {
+                    params: (3f32, 4f32, 5f32),
+                    special: Default::default(),
+                },
             )
             .unwrap()
             .try_into()
@@ -1538,7 +1560,14 @@ mod test {
             .value = EntityRef::Entity(ErasedEntityHandle(2)).into();
 
         let out: f32 = executor
-            .run(&mut TestContext::default(), c"mul_three_from_fields", ())
+            .run(
+                &mut TestContext::default(),
+                c"mul_three_from_fields",
+                CallArgs {
+                    params: (),
+                    special: Default::default(),
+                },
+            )
             .unwrap()
             .try_into()
             .unwrap();

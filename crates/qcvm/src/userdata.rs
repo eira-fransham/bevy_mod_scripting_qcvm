@@ -12,8 +12,8 @@ use arrayvec::ArrayVec;
 use bump_scope::BumpScope;
 
 use crate::{
-    ARG_ADDRS, AsErasedContext, BuiltinDef, CallArgs, ExecutionCtx, FunctionRef, MAX_ARGS,
-    QuakeCArgs, QuakeCMemory, Type, Value,
+    AsErasedContext, BuiltinDef, CallArgs, ExecutionCtx, FunctionRef, MAX_ARGS, QCMemory, QCParams,
+    Type, Value, function_args,
     progs::{FieldDef, VectorField, VmScalar, VmValue},
 };
 
@@ -200,7 +200,7 @@ pub trait Function: QuakeCType {
 /// (which can be used to call into QuakeC functions).
 pub struct FnCall<'a, T: ?Sized = dyn ErasedContext> {
     pub(crate) execution:
-        ExecutionCtx<'a, T, BumpScope<'a>, CallArgs<ArrayVec<VmScalar, MAX_ARGS>>>,
+        ExecutionCtx<'a, T, BumpScope<'a>, CallArgs<ArrayVec<[VmScalar; 3], MAX_ARGS>>>,
 }
 
 impl<T: ?Sized> Deref for FnCall<'_, T> {
@@ -234,21 +234,24 @@ where
     ///
     /// > TODO: The signature should not need to be passed here.
     pub fn arguments(&self, args: &[Type]) -> impl Iterator<Item = Value> {
-        ARG_ADDRS.step_by(3).zip(args).map(|(i, ty)| match ty {
-            Type::Vector => {
-                let [x, y, z] = self.execution.memory.get_vector(i).unwrap();
-                let vec = [
-                    x.try_into().unwrap(),
-                    y.try_into().unwrap(),
-                    z.try_into().unwrap(),
-                ];
-                self.execution.to_value(VmValue::Vector(vec)).unwrap()
-            }
-            _ => {
-                let value = self.execution.memory.get(i).unwrap().into();
-                self.execution.to_value(value).unwrap()
-            }
-        })
+        function_args()
+            .into_iter()
+            .zip(args)
+            .map(|(i, ty)| match ty {
+                Type::Vector => {
+                    let [x, y, z] = self.execution.memory.get_vector(i.addr as _).unwrap();
+                    let vec = [
+                        x.try_into().unwrap(),
+                        y.try_into().unwrap(),
+                        z.try_into().unwrap(),
+                    ];
+                    self.execution.to_value(VmValue::Vector(vec)).unwrap()
+                }
+                _ => {
+                    let value = self.execution.memory.get(i.addr as _).unwrap().into();
+                    self.execution.to_value(value).unwrap()
+                }
+            })
     }
 }
 
@@ -268,10 +271,10 @@ where
     T: ErasedContext,
 {
     /// Call a QuakeC function by index or name.
-    pub fn call<A, F>(&mut self, function_ref: F, args: A) -> anyhow::Result<Value>
+    pub fn call<A, F>(&mut self, function_ref: F, args: CallArgs<A>) -> anyhow::Result<Value>
     where
         F: Into<FunctionRef>,
-        A: QuakeCArgs,
+        A: QCParams,
     {
         let function_def = self
             .execution
