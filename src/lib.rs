@@ -32,6 +32,7 @@ pub struct QcScriptingPlugin {
 #[derive(Debug)]
 struct BevyScriptContext {
     worldspawn: Entity,
+    /// Per-execution globals such as self and other
     special_args: hashbrown::HashMap<CString, qcvm::Value>,
 }
 
@@ -82,6 +83,10 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
                     ReflectReference::new_component_ref::<QCEntity>(self.0, world.clone())?,
                     key,
                 )
+                .or_else(|e| match e {
+                    InteropError::InvalidIndex { .. } => Ok(ScriptValue::Unit),
+                    _ => Err(e),
+                })
                 .and_then(|v| bms_script_value_to_qcvm_script_value(&v))
             })
             .map_err(|()| InteropError::MissingWorld)?
@@ -233,6 +238,10 @@ impl qcvm::userdata::Context for BevyScriptContext {
                         )?,
                         key,
                     )
+                    .or_else(|e| match e {
+                        InteropError::InvalidIndex { .. } => Ok(ScriptValue::Unit),
+                        _ => Err(e),
+                    })
                     .and_then(|v| bms_script_value_to_qcvm_script_value(&v))?)
                 },
             )
