@@ -850,7 +850,7 @@ mod test {
             name: Arc<CStr>,
         }
 
-        #[derive(Copy, Clone, PartialEq, Eq)]
+        #[derive(Debug, Copy, Clone, PartialEq, Eq)]
         pub struct Reg {
             offset: usize,
             ty: Type,

@@ -969,55 +969,55 @@ impl ArgAddr {
 }
 
 pub(crate) fn function_args() -> impl ExactSizeIterator<Item = ArgAddr> {
-    use crate::quake1::globals::GlobalAddr;
+    // TODO: Make this generic so contexts can use different arg addrs
 
     [
         ArgAddr {
-            addr: GlobalAddr::Arg0.to_u16(),
+            addr: 4,
             ty: ArgType::FunctionArg(0),
         },
         ArgAddr {
-            addr: GlobalAddr::Arg1.to_u16(),
+            addr: 7,
             ty: ArgType::FunctionArg(1),
         },
         ArgAddr {
-            addr: GlobalAddr::Arg2.to_u16(),
+            addr: 10,
             ty: ArgType::FunctionArg(2),
         },
         ArgAddr {
-            addr: GlobalAddr::Arg3.to_u16(),
+            addr: 13,
             ty: ArgType::FunctionArg(3),
         },
         ArgAddr {
-            addr: GlobalAddr::Arg4.to_u16(),
+            addr: 16,
             ty: ArgType::FunctionArg(4),
         },
         ArgAddr {
-            addr: GlobalAddr::Arg5.to_u16(),
+            addr: 19,
             ty: ArgType::FunctionArg(5),
         },
         ArgAddr {
-            addr: GlobalAddr::Arg6.to_u16(),
+            addr: 22,
             ty: ArgType::FunctionArg(6),
         },
         ArgAddr {
-            addr: GlobalAddr::Arg7.to_u16(),
+            addr: 25,
             ty: ArgType::FunctionArg(7),
         },
         ArgAddr {
-            addr: GlobalAddr::Arg8.to_u16(),
+            addr: 25,
             ty: ArgType::FunctionArg(8),
         },
         ArgAddr {
-            addr: GlobalAddr::Arg9.to_u16(),
+            addr: 25,
             ty: ArgType::FunctionArg(9),
         },
         ArgAddr {
-            addr: GlobalAddr::Arg10.to_u16(),
+            addr: 25,
             ty: ArgType::FunctionArg(10),
         },
         ArgAddr {
-            addr: GlobalAddr::Arg11.to_u16(),
+            addr: 25,
             ty: ArgType::FunctionArg(11),
         },
     ]
