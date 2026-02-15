@@ -39,7 +39,7 @@ pub use arrayvec;
 pub use anyhow::{self, Error};
 
 pub use crate::progs::{
-    EntityRef, FieldDef, VectorField,
+    EntityRef, FieldDef, GlobalDef, VectorField,
     functions::{Builtin, BuiltinDef, FunctionDef, FunctionRegistry, MAX_ARGS},
 };
 
@@ -62,8 +62,9 @@ pub struct SpecialArgs {
 pub struct CallArgs<T> {
     /// Regular function parameters
     pub params: T,
-    /// Special global variables set per execution
-    pub special: SpecialArgs,
+    // /// Special global variables set per execution
+    // TODO: This should be implemented using `Context::global` etc
+    // pub special: SpecialArgs,
 }
 
 type HashMap<K, V> = hashbrown::HashMap<K, V, std::hash::BuildHasherDefault<hash32::FnvHasher>>;
@@ -569,14 +570,15 @@ where
                 Err(ArgError::ArgOutOfRange { .. }) => Ok(None),
                 Err(ArgError::Other(e)) => Err(e.into()),
             },
-            Some((ArgType::Self_, VectorField::X)) => Ok(self
-                .special
-                .self_
-                .map(|ent| VmScalar::Entity(EntityRef::Entity(ent)))),
-            Some((ArgType::Other, VectorField::X)) => Ok(self
-                .special
-                .other
-                .map(|ent| VmScalar::Entity(EntityRef::Entity(ent)))),
+            // TODO: Reimplement special args via `Context::global` etc
+            // Some((ArgType::Self_, VectorField::X)) => Ok(self
+            //     .special
+            //     .self_
+            //     .map(|ent| VmScalar::Entity(EntityRef::Entity(ent)))),
+            // Some((ArgType::Other, VectorField::X)) => Ok(self
+            //     .special
+            //     .other
+            //     .map(|ent| VmScalar::Entity(EntityRef::Entity(ent)))),
             Some(_) => {
                 unreachable!("TODO: This should be impossible - express this in the type system")
             }
@@ -1024,6 +1026,7 @@ pub(crate) fn function_args() -> impl ExactSizeIterator<Item = ArgAddr> {
     .into_iter()
 }
 
+// TODO: Make this configurable
 pub(crate) fn special_args() -> impl ExactSizeIterator<Item = ArgAddr> {
     use crate::quake1::globals::GlobalAddr;
 
@@ -1358,6 +1361,7 @@ impl ExecutionCtx<'_> {
         VmScalar: TryInto<O>,
         <VmScalar as TryInto<O>>::Error: std::error::Error + Send + Sync + 'static,
     {
+        // TODO: Use `Context::global`
         Ok(self.memory.get(index.try_into()?)?.try_into()?)
     }
 
@@ -1368,6 +1372,7 @@ impl ExecutionCtx<'_> {
         V: TryInto<VmScalar>,
         V::Error: std::error::Error + Send + Sync + 'static,
     {
+        // TODO: Use `Context::set_global`
         self.memory.set(index.try_into()?, value.try_into()?)
     }
 

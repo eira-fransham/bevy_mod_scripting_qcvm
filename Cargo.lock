@@ -527,6 +527,7 @@ dependencies = [
  "bevy_mod_scripting_display",
  "bevy_mod_scripting_script",
  "bevy_platform",
+ "hashbrown",
  "qcvm",
 ]
 

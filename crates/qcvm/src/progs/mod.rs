@@ -257,13 +257,17 @@ impl From<Arc<CStr>> for FieldName {
     }
 }
 
+/// A definition for a global in the `progs.dat`
 #[derive(Debug, Clone)]
 pub struct GlobalDef {
-    // TODO: Implement this
-    #[expect(dead_code)]
+    /// Whether the global should be saved in a savegame
+    // TODO: Implement this (should we conflate "save" with "persists between frames"?)
     pub save: bool,
+    /// The type of the global
     pub type_: VmType,
+    /// The offset of the global
     pub offset: u16,
+    /// The name of the global
     pub name: Arc<CStr>,
 }
 

@@ -195,14 +195,9 @@ impl ExecutionCtx<'_> {
             .collect::<anyhow::Result<ArrayVec<[VmScalar; 3], MAX_ARGS>>>()?;
 
         let vm_value: VmValue = self
-            .with_args(
-                name,
-                CallArgs {
-                    params,
-                    special: Default::default(),
-                },
-                |ctx| builtin.dyn_call(FnCall { execution: ctx }),
-            )?
+            .with_args(name, CallArgs { params }, |ctx| {
+                builtin.dyn_call(FnCall { execution: ctx })
+            })?
             .into();
 
         Ok(vm_value.into())
@@ -1382,10 +1377,23 @@ mod test {
                 .into()),
             }
         }
+
+        fn global(&self, _def: &GlobalDef) -> Result<Value, crate::userdata::AddrErr<Self::Error>> {
+            todo!()
+        }
+
+        fn set_global(
+            &mut self,
+            _def: &GlobalDef,
+            _offset: Option<VectorField>,
+            _value: Value,
+        ) -> Result<(), crate::userdata::AddrErr<Self::Error>> {
+            todo!()
+        }
     }
 
     #[test]
-    fn test_basic() {
+    fn basic() {
         let mut header_builder = HeaderBuilder::default();
 
         let just_mul =
@@ -1406,7 +1414,7 @@ mod test {
                 just_mul.function_id.0,
                 CallArgs {
                     params: (3f32, 4f32),
-                    special: Default::default(),
+                    // special: Default::default(),
                 },
             )
             .unwrap()
@@ -1417,7 +1425,7 @@ mod test {
     }
 
     #[test]
-    fn test_subcall() {
+    fn subcall() {
         let mut header_builder = HeaderBuilder::default();
 
         let constant =
@@ -1449,7 +1457,7 @@ mod test {
                 just_mul.function_id.0,
                 CallArgs {
                     params: (3f32, 4f32),
-                    special: Default::default(),
+                    // special: Default::default(),
                 },
             )
             .unwrap()
@@ -1460,7 +1468,7 @@ mod test {
     }
 
     #[test]
-    fn test_call_builtin() {
+    fn call_builtin() {
         let mut header_builder = HeaderBuilder::default();
 
         let mul_builtin = header_builder.push_builtin("mul", [Type::Float]);
@@ -1488,7 +1496,7 @@ mod test {
                 just_mul.function_id.0,
                 CallArgs {
                     params: (3f32, 4f32, 5f32),
-                    special: Default::default(),
+                    // special: Default::default(),
                 },
             )
             .unwrap()
@@ -1499,7 +1507,7 @@ mod test {
     }
 
     #[test]
-    fn test_ent_fields() {
+    fn ent_fields() {
         let mut header_builder = HeaderBuilder::default();
 
         let ent_global_0 =
@@ -1565,7 +1573,7 @@ mod test {
                 c"mul_three_from_fields",
                 CallArgs {
                     params: (),
-                    special: Default::default(),
+                    // special: Default::default(),
                 },
             )
             .unwrap()
@@ -1573,5 +1581,11 @@ mod test {
             .unwrap();
 
         assert_eq!(out, 100f32.powi(3));
+    }
+
+    #[test]
+    fn per_execution_globals() {
+        // TODO: Test per-execution globals (e.g. self, other)
+        todo!()
     }
 }

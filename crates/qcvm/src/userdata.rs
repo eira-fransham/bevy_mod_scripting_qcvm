@@ -14,13 +14,50 @@ use bump_scope::BumpScope;
 use crate::{
     AsErasedContext, BuiltinDef, CallArgs, ExecutionCtx, FunctionRef, MAX_ARGS, QCMemory, QCParams,
     Type, Value, function_args,
-    progs::{FieldDef, VectorField, VmScalar, VmValue},
+    progs::{FieldDef, GlobalDef, VectorField, VmScalar, VmValue},
 };
 
 /// A type-erased entity handle.
 #[repr(transparent)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct ErasedEntityHandle(pub u64);
+
+/// An error when getting/setting an address
+pub enum AddrErr<E> {
+    /// The address does not exist
+    OutOfRange,
+    /// Another error occurred
+    Other(E),
+}
+
+impl<E> From<E> for AddrErr<E> {
+    fn from(value: E) -> Self {
+        Self::Other(value)
+    }
+}
+
+impl<E> AddrErr<E>
+where
+    E: fmt::Display,
+{
+    fn into_anyhow(self) -> AddrErr<anyhow::Error> {
+        {
+            match self {
+                Self::OutOfRange => AddrErr::OutOfRange,
+                Self::Other(e) => AddrErr::Other(anyhow::format_err!("{e}")),
+            }
+        }
+    }
+}
+
+impl AddrErr<anyhow::Error> {
+    fn into_arc_dyn_error(self) -> AddrErr<Arc<dyn std::error::Error + Send + Sync + 'static>> {
+        match self {
+            Self::OutOfRange => AddrErr::OutOfRange,
+            Self::Other(e) => AddrErr::Other(e.into_boxed_dyn_error().into()),
+        }
+    }
+}
 
 /// User-provided global context. This is passed in to all functions and entity getters/setters.
 pub trait Context {
@@ -35,6 +72,17 @@ pub trait Context {
 
     /// Given a function definition, get the builtin that it corresponds to (if one exists).
     fn builtin(&self, def: &BuiltinDef) -> Result<Arc<Self::Function>, Self::Error>;
+
+    /// Get a global with the given definition
+    fn global(&self, def: &GlobalDef) -> Result<Value, AddrErr<Self::Error>>;
+
+    /// Set a global with the given definition
+    fn set_global(
+        &mut self,
+        def: &GlobalDef,
+        offset: Option<VectorField>,
+        value: Value,
+    ) -> Result<(), AddrErr<Self::Error>>;
 }
 
 impl Context for dyn ErasedContext {
@@ -45,6 +93,20 @@ impl Context for dyn ErasedContext {
     fn builtin(&self, def: &BuiltinDef) -> Result<Arc<dyn ErasedFunction>, Self::Error> {
         self.dyn_builtin(def)
             .map_err(|e| e.into_boxed_dyn_error().into())
+    }
+
+    fn global(&self, def: &GlobalDef) -> Result<Value, AddrErr<Self::Error>> {
+        self.dyn_global(def).map_err(AddrErr::into_arc_dyn_error)
+    }
+
+    fn set_global(
+        &mut self,
+        def: &GlobalDef,
+        offset: Option<VectorField>,
+        value: Value,
+    ) -> Result<(), AddrErr<Self::Error>> {
+        self.dyn_set_global(def, offset, value)
+            .map_err(AddrErr::into_arc_dyn_error)
     }
 }
 
@@ -64,6 +126,17 @@ pub trait ErasedContext: Any {
         offset: Option<VectorField>,
         value: Value,
     ) -> anyhow::Result<()>;
+
+    /// Dynamic version of [`Context::global`]
+    fn dyn_global(&self, def: &GlobalDef) -> Result<Value, AddrErr<anyhow::Error>>;
+
+    /// Dynamic version of [`Context::set_global`]
+    fn dyn_set_global(
+        &mut self,
+        def: &GlobalDef,
+        offset: Option<VectorField>,
+        value: Value,
+    ) -> Result<(), AddrErr<anyhow::Error>>;
 }
 
 impl fmt::Debug for &'_ mut dyn ErasedContext {
@@ -105,6 +178,20 @@ where
         })
         .map_err(|e| anyhow::format_err!("{e}"))?
         .map_err(|e| anyhow::format_err!("{e}"))
+    }
+
+    fn dyn_global(&self, def: &GlobalDef) -> Result<Value, AddrErr<anyhow::Error>> {
+        self.global(def).map_err(AddrErr::into_anyhow)
+    }
+
+    fn dyn_set_global(
+        &mut self,
+        def: &GlobalDef,
+        offset: Option<VectorField>,
+        value: Value,
+    ) -> Result<(), AddrErr<anyhow::Error>> {
+        self.set_global(def, offset, value)
+            .map_err(AddrErr::into_anyhow)
     }
 }
 
