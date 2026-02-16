@@ -11,8 +11,9 @@ pub use globals::GLOBALS_RANGE;
 pub mod globals {
     //! Global definitions for `progdefs.q1`, see [the Quake GPL release](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 
-    use std::ops::Range;
+    use std::{fmt, ops::Range};
 
+    use num::FromPrimitive;
     use strum::EnumIter;
 
     use crate::Type;
@@ -172,6 +173,26 @@ pub mod globals {
         SetChangeArgs,
     }
 
+    impl fmt::Display for GlobalAddr {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.name())
+        }
+    }
+
+    impl FromPrimitive for GlobalAddr {
+        fn from_u16(n: u16) -> Option<Self> {
+            Self::from_u16(n, Type::AnyScalar)
+        }
+
+        fn from_i64(n: i64) -> Option<Self> {
+            FromPrimitive::from_u16(n.try_into().ok()?)
+        }
+
+        fn from_u64(n: u64) -> Option<Self> {
+            FromPrimitive::from_u16(n.try_into().ok()?)
+        }
+    }
+
     impl GlobalAddr {
         /// Convert a raw offset into the relevant `GlobalAddr`, given the type. Certain
         /// field offsets are specified to overlap in the `progdefs.qc` in order to have
@@ -179,77 +200,77 @@ pub mod globals {
         /// and `float foo_x`.
         pub const fn from_u16(val: u16, ty: Type) -> Option<Self> {
             match (val, ty) {
-                (28, Type::Entity) => Some(Self::Self_),
-                (29, Type::Entity) => Some(Self::Other),
-                (30, Type::Entity) => Some(Self::World),
-                (31, Type::Float) => Some(Self::Time),
-                (32, Type::Float) => Some(Self::FrameTime),
-                (33, Type::Float) => Some(Self::ForceRetouch),
-                (34, Type::String) => Some(Self::MapName),
-                (35, Type::Float) => Some(Self::Deathmatch),
-                (36, Type::Float) => Some(Self::Coop),
-                (37, Type::Float) => Some(Self::TeamPlay),
-                (38, Type::Float) => Some(Self::ServerFlags),
-                (39, Type::Float) => Some(Self::TotalSecrets),
-                (40, Type::Float) => Some(Self::TotalMonsters),
-                (41, Type::Float) => Some(Self::FoundSecrets),
-                (42, Type::Float) => Some(Self::KilledMonsters),
-                (43, Type::Float) => Some(Self::SpawnParam0),
-                (44, Type::Float) => Some(Self::SpawnParam1),
-                (45, Type::Float) => Some(Self::SpawnParam2),
-                (46, Type::Float) => Some(Self::SpawnParam3),
-                (47, Type::Float) => Some(Self::SpawnParam4),
-                (48, Type::Float) => Some(Self::SpawnParam5),
-                (49, Type::Float) => Some(Self::SpawnParam6),
-                (50, Type::Float) => Some(Self::SpawnParam7),
-                (51, Type::Float) => Some(Self::SpawnParam8),
-                (52, Type::Float) => Some(Self::SpawnParam9),
-                (53, Type::Float) => Some(Self::SpawnParam10),
-                (54, Type::Float) => Some(Self::SpawnParam11),
-                (55, Type::Float) => Some(Self::SpawnParam12),
-                (56, Type::Float) => Some(Self::SpawnParam13),
-                (57, Type::Float) => Some(Self::SpawnParam14),
-                (58, Type::Float) => Some(Self::SpawnParam15),
+                (28, Type::AnyScalar | Type::Entity) => Some(Self::Self_),
+                (29, Type::AnyScalar | Type::Entity) => Some(Self::Other),
+                (30, Type::AnyScalar | Type::Entity) => Some(Self::World),
+                (31, Type::AnyScalar | Type::Float) => Some(Self::Time),
+                (32, Type::AnyScalar | Type::Float) => Some(Self::FrameTime),
+                (33, Type::AnyScalar | Type::Float) => Some(Self::ForceRetouch),
+                (34, Type::AnyScalar | Type::String) => Some(Self::MapName),
+                (35, Type::AnyScalar | Type::Float) => Some(Self::Deathmatch),
+                (36, Type::AnyScalar | Type::Float) => Some(Self::Coop),
+                (37, Type::AnyScalar | Type::Float) => Some(Self::TeamPlay),
+                (38, Type::AnyScalar | Type::Float) => Some(Self::ServerFlags),
+                (39, Type::AnyScalar | Type::Float) => Some(Self::TotalSecrets),
+                (40, Type::AnyScalar | Type::Float) => Some(Self::TotalMonsters),
+                (41, Type::AnyScalar | Type::Float) => Some(Self::FoundSecrets),
+                (42, Type::AnyScalar | Type::Float) => Some(Self::KilledMonsters),
+                (43, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam0),
+                (44, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam1),
+                (45, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam2),
+                (46, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam3),
+                (47, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam4),
+                (48, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam5),
+                (49, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam6),
+                (50, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam7),
+                (51, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam8),
+                (52, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam9),
+                (53, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam10),
+                (54, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam11),
+                (55, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam12),
+                (56, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam13),
+                (57, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam14),
+                (58, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam15),
                 (59, Type::Vector) => Some(Self::VForward),
-                (59, Type::Float) => Some(Self::VForwardX),
-                (60, Type::Float) => Some(Self::VForwardY),
-                (61, Type::Float) => Some(Self::VForwardZ),
+                (59, Type::AnyScalar | Type::Float) => Some(Self::VForwardX),
+                (60, Type::AnyScalar | Type::Float) => Some(Self::VForwardY),
+                (61, Type::AnyScalar | Type::Float) => Some(Self::VForwardZ),
                 (62, Type::Vector) => Some(Self::VUp),
-                (62, Type::Float) => Some(Self::VUpX),
-                (63, Type::Float) => Some(Self::VUpY),
-                (64, Type::Float) => Some(Self::VUpZ),
+                (62, Type::AnyScalar | Type::Float) => Some(Self::VUpX),
+                (63, Type::AnyScalar | Type::Float) => Some(Self::VUpY),
+                (64, Type::AnyScalar | Type::Float) => Some(Self::VUpZ),
                 (65, Type::Vector) => Some(Self::VRight),
-                (65, Type::Float) => Some(Self::VRightX),
-                (66, Type::Float) => Some(Self::VRightY),
-                (67, Type::Float) => Some(Self::VRightZ),
-                (68, Type::Float) => Some(Self::TraceAllSolid),
-                (69, Type::Float) => Some(Self::TraceStartSolid),
-                (70, Type::Float) => Some(Self::TraceFraction),
+                (65, Type::AnyScalar | Type::Float) => Some(Self::VRightX),
+                (66, Type::AnyScalar | Type::Float) => Some(Self::VRightY),
+                (67, Type::AnyScalar | Type::Float) => Some(Self::VRightZ),
+                (68, Type::AnyScalar | Type::Float) => Some(Self::TraceAllSolid),
+                (69, Type::AnyScalar | Type::Float) => Some(Self::TraceStartSolid),
+                (70, Type::AnyScalar | Type::Float) => Some(Self::TraceFraction),
                 (71, Type::Vector) => Some(Self::TraceEndPos),
-                (71, Type::Float) => Some(Self::TraceEndPosX),
-                (72, Type::Float) => Some(Self::TraceEndPosY),
-                (73, Type::Float) => Some(Self::TraceEndPosZ),
+                (71, Type::AnyScalar | Type::Float) => Some(Self::TraceEndPosX),
+                (72, Type::AnyScalar | Type::Float) => Some(Self::TraceEndPosY),
+                (73, Type::AnyScalar | Type::Float) => Some(Self::TraceEndPosZ),
                 (74, Type::Vector) => Some(Self::TracePlaneNormal),
-                (74, Type::Float) => Some(Self::TracePlaneNormalX),
-                (75, Type::Float) => Some(Self::TracePlaneNormalY),
-                (76, Type::Float) => Some(Self::TracePlaneNormalZ),
-                (77, Type::Float) => Some(Self::TracePlaneDist),
-                (78, Type::Entity) => Some(Self::TraceEntity),
-                (79, Type::Float) => Some(Self::TraceInOpen),
-                (80, Type::Float) => Some(Self::TraceInWater),
-                (81, Type::Entity) => Some(Self::MsgEntity),
+                (74, Type::AnyScalar | Type::Float) => Some(Self::TracePlaneNormalX),
+                (75, Type::AnyScalar | Type::Float) => Some(Self::TracePlaneNormalY),
+                (76, Type::AnyScalar | Type::Float) => Some(Self::TracePlaneNormalZ),
+                (77, Type::AnyScalar | Type::Float) => Some(Self::TracePlaneDist),
+                (78, Type::AnyScalar | Type::Entity) => Some(Self::TraceEntity),
+                (79, Type::AnyScalar | Type::Float) => Some(Self::TraceInOpen),
+                (80, Type::AnyScalar | Type::Float) => Some(Self::TraceInWater),
+                (81, Type::AnyScalar | Type::Entity) => Some(Self::MsgEntity),
 
                 // Functions
-                (82, Type::Function) => Some(Self::Main),
-                (83, Type::Function) => Some(Self::StartFrame),
-                (84, Type::Function) => Some(Self::PlayerPreThink),
-                (85, Type::Function) => Some(Self::PlayerPostThink),
-                (86, Type::Function) => Some(Self::ClientKill),
-                (87, Type::Function) => Some(Self::ClientConnect),
-                (88, Type::Function) => Some(Self::PutClientInServer),
-                (89, Type::Function) => Some(Self::ClientDisconnect),
-                (90, Type::Function) => Some(Self::SetNewArgs),
-                (91, Type::Function) => Some(Self::SetChangeArgs),
+                (82, Type::AnyScalar | Type::Function) => Some(Self::Main),
+                (83, Type::AnyScalar | Type::Function) => Some(Self::StartFrame),
+                (84, Type::AnyScalar | Type::Function) => Some(Self::PlayerPreThink),
+                (85, Type::AnyScalar | Type::Function) => Some(Self::PlayerPostThink),
+                (86, Type::AnyScalar | Type::Function) => Some(Self::ClientKill),
+                (87, Type::AnyScalar | Type::Function) => Some(Self::ClientConnect),
+                (88, Type::AnyScalar | Type::Function) => Some(Self::PutClientInServer),
+                (89, Type::AnyScalar | Type::Function) => Some(Self::ClientDisconnect),
+                (90, Type::AnyScalar | Type::Function) => Some(Self::SetNewArgs),
+                (91, Type::AnyScalar | Type::Function) => Some(Self::SetChangeArgs),
                 _ => None,
             }
         }
@@ -332,7 +353,7 @@ pub mod globals {
         }
 
         /// Get the name of this global.
-        pub const fn name(&self) -> &str {
+        pub const fn name(&self) -> &'static str {
             match self {
                 Self::Self_ => "self",
                 Self::Other => "other",

@@ -227,9 +227,9 @@ impl fmt::Display for VmType {
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, FromPrimitive)]
 #[cfg_attr(feature = "reflect", derive(Reflect))]
 pub enum VectorField {
-    /// The x component.
+    /// The x component, or the only field of a scalar.
     #[default]
-    X = 0,
+    XOrScalar = 0,
     /// The y component.
     Y = 1,
     /// The z component.
@@ -238,7 +238,7 @@ pub enum VectorField {
 
 impl VectorField {
     /// All fields of a vector.
-    pub const FIELDS: [Self; 3] = [VectorField::X, VectorField::Y, VectorField::Z];
+    pub const FIELDS: [Self; 3] = [VectorField::XOrScalar, VectorField::Y, VectorField::Z];
 }
 
 /// A definition for a global in the `progs.dat`
@@ -246,8 +246,11 @@ impl VectorField {
 pub struct GlobalDef {
     /// Whether the global should be saved in a savegame
     // TODO: Implement this (should we conflate "save" with "persists between frames"?)
+    #[expect(dead_code, reason = "TODO: Implement save")]
     pub save: bool,
     /// The type of the global
+    ///
+    /// > TODO: This should not be exposed in this form, `VmType` shouldn't be externally visible
     pub type_: VmType,
     /// The offset of the global
     pub offset: u16,
@@ -287,12 +290,12 @@ impl FieldDef {
     pub fn to_scalar(&self) -> Result<ScalarFieldDef, [ScalarFieldDef; 3]> {
         match VmScalarType::try_from(self.type_) {
             Err(fields) => Err(fields.map(|(type_, field)| ScalarFieldDef {
-                field: Some(field),
+                field,
                 def: self.clone(),
                 type_,
             })),
             Ok(type_) => Ok(ScalarFieldDef {
-                field: None,
+                field: Default::default(),
                 def: self.clone(),
                 type_,
             }),

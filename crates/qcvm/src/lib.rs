@@ -39,7 +39,7 @@ pub use arrayvec;
 pub use anyhow::{self, Error};
 
 pub use crate::progs::{
-    EntityRef, FieldDef, GlobalDef, VectorField,
+    EntityRef, FieldDef, VectorField,
     functions::{Builtin, BuiltinDef, FunctionDef, FunctionRegistry, MAX_ARGS},
 };
 
@@ -124,7 +124,7 @@ pub enum SetValueError {
 
 impl Value {
     /// The [`Type`] of this value.
-    pub fn type_(&self) -> Type {
+    pub const fn type_(&self) -> Type {
         match self {
             Value::Void => Type::Void,
             Value::Entity(_) => Type::Entity,
@@ -144,11 +144,11 @@ impl Value {
     ) -> Result<VmScalar, TryScalarError> {
         Ok(match (self, field.into()) {
             (Value::Vector(v), Some(offset)) => match offset {
-                VectorField::X => v.x.into(),
+                VectorField::XOrScalar => v.x.into(),
                 VectorField::Y => v.y.into(),
                 VectorField::Z => v.z.into(),
             },
-            (_, None | Some(VectorField::X)) => self
+            (_, None | Some(VectorField::XOrScalar)) => self
                 .clone()
                 .try_into()
                 .map_err(|_| TryScalarError::CannotGetVectorAsScalar)?,
@@ -169,7 +169,7 @@ impl Value {
         match (self, field.into(), value) {
             (this, None, value) => *this = value,
             (Value::Vector(v), Some(offset), Value::Float(f)) => match offset {
-                VectorField::X => v.x = f,
+                VectorField::XOrScalar => v.x = f,
                 VectorField::Y => v.y = f,
                 VectorField::Z => v.z = f,
             },
@@ -627,6 +627,13 @@ pub enum Type {
     String,
 }
 
+impl Type {
+    /// Returns true if this is a scalar type, false if it is [`Type::Vector`].
+    pub const fn is_scalar(&self) -> bool {
+        !matches!(self, Self::Vector)
+    }
+}
+
 impl TryFrom<progs::VmType> for Type {
     type Error = anyhow::Error;
 
@@ -698,7 +705,7 @@ impl ErasedFunction for QCFunctionDef {
 }
 
 /// The core QuakeC runtime.
-pub struct QuakeCVm {
+pub struct QCVm {
     progs: Progs,
 }
 
@@ -752,7 +759,7 @@ impl TryFrom<&str> for FunctionRef {
     }
 }
 
-impl QuakeCVm {
+impl QCVm {
     /// Load the runtime from a `progs.dat` file.
     pub fn load<R>(bytes: R) -> anyhow::Result<Self>
     where
@@ -963,7 +970,7 @@ impl ArgAddr {
                 VectorField::from_u16(idx - self.addr)?,
             ))
         } else if self.addr == idx {
-            Some((self.ty, VectorField::X))
+            Some((self.ty, VectorField::XOrScalar))
         } else {
             None
         }
@@ -1364,8 +1371,8 @@ impl ExecutionCtx<'_> {
     {
         let index = index.try_into()?;
         let global = self.memory.global.get(index)?;
-        match self.context.dyn_global(&global.def) {
-            Ok(val) => Ok(val.try_scalar(global.offset)?.try_into()?),
+        match self.context.dyn_global(global.def.offset) {
+            Ok(val) => Ok(val.try_scalar(global.field)?.try_into()?),
             Err(userdata::AddrErr::Other(other)) => Err(other),
             Err(userdata::AddrErr::OutOfRange) => Ok(self.memory.get(index)?.try_into()?),
         }
@@ -1387,7 +1394,7 @@ impl ExecutionCtx<'_> {
         let value = self.to_value(value.try_into()?.into())?;
         match self
             .context
-            .dyn_set_global(&global.def, global.offset, value.clone())
+            .dyn_set_global(global.def.offset, global.field, value.clone())
         {
             Ok(()) => Ok(()),
             Err(userdata::AddrErr::Other(other)) => Err(other),

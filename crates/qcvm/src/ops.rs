@@ -352,13 +352,13 @@ impl ExecutionCtx<'_> {
         let value = ent.non_null()?.get(&*self.context, &field_def.def)?;
 
         let scalar = match (value, field_def.field) {
-            (Value::Vector(vec), Some(field)) => match field {
-                VectorField::X => vec.x.into(),
-                VectorField::Y => vec.y.into(),
-                VectorField::Z => vec.z.into(),
-            },
-            (_, Some(_)) => anyhow::bail!("Tried to get a field of a non-vector"),
-            (value, None) => VmScalar::try_from(value)?,
+            (Value::Vector(vec), VectorField::XOrScalar) => vec.x.into(),
+            (Value::Vector(vec), VectorField::Y) => vec.y.into(),
+            (Value::Vector(vec), VectorField::Z) => vec.z.into(),
+            (value, VectorField::XOrScalar) => VmScalar::try_from(value)?,
+            (_, VectorField::Y | VectorField::Z) => {
+                anyhow::bail!("Tried to get a field of a non-vector")
+            }
         };
 
         self.set(out_ptr, scalar)
@@ -422,7 +422,7 @@ impl ExecutionCtx<'_> {
 
         entity
             .non_null()?
-            .set(self.context, &field_def.def, None, f.into())?;
+            .set(self.context, &field_def.def, Default::default(), f.into())?;
 
         Ok(())
     }
@@ -1284,7 +1284,7 @@ mod test {
             &self,
             context: &mut Self::Context,
             field: &FieldDef,
-            offset: Option<VectorField>,
+            offset: VectorField,
             value: Value,
         ) -> Result<(), Self::Error> {
             let existing_value: &mut Value = context
@@ -1343,6 +1343,7 @@ mod test {
         type Entity = TestEnt;
         type Function = TestFn;
         type Error = Arc<dyn std::error::Error + Send + Sync>;
+        type GlobalAddr = u16;
 
         fn builtin(
             &self,
@@ -1378,14 +1379,14 @@ mod test {
             }
         }
 
-        fn global(&self, _def: &GlobalDef) -> Result<Value, crate::userdata::AddrErr<Self::Error>> {
+        fn global(&self, _def: u16) -> Result<Value, crate::userdata::AddrErr<Self::Error>> {
             todo!()
         }
 
         fn set_global(
             &mut self,
-            _def: &GlobalDef,
-            _offset: Option<VectorField>,
+            _def: u16,
+            _offset: VectorField,
             _value: Value,
         ) -> Result<(), crate::userdata::AddrErr<Self::Error>> {
             todo!()
@@ -1404,7 +1405,7 @@ mod test {
                 body.ret(result);
             });
 
-        let executor = crate::QuakeCVm {
+        let executor = crate::QCVm {
             progs: header_builder.build(),
         };
 
@@ -1447,7 +1448,7 @@ mod test {
                 body.ret(result);
             });
 
-        let executor = crate::QuakeCVm {
+        let executor = crate::QCVm {
             progs: header_builder.build(),
         };
 
@@ -1486,7 +1487,7 @@ mod test {
             },
         );
 
-        let executor = crate::QuakeCVm {
+        let executor = crate::QCVm {
             progs: header_builder.build(),
         };
 
@@ -1544,7 +1545,7 @@ mod test {
             body.ret(result);
         });
 
-        let mut executor = crate::QuakeCVm {
+        let mut executor = crate::QCVm {
             progs: (header_builder.build()),
         };
 

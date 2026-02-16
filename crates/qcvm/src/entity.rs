@@ -4,7 +4,7 @@ use crate::progs::{FieldDef, Ptr, VectorField, VmScalarType};
 
 #[derive(Clone, Debug)]
 pub struct ScalarFieldDef {
-    pub field: Option<VectorField>,
+    pub field: VectorField,
     /// The type of the field.
     pub type_: VmScalarType,
     pub def: FieldDef,
@@ -12,7 +12,7 @@ pub struct ScalarFieldDef {
 
 impl ScalarFieldDef {
     pub fn offset(&self) -> u16 {
-        self.def.offset + self.field.map(|f| f as u16).unwrap_or_default()
+        self.def.offset + self.field as u16
     }
 
     pub fn name(&self) -> Arc<CStr> {

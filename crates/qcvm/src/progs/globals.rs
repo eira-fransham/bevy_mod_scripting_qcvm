@@ -6,30 +6,32 @@ use itertools::Either;
 use crate::progs::{GlobalDef, VmScalar, VmScalarType};
 
 #[derive(Clone, Debug)]
-pub struct Global {
+pub struct ScalarGlobal {
     pub def: Arc<GlobalDef>,
-    pub offset: Option<VectorField>,
+    pub field: VectorField,
 
     /// Should be same as `self.value.type_()`, but may get out of sync due to `Void`.
     pub type_: VmScalarType,
     pub value: VmScalar,
 }
 
-impl Global {
+impl ScalarGlobal {
     fn new(def: Arc<GlobalDef>) -> Either<Self, [Self; 3]> {
         match VmScalarType::try_from(def.type_) {
-            Ok(type_) => Either::Left(Global {
+            Ok(type_) => Either::Left(ScalarGlobal {
                 def,
-                offset: None,
+                field: Default::default(),
                 type_,
                 value: VmScalar::Void,
             }),
-            Err(tys_and_offsets) => Either::Right(tys_and_offsets.map(|(type_, offset)| Global {
-                def: def.clone(),
-                offset: Some(offset),
-                type_,
-                value: VmScalar::Void,
-            })),
+            Err(tys_and_offsets) => {
+                Either::Right(tys_and_offsets.map(|(type_, offset)| ScalarGlobal {
+                    def: def.clone(),
+                    field: offset,
+                    type_,
+                    value: VmScalar::Void,
+                }))
+            }
         }
     }
 
@@ -42,10 +44,11 @@ impl Global {
 
 #[derive(Debug)]
 pub struct GlobalRegistry {
-    globals: HashMap<u16, Global>,
+    // TODO: There's usually (always?) a strict range that contains all globals, so this can just be a vec and offset
+    globals: HashMap<u16, ScalarGlobal>,
     // TODO: Expose this.
-    #[expect(dead_code)]
-    infos: HashMap<Arc<CStr>, u16>,
+    #[expect(dead_code, reason = "TODO: Expose globals by name")]
+    by_name: HashMap<Arc<CStr>, u16>,
 }
 
 impl GlobalRegistry {
@@ -60,7 +63,7 @@ impl GlobalRegistry {
             .flat_map(|def| {
                 let value = values.get(def.offset as usize * 4..).unwrap_or(&[0; 12]);
 
-                match Global::new(def.clone()) {
+                match ScalarGlobal::new(def.clone()) {
                     Either::Left(scalar) => {
                         let name = def.name.clone();
 
@@ -102,16 +105,19 @@ impl GlobalRegistry {
             })
             .collect::<anyhow::Result<(_, _)>>()?;
 
-        Ok(Self { globals, infos })
+        Ok(Self {
+            globals,
+            by_name: infos,
+        })
     }
 
-    pub fn get_with_index(&self, index: u16) -> anyhow::Result<&Global> {
+    pub fn get_with_index(&self, index: u16) -> anyhow::Result<&ScalarGlobal> {
         self.globals
             .get(&index)
             .ok_or_else(|| anyhow::format_err!("No global with index {index}"))
     }
 
-    pub fn get_with_index_mut(&mut self, index: u16) -> anyhow::Result<&mut Global> {
+    pub fn get_with_index_mut(&mut self, index: u16) -> anyhow::Result<&mut ScalarGlobal> {
         self.globals
             .get_mut(&index)
             .ok_or_else(|| anyhow::format_err!("No global with index {index}"))
@@ -144,7 +150,7 @@ impl GlobalRegistry {
     }
 
     #[inline]
-    pub fn get<P>(&self, ptr: P) -> anyhow::Result<&Global>
+    pub fn get<P>(&self, ptr: P) -> anyhow::Result<&ScalarGlobal>
     where
         P: TryInto<u16>,
         P::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
@@ -155,7 +161,7 @@ impl GlobalRegistry {
     // TODO
     #[inline]
     #[allow(dead_code)]
-    pub fn get_mut<P>(&mut self, ptr: P) -> anyhow::Result<&mut Global>
+    pub fn get_mut<P>(&mut self, ptr: P) -> anyhow::Result<&mut ScalarGlobal>
     where
         P: TryInto<u16>,
         P::Error: snafu::Error + Into<anyhow::Error> + Send + Sync + 'static,
