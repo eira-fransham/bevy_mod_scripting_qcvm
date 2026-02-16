@@ -43,7 +43,7 @@ const SPECIAL_ARGS_ARE_IMMUTABLE: bool = true;
 #[derive(Debug)]
 struct BevyScriptContext {
     worldspawn: Entity,
-    /// Per-execution globals such as self and other
+    /// Per-execution globals such as `self` and `other`
     special_args: hashbrown::HashMap<qcvm::quake1::globals::GlobalAddr, qcvm::Value>,
 }
 
