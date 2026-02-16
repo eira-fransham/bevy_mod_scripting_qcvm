@@ -8,15 +8,14 @@
 
 pub use globals::GLOBALS_RANGE;
 
+/// Global definitions for `progdefs.q1`, see [the Quake GPL release](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 pub mod globals {
-    //! Global definitions for `progdefs.q1`, see [the Quake GPL release](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
-
     use std::{fmt, ops::Range};
 
     use num::FromPrimitive;
     use strum::EnumIter;
 
-    use crate::Type;
+    use crate::{Type, VectorField};
 
     /// The first static global address.
     pub const GLOBALS_START: u32 = 28;
@@ -194,6 +193,63 @@ pub mod globals {
     }
 
     impl GlobalAddr {
+        /// For vector globals, returns the component fields. For scalars, just returns `self`.
+        pub const fn fields(&self) -> Option<[(Self, VectorField); 3]> {
+            match self {
+                GlobalAddr::VForward => Some([
+                    (GlobalAddr::VForwardX, VectorField::XOrScalar),
+                    (GlobalAddr::VForwardY, VectorField::Y),
+                    (GlobalAddr::VForwardZ, VectorField::Z),
+                ]),
+                GlobalAddr::VUp => Some([
+                    (GlobalAddr::VUpX, VectorField::XOrScalar),
+                    (GlobalAddr::VUpY, VectorField::Y),
+                    (GlobalAddr::VUpZ, VectorField::Z),
+                ]),
+                GlobalAddr::VRight => Some([
+                    (GlobalAddr::VRightX, VectorField::XOrScalar),
+                    (GlobalAddr::VRightY, VectorField::Y),
+                    (GlobalAddr::VRightZ, VectorField::Z),
+                ]),
+                GlobalAddr::TraceEndPos => Some([
+                    (GlobalAddr::TraceEndPosX, VectorField::XOrScalar),
+                    (GlobalAddr::TraceEndPosY, VectorField::Y),
+                    (GlobalAddr::TraceEndPosZ, VectorField::Z),
+                ]),
+                GlobalAddr::TracePlaneNormal => Some([
+                    (GlobalAddr::TracePlaneNormalX, VectorField::XOrScalar),
+                    (GlobalAddr::TracePlaneNormalY, VectorField::Y),
+                    (GlobalAddr::TracePlaneNormalZ, VectorField::Z),
+                ]),
+                _ => None,
+            }
+        }
+
+        /// For fields that are a component of a vector, this returns the field name of the vector itself along with the field of the
+        /// vector that it relates to (x, y, or z). For other fields, this is a no-op.
+        pub const fn vector_field_or_scalar(&self) -> (Self, VectorField) {
+            match self {
+                GlobalAddr::VForwardX => (GlobalAddr::VForward, VectorField::XOrScalar),
+                GlobalAddr::VForwardY => (GlobalAddr::VForward, VectorField::Y),
+                GlobalAddr::VForwardZ => (GlobalAddr::VForward, VectorField::Z),
+                GlobalAddr::VUpX => (GlobalAddr::VUp, VectorField::XOrScalar),
+                GlobalAddr::VUpY => (GlobalAddr::VUp, VectorField::Y),
+                GlobalAddr::VUpZ => (GlobalAddr::VUp, VectorField::Z),
+                GlobalAddr::VRightX => (GlobalAddr::VRight, VectorField::XOrScalar),
+                GlobalAddr::VRightY => (GlobalAddr::VRight, VectorField::Y),
+                GlobalAddr::VRightZ => (GlobalAddr::VRight, VectorField::Z),
+                GlobalAddr::TraceEndPosX => (GlobalAddr::TraceEndPos, VectorField::XOrScalar),
+                GlobalAddr::TraceEndPosY => (GlobalAddr::TraceEndPos, VectorField::Y),
+                GlobalAddr::TraceEndPosZ => (GlobalAddr::TraceEndPos, VectorField::Z),
+                GlobalAddr::TracePlaneNormalX => {
+                    (GlobalAddr::TracePlaneNormal, VectorField::XOrScalar)
+                }
+                GlobalAddr::TracePlaneNormalY => (GlobalAddr::TracePlaneNormal, VectorField::Y),
+                GlobalAddr::TracePlaneNormalZ => (GlobalAddr::TracePlaneNormal, VectorField::Z),
+                other => (*other, VectorField::XOrScalar),
+            }
+        }
+
         /// Convert a raw offset into the relevant `GlobalAddr`, given the type. Certain
         /// field offsets are specified to overlap in the `progdefs.qc` in order to have
         /// quick access to fields of vectors, and this can distinguish between `vector foo`

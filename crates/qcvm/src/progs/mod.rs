@@ -236,6 +236,16 @@ pub enum VectorField {
     Z = 2,
 }
 
+impl fmt::Display for VectorField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VectorField::XOrScalar => write!(f, "x"),
+            VectorField::Y => write!(f, "y"),
+            VectorField::Z => write!(f, "z"),
+        }
+    }
+}
+
 impl VectorField {
     /// All fields of a vector.
     pub const FIELDS: [Self; 3] = [VectorField::XOrScalar, VectorField::Y, VectorField::Z];
@@ -444,7 +454,7 @@ impl StringRef {
     }
 }
 
-#[derive(Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
 pub struct GlobalPtr(pub Ptr);
 
 impl Deref for GlobalPtr {
@@ -455,7 +465,7 @@ impl Deref for GlobalPtr {
     }
 }
 
-#[derive(Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
 pub struct FieldPtr(pub Ptr);
 
 impl Deref for FieldPtr {

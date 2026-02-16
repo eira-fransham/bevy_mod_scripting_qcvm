@@ -43,6 +43,7 @@ bevy_reflect = "0.18"
 
 [dependencies]
 hashbrown.workspace = true
+itertools.workspace = true
 qcvm = { path = "crates/qcvm" }
 
 bevy_ecs = "0.18"

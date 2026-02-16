@@ -528,6 +528,7 @@ dependencies = [
  "bevy_mod_scripting_script",
  "bevy_platform",
  "hashbrown",
+ "itertools",
  "qcvm",
 ]
 

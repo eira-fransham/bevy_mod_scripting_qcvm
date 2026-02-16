@@ -83,7 +83,6 @@ pub trait Context {
     fn set_global(
         &mut self,
         def: Self::GlobalAddr,
-        offset: VectorField,
         value: Value,
     ) -> Result<(), AddrErr<Self::Error>>;
 }
@@ -103,13 +102,8 @@ impl Context for dyn ErasedContext {
         self.dyn_global(def).map_err(AddrErr::into_arc_dyn_error)
     }
 
-    fn set_global(
-        &mut self,
-        def: u16,
-        offset: VectorField,
-        value: Value,
-    ) -> Result<(), AddrErr<Self::Error>> {
-        self.dyn_set_global(def, offset, value)
+    fn set_global(&mut self, def: u16, value: Value) -> Result<(), AddrErr<Self::Error>> {
+        self.dyn_set_global(def, value)
             .map_err(AddrErr::into_arc_dyn_error)
     }
 }
@@ -135,12 +129,7 @@ pub trait ErasedContext: Any {
     fn dyn_global(&self, def: u16) -> Result<Value, AddrErr<anyhow::Error>>;
 
     /// Dynamic version of [`Context::set_global`]
-    fn dyn_set_global(
-        &mut self,
-        def: u16,
-        offset: VectorField,
-        value: Value,
-    ) -> Result<(), AddrErr<anyhow::Error>>;
+    fn dyn_set_global(&mut self, def: u16, value: Value) -> Result<(), AddrErr<anyhow::Error>>;
 }
 
 impl fmt::Debug for &'_ mut dyn ErasedContext {
@@ -189,15 +178,9 @@ where
             .map_err(AddrErr::into_anyhow)
     }
 
-    fn dyn_set_global(
-        &mut self,
-        def: u16,
-        offset: VectorField,
-        value: Value,
-    ) -> Result<(), AddrErr<anyhow::Error>> {
+    fn dyn_set_global(&mut self, def: u16, value: Value) -> Result<(), AddrErr<anyhow::Error>> {
         self.set_global(
             <T as Context>::GlobalAddr::from_u16(def).ok_or(AddrErr::OutOfRange)?,
-            offset,
             value,
         )
         .map_err(AddrErr::into_anyhow)
@@ -367,7 +350,7 @@ where
     T: ErasedContext,
 {
     /// Call a QuakeC function by index or name.
-    pub fn call<A, F>(&mut self, function_ref: F, args: CallArgs<A>) -> anyhow::Result<Value>
+    pub fn call<A, F>(&mut self, function_ref: F, args: A) -> anyhow::Result<Value>
     where
         F: Into<FunctionRef>,
         A: QCParams,

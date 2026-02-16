@@ -24,8 +24,9 @@ use bevy_mod_scripting_core::{
     make_plugin_config_static,
 };
 use bevy_mod_scripting_script::ScriptAttachment;
+use itertools::Either;
 use qcvm::{
-    ArgError, FieldDef, QCParams, VectorField, anyhow,
+    ArgError, FieldDef, QCParams, anyhow,
     arrayvec::ArrayVec,
     userdata::{AddrErr, QuakeCType},
 };
@@ -40,7 +41,7 @@ pub struct QCScriptingPlugin {
 struct BevyScriptContext {
     worldspawn: Entity,
     /// Per-execution globals such as self and other
-    special_args: hashbrown::HashMap<Cow<'static, str>, qcvm::Value>,
+    special_args: hashbrown::HashMap<qcvm::quake1::globals::GlobalAddr, qcvm::Value>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -142,7 +143,7 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
                     )
                     .and_then(|v| bms_script_value_to_qcvm_script_value(&v))?;
 
-                    old.set(Some(offset), value)
+                    old.set(offset, value)
                         // TODO
                         .map_err(|_| InteropError::NotImplemented)?;
 
@@ -232,7 +233,7 @@ impl qcvm::userdata::Context for BevyScriptContext {
     }
 
     fn global(&self, addr: Self::GlobalAddr) -> Result<qcvm::Value, AddrErr<InteropError>> {
-        if let Some(val) = self.special_args.get(addr.name()) {
+        if let Some(val) = self.special_args.get(&addr) {
             return Ok(val.clone());
         }
 
@@ -270,12 +271,10 @@ impl qcvm::userdata::Context for BevyScriptContext {
     fn set_global(
         &mut self,
         addr: Self::GlobalAddr,
-        offset: VectorField,
         value: qcvm::Value,
     ) -> Result<(), AddrErr<InteropError>> {
-        if let Some(val) = self.special_args.get_mut(addr.name()) {
-            val.set(offset, value)
-                .map_err(|e| InteropError::External(ExternalError(Arc::new(e))))?;
+        if let Some(val) = self.special_args.get_mut(&addr) {
+            *val = value;
             return Ok(());
         }
 
@@ -291,21 +290,6 @@ impl qcvm::userdata::Context for BevyScriptContext {
             .with_read_access(
                 ReflectAccessId::for_global(),
                 |world| -> Result<_, AddrErr<InteropError>> {
-                    let addr = if value.type_().is_scalar() {
-                        if addr.type_().is_scalar() && offset != VectorField::XOrScalar {
-                            return Err(InteropError::LengthMismatch {
-                                expected: 3,
-                                got: 1,
-                            }
-                            .into());
-                        }
-
-                        Self::GlobalAddr::from_u16(addr.to_u16() + offset as u16, value.type_())
-                            .ok_or(AddrErr::OutOfRange)?
-                    } else {
-                        addr
-                    };
-
                     let key = ScriptValue::String(addr.name().into());
 
                     Ok(interop_error_to_addr_error(set(
@@ -502,7 +486,37 @@ impl IntoScriptPluginParams for QCScriptingPlugin {
                 Some(ScriptValue::Map(map)) => (
                     map.drain()
                         .map(|(k, v)| {
-                            Ok((Cow::from(k), bms_script_value_to_qcvm_script_value(&v)?))
+                            let value = bms_script_value_to_qcvm_script_value(&v)?;
+                            let key = qcvm::quake1::globals::GlobalAddr::from_name(&k).ok_or_else(
+                                || {
+                                    let reason = format!("No global with name {k}");
+                                    InteropError::InvalidIndex {
+                                        index: Box::new(k.into()),
+                                        reason: Box::new(reason),
+                                    }
+                                },
+                            )?;
+
+                            Ok(match key.fields() {
+                                Some(fields) => {
+                                    let [x, y, z] = fields.map(|(addr, field)| {
+                                        Ok((
+                                            addr,
+                                            value
+                                                .field(field)
+                                                // TODO: Make this an index error
+                                                .map_err(|_| InteropError::NotImplemented)?,
+                                        ))
+                                    });
+
+                                    Either::Left([x?, y?, z?].into_iter())
+                                }
+                                None => Either::Right(std::iter::once((key, value))),
+                            })
+                        })
+                        .flat_map(|result| match result {
+                            Ok(iter) => Either::Left(iter.map(Ok)),
+                            Err(e) => Either::Right(std::iter::once(Err(e))),
                         })
                         .collect::<Result<_, InteropError>>()?,
                     &args[1..],
@@ -525,10 +539,7 @@ impl IntoScriptPluginParams for QCScriptingPlugin {
                         special_args: special,
                     },
                     callback_cstr,
-                    qcvm::CallArgs {
-                        params: BevyScriptArgs(args_ref),
-                        // special,
-                    },
+                    BevyScriptArgs(args_ref),
                 )
                 .map_err(qc_interop_error)?;
 

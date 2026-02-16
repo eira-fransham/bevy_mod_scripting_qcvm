@@ -7,8 +7,8 @@ use std::{ffi::CStr, fmt, num::NonZeroIsize};
 use tracing::{debug, error};
 
 use crate::{
-    ArgAddr, CallArgs, ExecutionCtx, MAGIC_OP_STATE_IMPL_FUNC, MAGIC_OP_STATE_IMPL_NUM_ARGS,
-    OpResult, Type, Value, function_args,
+    ArgAddr, ExecutionCtx, MAGIC_OP_STATE_IMPL_FUNC, MAGIC_OP_STATE_IMPL_NUM_ARGS, OpResult, Type,
+    Value, function_args,
     progs::{
         EntityField, EntityRef, FieldPtr, StringRef, VectorField, VmFunctionRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
@@ -195,7 +195,7 @@ impl ExecutionCtx<'_> {
             .collect::<anyhow::Result<ArrayVec<[VmScalar; 3], MAX_ARGS>>>()?;
 
         let vm_value: VmValue = self
-            .with_args(name, CallArgs { params }, |ctx| {
+            .with_args(name, params, |ctx| {
                 builtin.dyn_call(FnCall { execution: ctx })
             })?
             .into();
@@ -806,7 +806,7 @@ mod test {
         sync::Arc,
     };
 
-    use crate::{CallArgs, HashMap, userdata::ErasedEntityHandle};
+    use crate::{HashMap, userdata::ErasedEntityHandle};
     use itertools::Itertools;
 
     use crate::{
@@ -1380,16 +1380,15 @@ mod test {
         }
 
         fn global(&self, _def: u16) -> Result<Value, crate::userdata::AddrErr<Self::Error>> {
-            todo!()
+            Err(crate::userdata::AddrErr::OutOfRange)
         }
 
         fn set_global(
             &mut self,
             _def: u16,
-            _offset: VectorField,
             _value: Value,
         ) -> Result<(), crate::userdata::AddrErr<Self::Error>> {
-            todo!()
+            Err(crate::userdata::AddrErr::OutOfRange)
         }
     }
 
@@ -1413,10 +1412,7 @@ mod test {
             .run(
                 &mut TestContext::default(),
                 just_mul.function_id.0,
-                CallArgs {
-                    params: (3f32, 4f32),
-                    // special: Default::default(),
-                },
+                (3f32, 4f32),
             )
             .unwrap()
             .try_into()
@@ -1456,10 +1452,7 @@ mod test {
             .run(
                 &mut TestContext::default(),
                 just_mul.function_id.0,
-                CallArgs {
-                    params: (3f32, 4f32),
-                    // special: Default::default(),
-                },
+                (3f32, 4f32),
             )
             .unwrap()
             .try_into()
@@ -1495,10 +1488,7 @@ mod test {
             .run(
                 &mut TestContext::default(),
                 just_mul.function_id.0,
-                CallArgs {
-                    params: (3f32, 4f32, 5f32),
-                    // special: Default::default(),
-                },
+                (3f32, 4f32, 5f32),
             )
             .unwrap()
             .try_into()
@@ -1569,14 +1559,7 @@ mod test {
             .value = EntityRef::Entity(ErasedEntityHandle(2)).into();
 
         let out: f32 = executor
-            .run(
-                &mut TestContext::default(),
-                c"mul_three_from_fields",
-                CallArgs {
-                    params: (),
-                    // special: Default::default(),
-                },
-            )
+            .run(&mut TestContext::default(), c"mul_three_from_fields", ())
             .unwrap()
             .try_into()
             .unwrap();
@@ -1587,6 +1570,5 @@ mod test {
     #[test]
     fn per_execution_globals() {
         // TODO: Test per-execution globals (e.g. self, other)
-        todo!()
     }
 }

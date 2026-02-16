@@ -25,7 +25,7 @@ use crate::{
         functions::{ArgSize, FunctionExecutionCtx, QCFunctionDef, Statement},
         globals::GlobalRegistry,
     },
-    userdata::{ErasedContext, ErasedEntityHandle, ErasedFunction, FnCall, QuakeCType},
+    userdata::{AddrErr, ErasedContext, ErasedEntityHandle, ErasedFunction, FnCall, QuakeCType},
 };
 
 mod entity;
@@ -59,12 +59,9 @@ pub struct SpecialArgs {
 
 /// The arguments passed to a QuakeC function.
 #[derive(Debug)]
-pub struct CallArgs<T> {
+struct CallArgs<T> {
     /// Regular function parameters
-    pub params: T,
-    // /// Special global variables set per execution
-    // TODO: This should be implemented using `Context::global` etc
-    // pub special: SpecialArgs,
+    params: T,
 }
 
 type HashMap<K, V> = hashbrown::HashMap<K, V, std::hash::BuildHasherDefault<hash32::FnvHasher>>;
@@ -138,21 +135,22 @@ impl Value {
     /// Get a field of the value, if it's a vector. Passing `None` will just clone the value
     /// (this is useful for generic code using `VectorField` to optionally convert a type into
     /// a scalar).
-    pub(crate) fn try_scalar(
-        &self,
-        field: impl Into<Option<VectorField>>,
-    ) -> Result<VmScalar, TryScalarError> {
+    pub(crate) fn try_scalar(&self, field: VectorField) -> Result<VmScalar, TryScalarError> {
+        self.field(field)?
+            .try_into()
+            .map_err(|_| TryScalarError::CannotGetVectorAsScalar)
+    }
+
+    /// Get a field of a value.
+    pub fn field(&self, field: VectorField) -> Result<Value, TryScalarError> {
         Ok(match (self, field.into()) {
-            (Value::Vector(v), Some(offset)) => match offset {
+            (Value::Vector(v), offset) => match offset {
                 VectorField::XOrScalar => v.x.into(),
                 VectorField::Y => v.y.into(),
                 VectorField::Z => v.z.into(),
             },
-            (_, None | Some(VectorField::XOrScalar)) => self
-                .clone()
-                .try_into()
-                .map_err(|_| TryScalarError::CannotGetVectorAsScalar)?,
-            (_, Some(offset @ (VectorField::Y | VectorField::Z))) => {
+            (_, VectorField::XOrScalar) => self.clone(),
+            (_, offset @ (VectorField::Y | VectorField::Z)) => {
                 return Err(TryScalarError::FieldOfScalar { field: offset });
             }
         })
@@ -161,25 +159,17 @@ impl Value {
     /// Clone the source value to this value, with an optional field reference. Useful to implement
     /// [`userdata::EntityHandle::set`], as sometimes QuakeC only wants to set a single field of a
     /// vector.
-    pub fn set(
-        &mut self,
-        field: impl Into<Option<VectorField>>,
-        value: Value,
-    ) -> Result<(), SetValueError> {
+    pub fn set(&mut self, field: VectorField, value: Value) -> Result<(), SetValueError> {
         match (self, field.into(), value) {
-            (this, None, value) => *this = value,
-            (Value::Vector(v), Some(offset), Value::Float(f)) => match offset {
+            (this, VectorField::XOrScalar, value) => *this = value,
+            (Value::Vector(v), offset, Value::Float(f)) => match offset {
                 VectorField::XOrScalar => v.x = f,
                 VectorField::Y => v.y = f,
                 VectorField::Z => v.z = f,
             },
-            (Value::Vector(_), Some(_), val) => {
-                return Err(SetValueError::TypeError {
-                    expected: Type::Float,
-                    found: val.type_(),
-                });
+            (_, offset @ (VectorField::Y | VectorField::Z), _) => {
+                return Err(SetValueError::NoSuchField { field: offset });
             }
-            (_, Some(offset), _) => return Err(SetValueError::NoSuchField { field: offset }),
         }
 
         Ok(())
@@ -775,7 +765,7 @@ impl QCVm {
         &'a self,
         context: &'a mut C,
         function: F,
-        args: CallArgs<T>,
+        params: T,
     ) -> anyhow::Result<Value>
     where
         F: Into<FunctionRef>,
@@ -785,7 +775,7 @@ impl QCVm {
         let mut ctx: ExecutionCtx<'_, dyn ErasedContext, _, CallArgs<T>> = ExecutionCtx {
             alloc: Bump::new(),
             memory: ExecutionMemory {
-                local: args,
+                local: CallArgs { params },
                 global: &self.progs.globals,
                 last_ret: None,
             },
@@ -860,6 +850,7 @@ where
 
         match self.local.get(index)? {
             Some(val) => Ok(val),
+            // TODO: Should we make this solely host-controlled?
             None => self.global.get_value(index),
         }
     }
@@ -1105,7 +1096,7 @@ where
     Ctx: ?Sized + AsErasedContext,
     Alloc: ScopedAlloc,
 {
-    fn with_args<F, A, O>(&mut self, name: &CStr, args: CallArgs<A>, func: F) -> O
+    fn with_args<F, A, O>(&mut self, name: &CStr, params: A, func: F) -> O
     where
         F: FnOnce(ExecutionCtx<'_, dyn ErasedContext, BumpScope<'_>, CallArgs<A>>) -> O,
         A: QCParams,
@@ -1124,7 +1115,7 @@ where
             func(ExecutionCtx {
                 alloc,
                 memory: ExecutionMemory {
-                    local: args,
+                    local: CallArgs { params },
                     global,
                     last_ret: None,
                 },
@@ -1370,11 +1361,10 @@ impl ExecutionCtx<'_> {
         <VmScalar as TryInto<O>>::Error: std::error::Error + Send + Sync + 'static,
     {
         let index = index.try_into()?;
-        let global = self.memory.global.get(index)?;
-        match self.context.dyn_global(global.def.offset) {
-            Ok(val) => Ok(val.try_scalar(global.field)?.try_into()?),
-            Err(userdata::AddrErr::Other(other)) => Err(other),
-            Err(userdata::AddrErr::OutOfRange) => Ok(self.memory.get(index)?.try_into()?),
+        match self.context.dyn_global(index.try_into()?) {
+            Ok(val) => Ok(val.try_scalar(VectorField::XOrScalar)?.try_into()?),
+            Err(AddrErr::Other(other)) => Err(other),
+            Err(AddrErr::OutOfRange) => Ok(self.memory.get(index)?.try_into()?),
         }
     }
 
@@ -1390,17 +1380,14 @@ impl ExecutionCtx<'_> {
         // TODO: Should we even have global memory that isn't host-controlled? We already have a separate
         //       `local_range` to prevent functions from mutating one another's locals
         let index = index.try_into()?;
-        let global = self.memory.global.get(index)?;
         let value = self.to_value(value.try_into()?.into())?;
         match self
             .context
-            .dyn_set_global(global.def.offset, global.field, value.clone())
+            .dyn_set_global(index.try_into()?, value.clone())
         {
             Ok(()) => Ok(()),
-            Err(userdata::AddrErr::Other(other)) => Err(other),
-            Err(userdata::AddrErr::OutOfRange) => {
-                self.memory.set(index.try_into()?, value.try_into()?)
-            }
+            Err(AddrErr::Other(other)) => Err(other),
+            Err(AddrErr::OutOfRange) => self.memory.set(index.try_into()?, value.try_into()?),
         }
     }
 

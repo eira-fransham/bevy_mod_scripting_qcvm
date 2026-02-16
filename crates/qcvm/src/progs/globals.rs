@@ -7,7 +7,9 @@ use crate::progs::{GlobalDef, VmScalar, VmScalarType};
 
 #[derive(Clone, Debug)]
 pub struct ScalarGlobal {
+    #[expect(dead_code, reason = "This is still useful for debugging")]
     pub def: Arc<GlobalDef>,
+    #[expect(dead_code, reason = "This is still useful for debugging")]
     pub field: VectorField,
 
     /// Should be same as `self.value.type_()`, but may get out of sync due to `Void`.
@@ -112,8 +114,8 @@ impl GlobalRegistry {
     }
 
     pub fn get_with_index(&self, index: u16) -> anyhow::Result<&ScalarGlobal> {
-        self.globals
-            .get(&index)
+        dbg!(&self.globals)
+            .get(dbg!(&index))
             .ok_or_else(|| anyhow::format_err!("No global with index {index}"))
     }
 
