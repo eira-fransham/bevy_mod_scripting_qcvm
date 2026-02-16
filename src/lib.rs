@@ -168,6 +168,7 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
     }
 }
 
+/// Namespace for QC builtins
 pub struct QCBuiltin;
 
 impl qcvm::userdata::Context for BevyScriptContext {

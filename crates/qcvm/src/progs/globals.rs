@@ -1,15 +1,14 @@
 use std::{ffi::CStr, sync::Arc};
 
-use crate::HashMap;
+use crate::{HashMap, VectorField};
 use itertools::Either;
 
-use crate::progs::{FieldName, GlobalDef, VmScalar, VmScalarType};
+use crate::progs::{GlobalDef, VmScalar, VmScalarType};
 
 #[derive(Clone, Debug)]
 pub struct Global {
-    // TODO
-    #[expect(dead_code)]
-    pub name: FieldName,
+    pub def: Arc<GlobalDef>,
+    pub offset: Option<VectorField>,
 
     /// Should be same as `self.value.type_()`, but may get out of sync due to `Void`.
     pub type_: VmScalarType,
@@ -17,18 +16,17 @@ pub struct Global {
 }
 
 impl Global {
-    fn new(def: &GlobalDef) -> Either<Self, [Self; 3]> {
+    fn new(def: Arc<GlobalDef>) -> Either<Self, [Self; 3]> {
         match VmScalarType::try_from(def.type_) {
             Ok(type_) => Either::Left(Global {
-                name: def.name.clone().into(),
+                def,
+                offset: None,
                 type_,
                 value: VmScalar::Void,
             }),
             Err(tys_and_offsets) => Either::Right(tys_and_offsets.map(|(type_, offset)| Global {
-                name: FieldName {
-                    name: def.name.clone(),
-                    offset: Some(offset),
-                },
+                def: def.clone(),
+                offset: Some(offset),
                 type_,
                 value: VmScalar::Void,
             })),
@@ -58,10 +56,11 @@ impl GlobalRegistry {
     {
         let (globals, infos) = defs
             .into_iter()
+            .map(Arc::new)
             .flat_map(|def| {
                 let value = values.get(def.offset as usize * 4..).unwrap_or(&[0; 12]);
 
-                match Global::new(&def) {
+                match Global::new(def.clone()) {
                     Either::Left(scalar) => {
                         let name = def.name.clone();
 

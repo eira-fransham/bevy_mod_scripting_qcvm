@@ -241,22 +241,6 @@ impl VectorField {
     pub const FIELDS: [Self; 3] = [VectorField::X, VectorField::Y, VectorField::Z];
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FieldName {
-    // TODO: `CStr` is a pain in the ass to use, we should also support regular strs even if we internally store CStr
-    pub name: Arc<CStr>,
-    /// For vectors, we want to take the "raw" global definition
-    /// and make each field addressable individually, so we only
-    /// have to store scalars.
-    pub offset: Option<VectorField>,
-}
-
-impl From<Arc<CStr>> for FieldName {
-    fn from(name: Arc<CStr>) -> Self {
-        Self { name, offset: None }
-    }
-}
-
 /// A definition for a global in the `progs.dat`
 #[derive(Debug, Clone)]
 pub struct GlobalDef {

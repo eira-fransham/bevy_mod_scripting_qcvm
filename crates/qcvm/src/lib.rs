@@ -1210,6 +1210,7 @@ where
                 let arg_func = self.functions.get_by_index(ptr.0)?.clone();
 
                 match arg_func.try_into_qc() {
+                    // TODO: We shouldn't need to allocate a new arc here
                     Ok(quakec) => Ok(Value::Function(Arc::new(quakec))),
                     Err(builtin) => Ok(Value::Function(
                         self.context.as_erased().dyn_builtin(&builtin)?,
@@ -1361,8 +1362,13 @@ impl ExecutionCtx<'_> {
         VmScalar: TryInto<O>,
         <VmScalar as TryInto<O>>::Error: std::error::Error + Send + Sync + 'static,
     {
-        // TODO: Use `Context::global`
-        Ok(self.memory.get(index.try_into()?)?.try_into()?)
+        let index = index.try_into()?;
+        let global = self.memory.global.get(index)?;
+        match self.context.dyn_global(&global.def) {
+            Ok(val) => Ok(val.try_scalar(global.offset)?.try_into()?),
+            Err(userdata::AddrErr::Other(other)) => Err(other),
+            Err(userdata::AddrErr::OutOfRange) => Ok(self.memory.get(index)?.try_into()?),
+        }
     }
 
     pub fn set<I, V>(&mut self, index: I, value: V) -> anyhow::Result<()>
@@ -1372,8 +1378,23 @@ impl ExecutionCtx<'_> {
         V: TryInto<VmScalar>,
         V::Error: std::error::Error + Send + Sync + 'static,
     {
-        // TODO: Use `Context::set_global`
-        self.memory.set(index.try_into()?, value.try_into()?)
+        // TODO: Performance is unnecessarily wasted here, where we check context for every global.
+        //       Using a type param on `Context` should allow us to fail fast.
+        // TODO: Should we even have global memory that isn't host-controlled? We already have a separate
+        //       `local_range` to prevent functions from mutating one another's locals
+        let index = index.try_into()?;
+        let global = self.memory.global.get(index)?;
+        let value = self.to_value(value.try_into()?.into())?;
+        match self
+            .context
+            .dyn_set_global(&global.def, global.offset, value.clone())
+        {
+            Ok(()) => Ok(()),
+            Err(userdata::AddrErr::Other(other)) => Err(other),
+            Err(userdata::AddrErr::OutOfRange) => {
+                self.memory.set(index.try_into()?, value.try_into()?)
+            }
+        }
     }
 
     /// Sets the "last return" global. QuakeC only allows 1 function return to be accessible
