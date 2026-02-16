@@ -37,6 +37,9 @@ pub struct QCScriptingPlugin {
     pub scripting_plugin: ScriptingPlugin<QCScriptingPlugin>,
 }
 
+// HACK: This should be configurable elsewhere, but this is ok for now
+const SPECIAL_ARGS_ARE_IMMUTABLE: bool = true;
+
 #[derive(Debug)]
 struct BevyScriptContext {
     worldspawn: Entity,
@@ -81,7 +84,7 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
         //       We can add optimised getter/setter configuration later.
         world
             .with_read_access(ReflectAccessId::for_global(), |world| {
-                // TODO: We can probably use the `quake1` module defs somehow here(?)
+                // TODO: We should use the same enum-based mechanism as for `Context::GlobalAddr`
                 let key = if field.name.is_empty() {
                     ScriptValue::Integer(field.offset as i64)
                 } else {
@@ -274,8 +277,15 @@ impl qcvm::userdata::Context for BevyScriptContext {
         value: qcvm::Value,
     ) -> Result<(), AddrErr<InteropError>> {
         if let Some(val) = self.special_args.get_mut(&addr) {
-            *val = value;
-            return Ok(());
+            if SPECIAL_ARGS_ARE_IMMUTABLE {
+                let arg_name = addr.name();
+                return Err(AddrErr::Other(qc_interop_error(anyhow::format_err!(
+                    "Special argument {arg_name} is immutable"
+                ))));
+            } else {
+                *val = value;
+                return Ok(());
+            }
         }
 
         // TODO: We could do this just once when initialising the context, which would be significantly more efficient
@@ -563,7 +573,7 @@ impl IntoScriptPluginParams for QCScriptingPlugin {
     }
 
     fn context_reloader() -> bevy_mod_scripting_core::context::ContextReloadFn<Self> {
-        // TODO: We should diff the `progs.dat` values between the old and new contexts and set globals
+        // TODO: We should diff the `progs.dat` global values between the old and new contexts and set globals
         //       on the script attachment.
         fn qc_context_reloader(
             _context_key: &ScriptAttachment,
