@@ -1,4 +1,5 @@
 //! # Quake 1 field, global and builtin definitions
+//! const MAP
 //!
 //! This module contains Quake-compatible builtin IDs, which should be implemented
 //! if writing a host that can load unmodified `progs.dat` files designed for the
@@ -13,7 +14,7 @@ pub mod globals {
     use std::{fmt, ops::Range};
 
     use num::FromPrimitive;
-    use strum::EnumIter;
+    use strum::{EnumIter, VariantArray};
 
     use crate::{Type, VectorField};
 
@@ -27,8 +28,64 @@ pub mod globals {
     /// The range of static global addresses.
     pub const GLOBALS_RANGE: Range<usize> = GLOBALS_START as usize..LOCALS_START as usize;
 
+    // int      pad[28];
+    // int      self;
+    // int      other;
+    // int      world;
+    // float    time;
+    // float    frametime;
+    // float    force_retouch;
+    // string_t mapname;
+    // float    deathmatch;
+    // float    coop;
+    // float    teamplay;
+    // float    serverflags;
+    // float    total_secrets;
+    // float    total_monsters;
+    // float    found_secrets;
+    // float    killed_monsters;
+    // float    parm1;
+    // float    parm2;
+    // float    parm3;
+    // float    parm4;
+    // float    parm5;
+    // float    parm6;
+    // float    parm7;
+    // float    parm8;
+    // float    parm9;
+    // float    parm10;
+    // float    parm11;
+    // float    parm12;
+    // float    parm13;
+    // float    parm14;
+    // float    parm15;
+    // float    parm16;
+    // vec3_t   v_forward;
+    // vec3_t   v_up;
+    // vec3_t   v_right;
+    // float    trace_allsolid;
+    // float    trace_startsolid;
+    // float    trace_fraction;
+    // vec3_t   trace_endpos;
+    // vec3_t   trace_plane_normal;
+    // float    trace_plane_dist;
+    // int      trace_ent;
+    // float    trace_inopen;
+    // float    trace_inwater;
+    // int      msg_entity;
+    // func_t   main;
+    // func_t   StartFrame;
+    // func_t   PlayerPreThink;
+    // func_t   PlayerPostThink;
+    // func_t   ClientKill;
+    // func_t   ClientConnect;
+    // func_t   PutClientInServer;
+    // func_t   ClientDisconnect;
+    // func_t   SetNewParms;
+    // func_t   SetChangeParms;
+
     /// Global indices for globals defined in `progdefs.q1`, see [the Quake GPL release](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
-    #[derive(EnumIter, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[derive(VariantArray, EnumIter, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum GlobalAddr {
         /// entity self
         Self_,
@@ -195,32 +252,31 @@ pub mod globals {
     impl GlobalAddr {
         /// For vector globals, returns the component fields. For scalars, just returns `self`.
         pub const fn fields(&self) -> Option<[(Self, VectorField); 3]> {
-            match self {
-                GlobalAddr::VForward => Some([
-                    (GlobalAddr::VForwardX, VectorField::XOrScalar),
-                    (GlobalAddr::VForwardY, VectorField::Y),
-                    (GlobalAddr::VForwardZ, VectorField::Z),
-                ]),
-                GlobalAddr::VUp => Some([
-                    (GlobalAddr::VUpX, VectorField::XOrScalar),
-                    (GlobalAddr::VUpY, VectorField::Y),
-                    (GlobalAddr::VUpZ, VectorField::Z),
-                ]),
-                GlobalAddr::VRight => Some([
-                    (GlobalAddr::VRightX, VectorField::XOrScalar),
-                    (GlobalAddr::VRightY, VectorField::Y),
-                    (GlobalAddr::VRightZ, VectorField::Z),
-                ]),
-                GlobalAddr::TraceEndPos => Some([
-                    (GlobalAddr::TraceEndPosX, VectorField::XOrScalar),
-                    (GlobalAddr::TraceEndPosY, VectorField::Y),
-                    (GlobalAddr::TraceEndPosZ, VectorField::Z),
-                ]),
-                GlobalAddr::TracePlaneNormal => Some([
-                    (GlobalAddr::TracePlaneNormalX, VectorField::XOrScalar),
-                    (GlobalAddr::TracePlaneNormalY, VectorField::Y),
-                    (GlobalAddr::TracePlaneNormalZ, VectorField::Z),
-                ]),
+            const fn float_field(
+                addr: u16,
+                field: VectorField,
+            ) -> Option<(GlobalAddr, VectorField)> {
+                if let Some(addr) = GlobalAddr::from_u16(addr + field as u16, Type::Float) {
+                    Some((addr, field))
+                } else {
+                    None
+                }
+            }
+
+            match self.type_() {
+                Type::Vector => {
+                    let addr = self.to_u16();
+                    let [x, y, z] = VectorField::FIELDS;
+                    let [Some(x), Some(y), Some(z)] = [
+                        float_field(addr, x),
+                        float_field(addr, y),
+                        float_field(addr, z),
+                    ] else {
+                        return None;
+                    };
+
+                    Some([x, y, z])
+                }
                 _ => None,
             }
         }
@@ -255,80 +311,19 @@ pub mod globals {
         /// quick access to fields of vectors, and this can distinguish between `vector foo`
         /// and `float foo_x`.
         pub const fn from_u16(val: u16, ty: Type) -> Option<Self> {
-            match (val, ty) {
-                (28, Type::AnyScalar | Type::Entity) => Some(Self::Self_),
-                (29, Type::AnyScalar | Type::Entity) => Some(Self::Other),
-                (30, Type::AnyScalar | Type::Entity) => Some(Self::World),
-                (31, Type::AnyScalar | Type::Float) => Some(Self::Time),
-                (32, Type::AnyScalar | Type::Float) => Some(Self::FrameTime),
-                (33, Type::AnyScalar | Type::Float) => Some(Self::ForceRetouch),
-                (34, Type::AnyScalar | Type::String) => Some(Self::MapName),
-                (35, Type::AnyScalar | Type::Float) => Some(Self::Deathmatch),
-                (36, Type::AnyScalar | Type::Float) => Some(Self::Coop),
-                (37, Type::AnyScalar | Type::Float) => Some(Self::TeamPlay),
-                (38, Type::AnyScalar | Type::Float) => Some(Self::ServerFlags),
-                (39, Type::AnyScalar | Type::Float) => Some(Self::TotalSecrets),
-                (40, Type::AnyScalar | Type::Float) => Some(Self::TotalMonsters),
-                (41, Type::AnyScalar | Type::Float) => Some(Self::FoundSecrets),
-                (42, Type::AnyScalar | Type::Float) => Some(Self::KilledMonsters),
-                (43, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam0),
-                (44, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam1),
-                (45, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam2),
-                (46, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam3),
-                (47, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam4),
-                (48, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam5),
-                (49, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam6),
-                (50, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam7),
-                (51, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam8),
-                (52, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam9),
-                (53, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam10),
-                (54, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam11),
-                (55, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam12),
-                (56, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam13),
-                (57, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam14),
-                (58, Type::AnyScalar | Type::Float) => Some(Self::SpawnParam15),
-                (59, Type::Vector) => Some(Self::VForward),
-                (59, Type::AnyScalar | Type::Float) => Some(Self::VForwardX),
-                (60, Type::AnyScalar | Type::Float) => Some(Self::VForwardY),
-                (61, Type::AnyScalar | Type::Float) => Some(Self::VForwardZ),
-                (62, Type::Vector) => Some(Self::VUp),
-                (62, Type::AnyScalar | Type::Float) => Some(Self::VUpX),
-                (63, Type::AnyScalar | Type::Float) => Some(Self::VUpY),
-                (64, Type::AnyScalar | Type::Float) => Some(Self::VUpZ),
-                (65, Type::Vector) => Some(Self::VRight),
-                (65, Type::AnyScalar | Type::Float) => Some(Self::VRightX),
-                (66, Type::AnyScalar | Type::Float) => Some(Self::VRightY),
-                (67, Type::AnyScalar | Type::Float) => Some(Self::VRightZ),
-                (68, Type::AnyScalar | Type::Float) => Some(Self::TraceAllSolid),
-                (69, Type::AnyScalar | Type::Float) => Some(Self::TraceStartSolid),
-                (70, Type::AnyScalar | Type::Float) => Some(Self::TraceFraction),
-                (71, Type::Vector) => Some(Self::TraceEndPos),
-                (71, Type::AnyScalar | Type::Float) => Some(Self::TraceEndPosX),
-                (72, Type::AnyScalar | Type::Float) => Some(Self::TraceEndPosY),
-                (73, Type::AnyScalar | Type::Float) => Some(Self::TraceEndPosZ),
-                (74, Type::Vector) => Some(Self::TracePlaneNormal),
-                (74, Type::AnyScalar | Type::Float) => Some(Self::TracePlaneNormalX),
-                (75, Type::AnyScalar | Type::Float) => Some(Self::TracePlaneNormalY),
-                (76, Type::AnyScalar | Type::Float) => Some(Self::TracePlaneNormalZ),
-                (77, Type::AnyScalar | Type::Float) => Some(Self::TracePlaneDist),
-                (78, Type::AnyScalar | Type::Entity) => Some(Self::TraceEntity),
-                (79, Type::AnyScalar | Type::Float) => Some(Self::TraceInOpen),
-                (80, Type::AnyScalar | Type::Float) => Some(Self::TraceInWater),
-                (81, Type::AnyScalar | Type::Entity) => Some(Self::MsgEntity),
+            // Can't just iter over `VARIANTS` as that isn't stable in const fns.
+            let mut i = 0;
+            while i < Self::VARIANTS.len() {
+                let variant = Self::VARIANTS[i];
 
-                // Functions
-                (82, Type::AnyScalar | Type::Function) => Some(Self::Main),
-                (83, Type::AnyScalar | Type::Function) => Some(Self::StartFrame),
-                (84, Type::AnyScalar | Type::Function) => Some(Self::PlayerPreThink),
-                (85, Type::AnyScalar | Type::Function) => Some(Self::PlayerPostThink),
-                (86, Type::AnyScalar | Type::Function) => Some(Self::ClientKill),
-                (87, Type::AnyScalar | Type::Function) => Some(Self::ClientConnect),
-                (88, Type::AnyScalar | Type::Function) => Some(Self::PutClientInServer),
-                (89, Type::AnyScalar | Type::Function) => Some(Self::ClientDisconnect),
-                (90, Type::AnyScalar | Type::Function) => Some(Self::SetNewArgs),
-                (91, Type::AnyScalar | Type::Function) => Some(Self::SetChangeArgs),
-                _ => None,
+                if variant.to_u16() == val && variant.type_().typeck(&ty) {
+                    return Some(variant);
+                }
+
+                i += 1;
             }
+
+            None
         }
 
         /// Get the offset to this global.
@@ -661,277 +656,910 @@ pub mod globals {
     }
 }
 
-// TODO
-#[doc(hidden)]
+/// Field definitions for `progdefs.q1`, see [the Quake GPL release](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 pub mod fields {
-    //! Field definitions for `progdefs.q1`, see [the Quake GPL release](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
-
-    use num_derive::FromPrimitive;
+    use num::FromPrimitive;
     use std::fmt;
+    use strum::{EnumIter, VariantArray};
 
-    #[derive(Copy, Clone, Debug, PartialEq, Eq, FromPrimitive)]
-    pub enum FieldAddrFloat {
-        ModelIndex = 0,
-        AbsMinX = 1,
-        AbsMinY = 2,
-        AbsMinZ = 3,
-        AbsMaxX = 4,
-        AbsMaxY = 5,
-        AbsMaxZ = 6,
-        /// Used by mobile level geometry such as moving platforms.
-        LocalTime = 7,
-        /// Determines the movement behavior of an entity. The value must be a variant of `MoveKind`.
-        MoveKind = 8,
-        Solid = 9,
-        OriginX = 10,
-        OriginY = 11,
-        OriginZ = 12,
-        OldOriginX = 13,
-        OldOriginY = 14,
-        OldOriginZ = 15,
-        VelocityX = 16,
-        VelocityY = 17,
-        VelocityZ = 18,
-        AnglesX = 19,
-        AnglesY = 20,
-        AnglesZ = 21,
-        AngularVelocityX = 22,
-        AngularVelocityY = 23,
-        AngularVelocityZ = 24,
-        PunchAngleX = 25,
-        PunchAngleY = 26,
-        PunchAngleZ = 27,
-        /// The index of the entity's animation frame.
-        FrameId = 30,
-        /// The index of the entity's skin.
-        SkinId = 31,
-        /// Effects flags applied to the entity. See `EntityEffects`.
-        Effects = 32,
-        /// Minimum extent in local coordinates, X-coordinate.
-        MinsX = 33,
-        /// Minimum extent in local coordinates, Y-coordinate.
-        MinsY = 34,
-        /// Minimum extent in local coordinates, Z-coordinate.
-        MinsZ = 35,
-        /// Maximum extent in local coordinates, X-coordinate.
-        MaxsX = 36,
-        /// Maximum extent in local coordinates, Y-coordinate.
-        MaxsY = 37,
-        /// Maximum extent in local coordinates, Z-coordinate.
-        MaxsZ = 38,
-        SizeX = 39,
-        SizeY = 40,
-        SizeZ = 41,
-        /// The next server time at which the entity should run its think function.
-        NextThink = 46,
-        /// The entity's remaining health.
-        Health = 48,
-        /// The number of kills scored by the entity.
-        Frags = 49,
-        Weapon = 50,
-        WeaponFrame = 52,
-        /// The entity's remaining ammunition for its selected weapon.
-        CurrentAmmo = 53,
-        /// The entity's remaining shotgun shells.
-        AmmoShells = 54,
-        /// The entity's remaining shotgun shells.
-        AmmoNails = 55,
-        /// The entity's remaining rockets/grenades.
-        AmmoRockets = 56,
-        AmmoCells = 57,
-        Items = 58,
-        TakeDamage = 59,
-        DeadFlag = 61,
-        ViewOffsetX = 62,
-        ViewOffsetY = 63,
-        ViewOffsetZ = 64,
-        Button0 = 65,
-        Button1 = 66,
-        Button2 = 67,
-        Impulse = 68,
-        FixAngle = 69,
-        ViewAngleX = 70,
-        ViewAngleY = 71,
-        ViewAngleZ = 72,
-        IdealPitch = 73,
-        Flags = 76,
-        Colormap = 77,
-        Team = 78,
-        MaxHealth = 79,
-        TeleportTime = 80,
-        ArmorStrength = 81,
-        ArmorValue = 82,
-        WaterLevel = 83,
-        Contents = 84,
-        IdealYaw = 85,
-        YawSpeed = 86,
-        SpawnFlags = 89,
-        DmgTake = 92,
-        DmgSave = 93,
-        MoveDirectionX = 96,
-        MoveDirectionY = 97,
-        MoveDirectionZ = 98,
-        Sounds = 100,
+    use crate::{Type, VectorField};
+
+    // float    modelindex;
+    // vec3_t   absmin;
+    // vec3_t   absmax;
+    // float    ltime;
+    // float    movetype;
+    // float    solid;
+    // vec3_t   origin;
+    // vec3_t   oldorigin;
+    // vec3_t   velocity;
+    // vec3_t   angles;
+    // vec3_t   avelocity;
+    // vec3_t   punchangle;
+    // string_t classname;
+    // string_t model;
+    // float    frame;
+    // float    skin;
+    // float    effects;
+    // vec3_t   mins;
+    // vec3_t   maxs;
+    // vec3_t   size;
+    // func_t   touch;
+    // func_t   use;
+    // func_t   think;
+    // func_t   blocked;
+    // float    nextthink;
+    // int      groundentity;
+    // float    health;
+    // float    frags;
+    // float    weapon;
+    // string_t weaponmodel;
+    // float    weaponframe;
+    // float    currentammo;
+    // float    ammo_shells;
+    // float    ammo_nails;
+    // float    ammo_rockets;
+    // float    ammo_cells;
+    // float    items;
+    // float    takedamage;
+    // int      chain;
+    // float    deadflag;
+    // vec3_t   view_ofs;
+    // float    button0;
+    // float    button1;
+    // float    button2;
+    // float    impulse;
+    // float    fixangle;
+    // vec3_t   v_angle;
+    // float    idealpitch;
+    // string_t netname;
+    // int      enemy;
+    // float    flags;
+    // float    colormap;
+    // float    team;
+    // float    max_health;
+    // float    teleport_time;
+    // float    armortype;
+    // float    armorvalue;
+    // float    waterlevel;
+    // float    watertype;
+    // float    ideal_yaw;
+    // float    yaw_speed;
+    // int      aiment;
+    // int      goalentity;
+    // float    spawnflags;
+    // string_t target;
+    // string_t targetname;
+    // float    dmg_take;
+    // float    dmg_save;
+    // int      dmg_inflictor;
+    // int      owner;
+    // vec3_t   movedir;
+    // string_t message;
+    // float    sounds;
+    // string_t noise;
+    // string_t noise1;
+    // string_t noise2;
+    // string_t noise3;
+
+    /// Indices for entity fields defined in `progdefs.q1`, see [the Quake GPL release](https://github.com/id-Software/Quake/blob/bf4ac424ce754894ac8f1dae6a3981954bc9852d/WinQuake/progdefs.q1#L62-L141).
+    #[derive(VariantArray, EnumIter, Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum FieldAddr {
+        /// float    modelindex;
+        ModelId,
+        /// vec3_t   absmin;
+        AbsMin,
+        /// float absmin.x;
+        AbsMinX,
+        /// float absmin.y;
+        AbsMinY,
+        /// float absmin.z;
+        AbsMinZ,
+        /// vec3_t   absmax;
+        AbsMax,
+        /// float absmax.x;
+        AbsMaxX,
+        /// float absmax.y;
+        AbsMaxY,
+        /// float absmax.z;
+        AbsMaxZ,
+        /// float    ltime;
+        LocalTime,
+        /// float    movetype;
+        MoveType,
+        /// float    solid;
+        Solid,
+        /// vec3_t   origin;
+        Origin,
+        /// float origin.x;
+        OriginX,
+        /// float origin.y;
+        OriginY,
+        /// float origin.z;
+        OriginZ,
+        /// vec3_t   oldorigin;
+        OldOrigin,
+        /// float oldorigin.x;
+        OldOriginX,
+        /// float oldorigin.y;
+        OldOriginY,
+        /// float oldorigin.z;
+        OldOriginZ,
+        /// vec3_t   velocity;
+        Velocity,
+        /// float velocity.x;
+        VelocityX,
+        /// float velocity.y;
+        VelocityY,
+        /// float velocity.z;
+        VelocityZ,
+        /// vec3_t   angles;
+        Angles,
+        /// float angles.x;
+        AnglesX,
+        /// float angles.y;
+        AnglesY,
+        /// float angles.z;
+        AnglesZ,
+        /// vec3_t   avelocity;
+        AngularVelocity,
+        /// float avelocity.x;
+        AngularVelocityX,
+        /// float avelocity.y;
+        AngularVelocityY,
+        /// float avelocity.z;
+        AngularVelocityZ,
+        /// vec3_t   punchangle;
+        PunchAngle,
+        /// float punchangle.x;
+        PunchAngleX,
+        /// float punchangle.y;
+        PunchAngleY,
+        /// float punchangle.z;
+        PunchAngleZ,
+        /// string_t classname;
+        ClassName,
+        /// string_t model;
+        ModelName,
+        /// float    frame;
+        Frame,
+        /// float    skin;
+        SkinId,
+        /// float    effects;
+        Effects,
+        /// vec3_t   mins;
+        Mins,
+        /// float mins.x;
+        MinsX,
+        /// float mins.y;
+        MinsY,
+        /// float mins.z;
+        MinsZ,
+        /// vec3_t   maxs;
+        Maxs,
+        /// float maxs.x;
+        MaxsX,
+        /// float maxs.y;
+        MaxsY,
+        /// float maxs.z;
+        MaxsZ,
+        /// vec3_t   size;
+        Size,
+        /// float size.x;
+        SizeX,
+        /// float size.y;
+        SizeY,
+        /// float size.z;
+        SizeZ,
+        /// func_t   touch;
+        OnTouch,
+        /// func_t   use;
+        OnUse,
+        /// func_t   think;
+        OnThink,
+        /// func_t   blocked;
+        OnBlocked,
+        /// float    nextthink;
+        NextThink,
+        /// int      groundentity;
+        Ground,
+        /// float    health;
+        Health,
+        /// float    frags;
+        Frags,
+        /// float    weapon;
+        WeaponId,
+        /// string_t weaponmodel;
+        WeaponModelName,
+        /// float    weaponframe;
+        WeaponFrame,
+        /// float    currentammo;
+        CurrentAmmo,
+        /// float    ammo_shells;
+        AmmoShells,
+        /// float    ammo_nails;
+        AmmoNails,
+        /// float    ammo_rockets;
+        AmmoRockets,
+        /// float    ammo_cells;
+        AmmoCells,
+        /// float    items;
+        Items,
+        /// float    takedamage;
+        TakeDamage,
+        /// int      chain;
+        Chain,
+        /// float    deadflag;
+        DeadFlag,
+        /// vec3_t   view_ofs;
+        ViewOffset,
+        /// float view_ofs.x;
+        ViewOffsetX,
+        /// float view_ofs.y;
+        ViewOffsetY,
+        /// float view_ofs.z;
+        ViewOffsetZ,
+        /// float    button0;
+        Button0,
+        /// float    button1;
+        Button1,
+        /// float    button2;
+        Button2,
+        /// float    impulse;
+        Impulse,
+        /// float    fixangle;
+        FixAngle,
+        /// vec3_t   v_angle;
+        ViewAngle,
+        /// float v_angle.x;
+        ViewAngleX,
+        /// float v_angle.y;
+        ViewAngleY,
+        /// float v_angle.z;
+        ViewAngleZ,
+        /// float    idealpitch;
+        IdealPitch,
+        /// string_t netname;
+        NetworkName,
+        /// int      enemy;
+        Enemy,
+        /// float    flags;
+        Flags,
+        /// float    colormap;
+        ColorMapId,
+        /// float    team;
+        Team,
+        /// float    max_health;
+        MaxHealth,
+        /// float    teleport_time;
+        TeleportTime,
+        /// float    armortype;
+        ArmorType,
+        /// float    armorvalue;
+        ArmorValue,
+        /// float    waterlevel;
+        WaterLevel,
+        /// float    watertype;
+        WaterType,
+        /// float    ideal_yaw;
+        IdealYaw,
+        /// float    yaw_speed;
+        YawSpeed,
+        /// int      aiment;
+        AimEntity,
+        /// int      goalentity;
+        GoalEntity,
+        /// float    spawnflags;
+        SpawnFlags,
+        /// string_t target;
+        Target,
+        /// string_t targetname;
+        TargetName,
+        /// float    dmg_take;
+        DamageTaken,
+        /// float    dmg_save;
+        DamageSaved,
+        /// int      dmg_inflictor;
+        DamageInflictor,
+        /// int      owner;
+        Owner,
+        /// vec3_t   movedir;
+        MoveDirection,
+        /// float movedir.x;
+        MoveDirectionX,
+        /// float movedir.y;
+        MoveDirectionY,
+        /// float movedir.z;
+        MoveDirectionZ,
+        /// string_t message;
+        Message,
+        /// float    sounds;
+        Sounds,
+        /// string_t noise;
+        Noise0,
+        /// string_t noise1;
+        Noise1,
+        /// string_t noise2;
+        Noise2,
+        /// string_t noise3;
+        Noise3,
     }
 
-    impl fmt::Display for FieldAddrFloat {
+    impl fmt::Display for FieldAddr {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Self::ModelIndex => write!(f, "model_id"),
-                Self::AbsMinX => write!(f, "abs_min_x"),
-                Self::AbsMinY => write!(f, "abs_min_y"),
-                Self::AbsMinZ => write!(f, "abs_min_z"),
-                Self::AbsMaxX => write!(f, "abs_max_x"),
-                Self::AbsMaxY => write!(f, "abs_max_y"),
-                Self::AbsMaxZ => write!(f, "abs_max_z"),
-                Self::LocalTime => write!(f, "local_time"),
-                Self::MoveKind => write!(f, "move_kind"),
-                Self::Solid => write!(f, "solid"),
-                Self::OriginX => write!(f, "origin_x"),
-                Self::OriginY => write!(f, "origin_y"),
-                Self::OriginZ => write!(f, "origin_z"),
-                Self::OldOriginX => write!(f, "old_origin_x"),
-                Self::OldOriginY => write!(f, "old_origin_y"),
-                Self::OldOriginZ => write!(f, "old_origin_z"),
-                Self::VelocityX => write!(f, "velocity_x"),
-                Self::VelocityY => write!(f, "velocity_y"),
-                Self::VelocityZ => write!(f, "velocity_z"),
-                Self::AnglesX => write!(f, "angles_x"),
-                Self::AnglesY => write!(f, "angles_y"),
-                Self::AnglesZ => write!(f, "angles_z"),
-                Self::AngularVelocityX => write!(f, "angular_velocity_x"),
-                Self::AngularVelocityY => write!(f, "angular_velocity_y"),
-                Self::AngularVelocityZ => write!(f, "angular_velocity_z"),
-                Self::PunchAngleX => write!(f, "punch_angle_x"),
-                Self::PunchAngleY => write!(f, "punch_angle_y"),
-                Self::PunchAngleZ => write!(f, "punch_angle_z"),
-                Self::FrameId => write!(f, "frame_id"),
-                Self::SkinId => write!(f, "skin_id"),
-                Self::Effects => write!(f, "effects"),
-                Self::MinsX => write!(f, "mins_x"),
-                Self::MinsY => write!(f, "mins_y"),
-                Self::MinsZ => write!(f, "mins_z"),
-                Self::MaxsX => write!(f, "maxs_x"),
-                Self::MaxsY => write!(f, "maxs_y"),
-                Self::MaxsZ => write!(f, "maxs_z"),
-                Self::SizeX => write!(f, "size_x"),
-                Self::SizeY => write!(f, "size_y"),
-                Self::SizeZ => write!(f, "size_z"),
-                Self::NextThink => write!(f, "next_think"),
-                Self::Health => write!(f, "health"),
-                Self::Frags => write!(f, "frags"),
-                Self::Weapon => write!(f, "weapon"),
-                Self::WeaponFrame => write!(f, "weapon_frame"),
-                Self::CurrentAmmo => write!(f, "current_ammo"),
-                Self::AmmoShells => write!(f, "ammo_shells"),
-                Self::AmmoNails => write!(f, "ammo_nails"),
-                Self::AmmoRockets => write!(f, "ammo_rockets"),
-                Self::AmmoCells => write!(f, "ammo_cells"),
-                Self::Items => write!(f, "items"),
-                Self::TakeDamage => write!(f, "take_damage"),
-                Self::DeadFlag => write!(f, "dead_flag"),
-                Self::ViewOffsetX => write!(f, "view_offset_x"),
-                Self::ViewOffsetY => write!(f, "view_offset_y"),
-                Self::ViewOffsetZ => write!(f, "view_offset_z"),
-                Self::Button0 => write!(f, "button0"),
-                Self::Button1 => write!(f, "button1"),
-                Self::Button2 => write!(f, "button2"),
-                Self::Impulse => write!(f, "impulse"),
-                Self::FixAngle => write!(f, "fix_angle"),
-                Self::ViewAngleX => write!(f, "view_angle_x"),
-                Self::ViewAngleY => write!(f, "view_angle_y"),
-                Self::ViewAngleZ => write!(f, "view_angle_z"),
-                Self::IdealPitch => write!(f, "ideal_pitch"),
-                Self::Flags => write!(f, "flags"),
-                Self::Colormap => write!(f, "colormap"),
-                Self::Team => write!(f, "team"),
-                Self::MaxHealth => write!(f, "max_health"),
-                Self::TeleportTime => write!(f, "teleport_time"),
-                Self::ArmorStrength => write!(f, "armor_strength"),
-                Self::ArmorValue => write!(f, "armor_value"),
-                Self::WaterLevel => write!(f, "water_level"),
-                Self::Contents => write!(f, "contents"),
-                Self::IdealYaw => write!(f, "ideal_yaw"),
-                Self::YawSpeed => write!(f, "yaw_speed"),
-                Self::SpawnFlags => write!(f, "spawn_flags"),
-                Self::DmgTake => write!(f, "dmg_take"),
-                Self::DmgSave => write!(f, "dmg_save"),
-                Self::MoveDirectionX => write!(f, "move_direction_x"),
-                Self::MoveDirectionY => write!(f, "move_direction_y"),
-                Self::MoveDirectionZ => write!(f, "move_direction_z"),
-                Self::Sounds => write!(f, "sounds"),
-            }
+            write!(f, "{}", self.name())
         }
     }
 
-    #[derive(Copy, Clone, Debug, PartialEq, Eq, FromPrimitive)]
-    pub enum FieldAddrVector {
-        AbsMin = 1,
-        AbsMax = 4,
-        Origin = 10,
-        OldOrigin = 13,
-        Velocity = 16,
-        Angles = 19,
-        AngularVelocity = 22,
-        PunchAngle = 25,
-        Mins = 33,
-        Maxs = 36,
-        Size = 39,
-        ViewOffset = 62,
-        ViewAngle = 70,
-        MoveDirection = 96,
-    }
+    impl FromPrimitive for FieldAddr {
+        fn from_u16(n: u16) -> Option<Self> {
+            Self::from_u16(n, Type::AnyScalar)
+        }
 
-    #[derive(Copy, Clone, Debug, FromPrimitive)]
-    pub enum FieldAddrStringId {
-        ClassName = 28,
-        ModelName = 29,
-        WeaponModelName = 51,
-        NetName = 74,
-        Target = 90,
-        TargetName = 91,
-        Message = 99,
-        Noise0Name = 101,
-        Noise1Name = 102,
-        Noise2Name = 103,
-        Noise3Name = 104,
-    }
+        fn from_i64(n: i64) -> Option<Self> {
+            FromPrimitive::from_u16(n.try_into().ok()?)
+        }
 
-    impl fmt::Display for FieldAddrStringId {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Self::ClassName => write!(f, "classname"),
-                Self::ModelName => write!(f, "modelname"),
-                Self::WeaponModelName => write!(f, "weaponmodelname"),
-                Self::NetName => write!(f, "netname"),
-                Self::Target => write!(f, "target"),
-                Self::TargetName => write!(f, "targetname"),
-                Self::Message => write!(f, "message"),
-                Self::Noise0Name => write!(f, "noise0name"),
-                Self::Noise1Name => write!(f, "noise1name"),
-                Self::Noise2Name => write!(f, "noise2name"),
-                Self::Noise3Name => write!(f, "noise3name"),
-            }
+        fn from_u64(n: u64) -> Option<Self> {
+            FromPrimitive::from_u16(n.try_into().ok()?)
         }
     }
 
-    #[derive(Copy, Clone, Debug, FromPrimitive)]
-    pub enum FieldAddrEntityId {
-        /// The entity this entity is standing on.
-        Ground = 47,
-        Chain = 60,
-        Enemy = 75,
-        Aim = 87,
-        Goal = 88,
-        DmgInflictor = 94,
-        Owner = 95,
-    }
+    impl FieldAddr {
+        /// For vector globals, returns the component fields. For scalars, just returns `self`.
+        pub const fn fields(&self) -> Option<[(Self, VectorField); 3]> {
+            const fn float_field(
+                addr: u16,
+                field: VectorField,
+            ) -> Option<(FieldAddr, VectorField)> {
+                if let Some(addr) = FieldAddr::from_u16(addr + field as u16, Type::Float) {
+                    Some((addr, field))
+                } else {
+                    None
+                }
+            }
 
-    #[derive(Copy, Clone, Debug, FromPrimitive)]
-    pub enum FieldAddrFunctionId {
-        Touch = 42,
-        Use = 43,
-        Think = 44,
-        Blocked = 45,
+            match self.type_() {
+                Type::Vector => {
+                    let addr = self.to_u16();
+                    let [x, y, z] = VectorField::FIELDS;
+                    let [Some(x), Some(y), Some(z)] = [
+                        float_field(addr, x),
+                        float_field(addr, y),
+                        float_field(addr, z),
+                    ] else {
+                        return None;
+                    };
+
+                    Some([x, y, z])
+                }
+                _ => None,
+            }
+        }
+
+        /// For fields that are a component of a vector, this returns the field name of the vector itself along with the field of the
+        /// vector that it relates to (x, y, or z). For other fields, this is a no-op.
+        pub const fn vector_field_or_scalar(&self) -> (Self, VectorField) {
+            match self {
+                Self::AbsMinX => (Self::AbsMin, VectorField::XOrScalar),
+                Self::AbsMinY => (Self::AbsMin, VectorField::Y),
+                Self::AbsMinZ => (Self::AbsMin, VectorField::Z),
+                Self::AbsMaxX => (Self::AbsMax, VectorField::XOrScalar),
+                Self::AbsMaxY => (Self::AbsMax, VectorField::Y),
+                Self::AbsMaxZ => (Self::AbsMax, VectorField::Z),
+                Self::OriginX => (Self::Origin, VectorField::XOrScalar),
+                Self::OriginY => (Self::Origin, VectorField::Y),
+                Self::OriginZ => (Self::Origin, VectorField::Z),
+                Self::OldOriginX => (Self::OldOrigin, VectorField::XOrScalar),
+                Self::OldOriginY => (Self::OldOrigin, VectorField::Y),
+                Self::OldOriginZ => (Self::OldOrigin, VectorField::Z),
+                Self::VelocityX => (Self::Velocity, VectorField::XOrScalar),
+                Self::VelocityY => (Self::Velocity, VectorField::Y),
+                Self::VelocityZ => (Self::Velocity, VectorField::Z),
+                Self::AnglesX => (Self::Angles, VectorField::XOrScalar),
+                Self::AnglesY => (Self::Angles, VectorField::Y),
+                Self::AnglesZ => (Self::Angles, VectorField::Z),
+                Self::AngularVelocityX => (Self::AngularVelocity, VectorField::XOrScalar),
+                Self::AngularVelocityY => (Self::AngularVelocity, VectorField::Y),
+                Self::AngularVelocityZ => (Self::AngularVelocity, VectorField::Z),
+                Self::PunchAngleX => (Self::PunchAngle, VectorField::XOrScalar),
+                Self::PunchAngleY => (Self::PunchAngle, VectorField::Y),
+                Self::PunchAngleZ => (Self::PunchAngle, VectorField::Z),
+                Self::MinsX => (Self::Mins, VectorField::XOrScalar),
+                Self::MinsY => (Self::Mins, VectorField::Y),
+                Self::MinsZ => (Self::Mins, VectorField::Z),
+                Self::MaxsX => (Self::Maxs, VectorField::XOrScalar),
+                Self::MaxsY => (Self::Maxs, VectorField::Y),
+                Self::MaxsZ => (Self::Maxs, VectorField::Z),
+                Self::SizeX => (Self::Size, VectorField::XOrScalar),
+                Self::SizeY => (Self::Size, VectorField::Y),
+                Self::SizeZ => (Self::Size, VectorField::Z),
+                Self::ViewOffsetX => (Self::ViewOffset, VectorField::XOrScalar),
+                Self::ViewOffsetY => (Self::ViewOffset, VectorField::Y),
+                Self::ViewOffsetZ => (Self::ViewOffset, VectorField::Z),
+                Self::ViewAngleX => (Self::ViewAngle, VectorField::XOrScalar),
+                Self::ViewAngleY => (Self::ViewAngle, VectorField::Y),
+                Self::ViewAngleZ => (Self::ViewAngle, VectorField::Z),
+                Self::MoveDirectionX => (Self::MoveDirection, VectorField::XOrScalar),
+                Self::MoveDirectionY => (Self::MoveDirection, VectorField::Y),
+                Self::MoveDirectionZ => (Self::MoveDirection, VectorField::Z),
+                other => (*other, VectorField::XOrScalar),
+            }
+        }
+
+        /// Convert a raw offset into the relevant `FieldAddr`, given the type. Certain
+        /// field offsets are specified to overlap in the `progdefs.qc` in order to have
+        /// quick access to fields of vectors, and this can distinguish between `vector foo`
+        /// and `float foo_x`.
+        pub const fn from_u16(val: u16, ty: Type) -> Option<Self> {
+            // Can't just iter over `VARIANTS` as that isn't stable in const fns.
+            let mut i = 0;
+            while i < Self::VARIANTS.len() {
+                let variant = Self::VARIANTS[i];
+
+                if variant.to_u16() == val && variant.type_().typeck(&ty) {
+                    return Some(variant);
+                }
+
+                i += 1;
+            }
+
+            None
+        }
+
+        /// Get the offset to this global.
+        pub const fn to_u16(&self) -> u16 {
+            match self {
+                Self::ModelId => 0,
+                Self::AbsMin | Self::AbsMinX => 1,
+                Self::AbsMinY => 2,
+                Self::AbsMinZ => 3,
+                Self::AbsMax | Self::AbsMaxX => 4,
+                Self::AbsMaxY => 5,
+                Self::AbsMaxZ => 6,
+                Self::LocalTime => 7,
+                Self::MoveType => 8,
+                Self::Solid => 9,
+                Self::Origin | Self::OriginX => 10,
+                Self::OriginY => 11,
+                Self::OriginZ => 12,
+                Self::OldOrigin | Self::OldOriginX => 13,
+                Self::OldOriginY => 14,
+                Self::OldOriginZ => 15,
+                Self::Velocity | Self::VelocityX => 16,
+                Self::VelocityY => 17,
+                Self::VelocityZ => 18,
+                Self::Angles | Self::AnglesX => 19,
+                Self::AnglesY => 20,
+                Self::AnglesZ => 21,
+                Self::AngularVelocity | Self::AngularVelocityX => 22,
+                Self::AngularVelocityY => 23,
+                Self::AngularVelocityZ => 24,
+                Self::PunchAngle | Self::PunchAngleX => 25,
+                Self::PunchAngleY => 26,
+                Self::PunchAngleZ => 27,
+                Self::ClassName => 28,
+                Self::ModelName => 29,
+                Self::Frame => 30,
+                Self::SkinId => 31,
+                Self::Effects => 32,
+                Self::Mins | Self::MinsX => 33,
+                Self::MinsY => 34,
+                Self::MinsZ => 35,
+                Self::Maxs | Self::MaxsX => 36,
+                Self::MaxsY => 37,
+                Self::MaxsZ => 38,
+                Self::Size | Self::SizeX => 39,
+                Self::SizeY => 40,
+                Self::SizeZ => 41,
+                Self::OnTouch => 42,
+                Self::OnUse => 43,
+                Self::OnThink => 44,
+                Self::OnBlocked => 45,
+                Self::NextThink => 46,
+                Self::Ground => 47,
+                Self::Health => 48,
+                Self::Frags => 49,
+                Self::WeaponId => 50,
+                Self::WeaponModelName => 51,
+                Self::WeaponFrame => 52,
+                Self::CurrentAmmo => 53,
+                Self::AmmoShells => 54,
+                Self::AmmoNails => 55,
+                Self::AmmoRockets => 56,
+                Self::AmmoCells => 57,
+                Self::Items => 58,
+                Self::TakeDamage => 59,
+                Self::Chain => 60,
+                Self::DeadFlag => 61,
+                Self::ViewOffset | Self::ViewOffsetX => 62,
+                Self::ViewOffsetY => 63,
+                Self::ViewOffsetZ => 64,
+                Self::Button0 => 65,
+                Self::Button1 => 66,
+                Self::Button2 => 67,
+                Self::Impulse => 68,
+                Self::FixAngle => 69,
+                Self::ViewAngle | Self::ViewAngleX => 70,
+                Self::ViewAngleY => 71,
+                Self::ViewAngleZ => 72,
+                Self::IdealPitch => 73,
+                Self::NetworkName => 74,
+                Self::Enemy => 75,
+                Self::Flags => 76,
+                Self::ColorMapId => 77,
+                Self::Team => 78,
+                Self::MaxHealth => 79,
+                Self::TeleportTime => 80,
+                Self::ArmorType => 81,
+                Self::ArmorValue => 82,
+                Self::WaterLevel => 83,
+                Self::WaterType => 84,
+                Self::IdealYaw => 85,
+                Self::YawSpeed => 86,
+                Self::AimEntity => 87,
+                Self::GoalEntity => 88,
+                Self::SpawnFlags => 89,
+                Self::Target => 90,
+                Self::TargetName => 91,
+                Self::DamageTaken => 92,
+                Self::DamageSaved => 93,
+                Self::DamageInflictor => 94,
+                Self::Owner => 95,
+                Self::MoveDirection | Self::MoveDirectionX => 96,
+                Self::MoveDirectionY => 97,
+                Self::MoveDirectionZ => 98,
+                Self::Message => 99,
+                Self::Sounds => 100,
+                Self::Noise0 => 101,
+                Self::Noise1 => 102,
+                Self::Noise2 => 103,
+                Self::Noise3 => 104,
+            }
+        }
+
+        /// Get the name of this global.
+        pub const fn name(&self) -> &'static str {
+            match self {
+                Self::ModelId => "modelindex",
+                Self::AbsMin => "absmin",
+                Self::AbsMinX => "absmin_x",
+                Self::AbsMinY => "absmin_y",
+                Self::AbsMinZ => "absmin_z",
+                Self::AbsMax => "absmax",
+                Self::AbsMaxX => "absmax_x",
+                Self::AbsMaxY => "absmax_y",
+                Self::AbsMaxZ => "absmax_z",
+                Self::LocalTime => "ltime",
+                Self::MoveType => "movetype",
+                Self::Solid => "solid",
+                Self::Origin => "origin",
+                Self::OriginX => "origin_x",
+                Self::OriginY => "origin_y",
+                Self::OriginZ => "origin_z",
+                Self::OldOrigin => "oldorigin",
+                Self::OldOriginX => "oldorigin_x",
+                Self::OldOriginY => "oldorigin_y",
+                Self::OldOriginZ => "oldorigin_z",
+                Self::Velocity => "velocity",
+                Self::VelocityX => "velocity_x",
+                Self::VelocityY => "velocity_y",
+                Self::VelocityZ => "velocity_z",
+                Self::Angles => "angles",
+                Self::AnglesX => "angles_x",
+                Self::AnglesY => "angles_y",
+                Self::AnglesZ => "angles_z",
+                Self::AngularVelocity => "avelocity",
+                Self::AngularVelocityX => "avelocity_x",
+                Self::AngularVelocityY => "avelocity_y",
+                Self::AngularVelocityZ => "avelocity_z",
+                Self::PunchAngle => "punchangle",
+                Self::PunchAngleX => "punchangle_x",
+                Self::PunchAngleY => "punchangle_y",
+                Self::PunchAngleZ => "punchangle_z",
+                Self::ClassName => "classname",
+                Self::ModelName => "model",
+                Self::Frame => "frame",
+                Self::SkinId => "skin",
+                Self::Effects => "effects",
+                Self::Mins => "mins",
+                Self::MinsX => "mins_x",
+                Self::MinsY => "mins_y",
+                Self::MinsZ => "mins_z",
+                Self::Maxs => "maxs",
+                Self::MaxsX => "maxs_x",
+                Self::MaxsY => "maxs_y",
+                Self::MaxsZ => "maxs_z",
+                Self::Size => "size",
+                Self::SizeX => "size_x",
+                Self::SizeY => "size_y",
+                Self::SizeZ => "size_z",
+                Self::OnTouch => "touch",
+                Self::OnUse => "use",
+                Self::OnThink => "think",
+                Self::OnBlocked => "blocked",
+                Self::NextThink => "nextthink",
+                Self::Ground => "groundentity",
+                Self::Health => "health",
+                Self::Frags => "frags",
+                Self::WeaponId => "weapon",
+                Self::WeaponModelName => "weaponmodel",
+                Self::WeaponFrame => "weaponframe",
+                Self::CurrentAmmo => "currentammo",
+                Self::AmmoShells => "ammo_shells",
+                Self::AmmoNails => "ammo_nails",
+                Self::AmmoRockets => "ammo_rockets",
+                Self::AmmoCells => "ammo_cells",
+                Self::Items => "items",
+                Self::TakeDamage => "takedamage",
+                Self::Chain => "chain",
+                Self::DeadFlag => "deadflag",
+                Self::ViewOffset => "view_ofs",
+                Self::ViewOffsetX => "view_ofs_x",
+                Self::ViewOffsetY => "view_ofs_y",
+                Self::ViewOffsetZ => "view_ofs_z",
+                Self::Button0 => "button0",
+                Self::Button1 => "button1",
+                Self::Button2 => "button2",
+                Self::Impulse => "impulse",
+                Self::FixAngle => "fixangle",
+                Self::ViewAngle => "v_angle",
+                Self::ViewAngleX => "v_angle_x",
+                Self::ViewAngleY => "v_angle_y",
+                Self::ViewAngleZ => "v_angle_z",
+                Self::IdealPitch => "idealpitch",
+                Self::NetworkName => "netname",
+                Self::Enemy => "enemy",
+                Self::Flags => "flags",
+                Self::ColorMapId => "colormap",
+                Self::Team => "team",
+                Self::MaxHealth => "max_health",
+                Self::TeleportTime => "teleport_time",
+                Self::ArmorType => "armortype",
+                Self::ArmorValue => "armorvalue",
+                Self::WaterLevel => "waterlevel",
+                Self::WaterType => "watertype",
+                Self::IdealYaw => "ideal_yaw",
+                Self::YawSpeed => "yaw_speed",
+                Self::AimEntity => "aiment",
+                Self::GoalEntity => "goalentity",
+                Self::SpawnFlags => "spawnflags",
+                Self::Target => "target",
+                Self::TargetName => "targetname",
+                Self::DamageTaken => "dmg_take",
+                Self::DamageSaved => "dmg_save",
+                Self::DamageInflictor => "dmg_inflictor",
+                Self::Owner => "owner",
+                Self::MoveDirection => "movedir",
+                Self::MoveDirectionX => "movedir_x",
+                Self::MoveDirectionY => "movedir_y",
+                Self::MoveDirectionZ => "movedir_z",
+                Self::Message => "message",
+                Self::Sounds => "sounds",
+                Self::Noise0 => "noise",
+                Self::Noise1 => "noise1",
+                Self::Noise2 => "noise2",
+                Self::Noise3 => "noise3",
+            }
+        }
+
+        /// Given a name, get the global address the name corresponds to.
+        pub fn from_name(name: &str) -> Option<Self> {
+            // Can't just iter over `VARIANTS` as that isn't stable in const fns.
+            let mut i = 0;
+            while i < Self::VARIANTS.len() {
+                let variant = Self::VARIANTS[i];
+
+                if variant.name() == name {
+                    return Some(variant);
+                }
+
+                i += 1;
+            }
+
+            None
+        }
+
+        /// Get the type of this global.
+        pub const fn type_(&self) -> Type {
+            match self {
+                // float    modelindex;
+                Self::ModelId => Type::Float,
+                // vec3_t   absmin;
+                Self::AbsMin => Type::Vector,
+                Self::AbsMinX => Type::Float,
+                Self::AbsMinY => Type::Float,
+                Self::AbsMinZ => Type::Float,
+                // vec3_t   absmax;
+                Self::AbsMax => Type::Vector,
+                Self::AbsMaxX => Type::Float,
+                Self::AbsMaxY => Type::Float,
+                Self::AbsMaxZ => Type::Float,
+                // float    ltime;
+                Self::LocalTime => Type::Float,
+                // float    movetype;
+                Self::MoveType => Type::Float,
+                // float    solid;
+                Self::Solid => Type::Float,
+                // vec3_t   origin;
+                Self::Origin => Type::Vector,
+                Self::OriginX => Type::Float,
+                Self::OriginY => Type::Float,
+                Self::OriginZ => Type::Float,
+                // vec3_t   oldorigin;
+                Self::OldOrigin => Type::Vector,
+                Self::OldOriginX => Type::Float,
+                Self::OldOriginY => Type::Float,
+                Self::OldOriginZ => Type::Float,
+                // vec3_t   velocity;
+                Self::Velocity => Type::Vector,
+                Self::VelocityX => Type::Float,
+                Self::VelocityY => Type::Float,
+                Self::VelocityZ => Type::Float,
+                // vec3_t   angles;
+                Self::Angles => Type::Vector,
+                Self::AnglesX => Type::Float,
+                Self::AnglesY => Type::Float,
+                Self::AnglesZ => Type::Float,
+                // vec3_t   avelocity;
+                Self::AngularVelocity => Type::Vector,
+                Self::AngularVelocityX => Type::Float,
+                Self::AngularVelocityY => Type::Float,
+                Self::AngularVelocityZ => Type::Float,
+                // vec3_t   punchangle;
+                Self::PunchAngle => Type::Vector,
+                Self::PunchAngleX => Type::Float,
+                Self::PunchAngleY => Type::Float,
+                Self::PunchAngleZ => Type::Float,
+                // string_t classname;
+                Self::ClassName => Type::String,
+                // string_t model;
+                Self::ModelName => Type::String,
+                // float    frame;
+                Self::Frame => Type::Float,
+                // float    skin;
+                Self::SkinId => Type::Float,
+                // float    effects;
+                Self::Effects => Type::Float,
+                // vec3_t   mins;
+                Self::Mins => Type::Vector,
+                Self::MinsX => Type::Float,
+                Self::MinsY => Type::Float,
+                Self::MinsZ => Type::Float,
+                // vec3_t   maxs;
+                Self::Maxs => Type::Vector,
+                Self::MaxsX => Type::Float,
+                Self::MaxsY => Type::Float,
+                Self::MaxsZ => Type::Float,
+                // vec3_t   size;
+                Self::Size => Type::Vector,
+                Self::SizeX => Type::Float,
+                Self::SizeY => Type::Float,
+                Self::SizeZ => Type::Float,
+                // func_t   touch;
+                Self::OnTouch => Type::Function,
+                // func_t   use;
+                Self::OnUse => Type::Function,
+                // func_t   think;
+                Self::OnThink => Type::Function,
+                // func_t   blocked;
+                Self::OnBlocked => Type::Function,
+                // float    nextthink;
+                Self::NextThink => Type::Float,
+                // int      groundentity;
+                Self::Ground => Type::Entity,
+                // float    health;
+                Self::Health => Type::Float,
+                // float    frags;
+                Self::Frags => Type::Float,
+                // float    weapon;
+                Self::WeaponId => Type::Float,
+                // string_t weaponmodel;
+                Self::WeaponModelName => Type::String,
+                // float    weaponframe;
+                Self::WeaponFrame => Type::Float,
+                // float    currentammo;
+                Self::CurrentAmmo => Type::Float,
+                // float    ammo_shells;
+                Self::AmmoShells => Type::Float,
+                // float    ammo_nails;
+                Self::AmmoNails => Type::Float,
+                // float    ammo_rockets;
+                Self::AmmoRockets => Type::Float,
+                // float    ammo_cells;
+                Self::AmmoCells => Type::Float,
+                // float    items;
+                Self::Items => Type::Float,
+                // float    takedamage;
+                Self::TakeDamage => Type::Float,
+                // int      chain;
+                Self::Chain => Type::Entity,
+                // float    deadflag;
+                Self::DeadFlag => Type::Float,
+                // vec3_t   view_ofs;
+                Self::ViewOffset => Type::Vector,
+                Self::ViewOffsetX => Type::Float,
+                Self::ViewOffsetY => Type::Float,
+                Self::ViewOffsetZ => Type::Float,
+                // float    button0;
+                Self::Button0 => Type::Float,
+                // float    button1;
+                Self::Button1 => Type::Float,
+                // float    button2;
+                Self::Button2 => Type::Float,
+                // float    impulse;
+                Self::Impulse => Type::Float,
+                // float    fixangle;
+                Self::FixAngle => Type::Float,
+                // vec3_t   v_angle;
+                Self::ViewAngle => Type::Vector,
+                Self::ViewAngleX => Type::Float,
+                Self::ViewAngleY => Type::Float,
+                Self::ViewAngleZ => Type::Float,
+                // float    idealpitch;
+                Self::IdealPitch => Type::Float,
+                // string_t netname;
+                Self::NetworkName => Type::String,
+                // int      enemy;
+                Self::Enemy => Type::Entity,
+                // float    flags;
+                Self::Flags => Type::Float,
+                // float    colormap;
+                Self::ColorMapId => Type::Float,
+                // float    team;
+                Self::Team => Type::Float,
+                // float    max_health;
+                Self::MaxHealth => Type::Float,
+                // float    teleport_time;
+                Self::TeleportTime => Type::Float,
+                // float    armortype;
+                Self::ArmorType => Type::Float,
+                // float    armorvalue;
+                Self::ArmorValue => Type::Float,
+                // float    waterlevel;
+                Self::WaterLevel => Type::Float,
+                // float    watertype;
+                Self::WaterType => Type::Float,
+                // float    ideal_yaw;
+                Self::IdealYaw => Type::Float,
+                // float    yaw_speed;
+                Self::YawSpeed => Type::Float,
+                // int      aiment;
+                Self::AimEntity => Type::Entity,
+                // int      goalentity;
+                Self::GoalEntity => Type::Entity,
+                // float    spawnflags;
+                Self::SpawnFlags => Type::Float,
+                // string_t target;
+                Self::Target => Type::String,
+                // string_t targetname;
+                Self::TargetName => Type::String,
+                // float    dmg_take;
+                Self::DamageTaken => Type::Float,
+                // float    dmg_save;
+                Self::DamageSaved => Type::Float,
+                // int      dmg_inflictor;
+                Self::DamageInflictor => Type::Entity,
+                // int      owner;
+                Self::Owner => Type::Entity,
+                // vec3_t   movedir;
+                Self::MoveDirection => Type::Vector,
+                Self::MoveDirectionX => Type::Float,
+                Self::MoveDirectionY => Type::Float,
+                Self::MoveDirectionZ => Type::Float,
+                // string_t message;
+                Self::Message => Type::String,
+                // float    sounds;
+                Self::Sounds => Type::Float,
+                // string_t noise;
+                Self::Noise0 => Type::String,
+                // string_t noise1;
+                Self::Noise1 => Type::String,
+                // string_t noise2;
+                Self::Noise2 => Type::String,
+                // string_t noise3;
+                Self::Noise3 => Type::String,
+            }
+        }
     }
 }

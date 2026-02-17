@@ -1,7 +1,7 @@
 use std::ffi::CStr;
 use std::{fmt, ops::Range, sync::Arc};
 
-use crate::{ArgType, FunctionRef, HashMap, Type, VectorField, callback_args, function_args};
+use crate::{FunctionRef, HashMap, Type, VectorField, function_args};
 use arc_slice::ArcSlice;
 use arrayvec::ArrayVec;
 #[cfg(feature = "reflect")]
@@ -109,8 +109,8 @@ impl QCMemory for FunctionExecutionCtx<'_> {
                 return Ok(None);
             };
 
-            match callback_args().find_map(|arg| arg.try_match_scalar(index)) {
-                Some((ArgType::FunctionArg(arg_index), ofs)) => {
+            match function_args().find_map(|arg| arg.try_match_scalar(index)) {
+                Some((arg_index, ofs)) => {
                     Ok(self.params.get(arg_index * 3 + ofs as usize).cloned())
                 }
                 _ => Ok(None),
@@ -138,8 +138,8 @@ impl FunctionExecutionCtx<'_> {
                 return out_of_range();
             };
 
-            match callback_args().find_map(|arg| arg.try_match_scalar(index)) {
-                Some((ArgType::FunctionArg(arg_index), ofs)) => {
+            match function_args().find_map(|arg| arg.try_match_scalar(index)) {
+                Some((arg_index, ofs)) => {
                     if let Some(param) = self.params.get_mut(arg_index * 3 + ofs as usize) {
                         *param = value;
                     } else {

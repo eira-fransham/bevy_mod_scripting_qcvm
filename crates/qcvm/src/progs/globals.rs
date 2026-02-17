@@ -114,8 +114,8 @@ impl GlobalRegistry {
     }
 
     pub fn get_with_index(&self, index: u16) -> anyhow::Result<&ScalarGlobal> {
-        dbg!(&self.globals)
-            .get(dbg!(&index))
+        self.globals
+            .get(&index)
             .ok_or_else(|| anyhow::format_err!("No global with index {index}"))
     }
 

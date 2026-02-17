@@ -26,10 +26,12 @@ use bevy_mod_scripting_core::{
 use bevy_mod_scripting_script::ScriptAttachment;
 use itertools::Either;
 use qcvm::{
-    ArgError, FieldDef, QCParams, anyhow,
+    ArgError, QCParams, anyhow,
     arrayvec::ArrayVec,
-    userdata::{AddrErr, QuakeCType},
+    userdata::{AddrError, QuakeCType},
 };
+
+pub use qcvm;
 
 /// The main "entry point" plugin for adding QC Scripting
 pub struct QCScriptingPlugin {
@@ -72,8 +74,13 @@ pub struct QCWorldspawn;
 impl qcvm::userdata::EntityHandle for BevyEntityHandle {
     type Context = BevyScriptContext;
     type Error = InteropError;
+    type FieldAddr = qcvm::quake1::fields::FieldAddr;
 
-    fn get(&self, _: &Self::Context, field: &FieldDef) -> Result<qcvm::Value, Self::Error> {
+    fn get(
+        &self,
+        _: &Self::Context,
+        field: Self::FieldAddr,
+    ) -> Result<qcvm::Value, AddrError<Self::Error>> {
         // TODO: We could do this just once when initialising the context, which would be significantly more efficient
         let world = ThreadWorldContainer.try_get_context()?.world;
 
@@ -84,12 +91,7 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
         //       We can add optimised getter/setter configuration later.
         world
             .with_read_access(ReflectAccessId::for_global(), |world| {
-                // TODO: We should use the same enum-based mechanism as for `Context::GlobalAddr`
-                let key = if field.name.is_empty() {
-                    ScriptValue::Integer(field.offset as i64)
-                } else {
-                    ScriptValue::String(field.name.to_string_lossy().into_owned().into())
-                };
+                let key = ScriptValue::String(field.name().into());
 
                 get(
                     FUNCTION_CALL_CONTEXT,
@@ -101,6 +103,7 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
                     _ => Err(e),
                 })
                 .and_then(|v| bms_script_value_to_qcvm_script_value(&v))
+                .map_err(Into::into)
             })
             .map_err(|()| InteropError::MissingWorld)?
     }
@@ -108,61 +111,22 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
     fn set(
         &self,
         _context: &mut Self::Context,
-        field: &FieldDef,
-        offset: qcvm::VectorField,
+        field: Self::FieldAddr,
         value: qcvm::Value,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), AddrError<Self::Error>> {
         // TODO: We could do this just once when initialising the context, which would be significantly more efficient
         let world = ThreadWorldContainer.try_get_context()?.world;
 
         let function_registry = world.script_function_registry();
-        let (get, set) = {
-            let function_registry = function_registry.read();
-
-            (
-                function_registry.magic_functions.get,
-                function_registry.magic_functions.set,
-            )
-        };
+        let set = function_registry.read().magic_functions.set;
 
         // TODO: We unfortunately need global access for now, since we don't know what components a getter will access.
         //       We can add optimised getter/setter configuration later.
         world
             .with_read_access(ReflectAccessId::for_global(), |world| {
-                let key = if field.name.is_empty() {
-                    ScriptValue::Integer(field.offset as i64)
-                } else {
-                    ScriptValue::String(field.name.to_string_lossy().into_owned().into())
-                };
+                let key = ScriptValue::String(field.name().into());
 
-                // TODO: This whole process is horribly wasteful for the very-common case of setting a single field of a vector.
-                //       While it is built for flexibility over speed, this feels like a bit much.
-                let new_value = if field.type_.num_elements() > 1 {
-                    // Get old value
-                    let mut old = get(
-                        FUNCTION_CALL_CONTEXT,
-                        ReflectReference::new_component_ref::<QCEntity>(self.0, world.clone())?,
-                        key.clone(),
-                    )
-                    .and_then(|v| bms_script_value_to_qcvm_script_value(&v))?;
-
-                    old.set(offset, value)
-                        // TODO
-                        .map_err(|_| InteropError::NotImplemented)?;
-
-                    old
-                } else {
-                    if offset != qcvm::VectorField::XOrScalar {
-                        return Err(InteropError::LengthMismatch {
-                            expected: 3,
-                            got: 1,
-                        });
-                    }
-
-                    value
-                };
-
-                let new_value = qcvm_script_value_to_bms_script_value(&new_value)?;
+                let new_value = qcvm_script_value_to_bms_script_value(&value)?;
 
                 set(
                     FUNCTION_CALL_CONTEXT,
@@ -170,6 +134,7 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
                     key,
                     new_value,
                 )
+                .map_err(Into::into)
             })
             .map_err(|()| InteropError::MissingWorld)?
     }
@@ -190,12 +155,12 @@ impl qcvm::userdata::EntityHandle for BevyEntityHandle {
 
 fn interop_error_to_addr_error<T>(
     res: Result<T, InteropError>,
-) -> Result<T, AddrErr<InteropError>> {
+) -> Result<T, AddrError<InteropError>> {
     res.map_err(|e| match e {
         InteropError::LengthMismatch { .. } | InteropError::InvalidIndex { .. } => {
-            AddrErr::OutOfRange
+            AddrError::OutOfRange
         }
-        other => AddrErr::Other(other),
+        other => AddrError::Other { error: other },
     })
 }
 
@@ -235,7 +200,7 @@ impl qcvm::userdata::Context for BevyScriptContext {
         }
     }
 
-    fn global(&self, addr: Self::GlobalAddr) -> Result<qcvm::Value, AddrErr<InteropError>> {
+    fn global(&self, addr: Self::GlobalAddr) -> Result<qcvm::Value, AddrError<InteropError>> {
         if let Some(val) = self.special_args.get(&addr) {
             return Ok(val.clone());
         }
@@ -251,7 +216,7 @@ impl qcvm::userdata::Context for BevyScriptContext {
         world
             .with_read_access(
                 ReflectAccessId::for_global(),
-                |world| -> Result<_, AddrErr<InteropError>> {
+                |world| -> Result<_, AddrError<InteropError>> {
                     // TODO: We can probably use the `quake1` module defs somehow here(?)
                     let key = ScriptValue::String(addr.name().into());
 
@@ -275,13 +240,15 @@ impl qcvm::userdata::Context for BevyScriptContext {
         &mut self,
         addr: Self::GlobalAddr,
         value: qcvm::Value,
-    ) -> Result<(), AddrErr<InteropError>> {
+    ) -> Result<(), AddrError<InteropError>> {
         if let Some(val) = self.special_args.get_mut(&addr) {
             if SPECIAL_ARGS_ARE_IMMUTABLE {
                 let arg_name = addr.name();
-                return Err(AddrErr::Other(qc_interop_error(anyhow::format_err!(
-                    "Special argument {arg_name} is immutable"
-                ))));
+                return Err(AddrError::Other {
+                    error: qc_interop_error(anyhow::format_err!(
+                        "Special argument {arg_name} is immutable"
+                    )),
+                });
             } else {
                 *val = value;
                 return Ok(());
@@ -299,7 +266,7 @@ impl qcvm::userdata::Context for BevyScriptContext {
         world
             .with_read_access(
                 ReflectAccessId::for_global(),
-                |world| -> Result<_, AddrErr<InteropError>> {
+                |world| -> Result<_, AddrError<InteropError>> {
                     let key = ScriptValue::String(addr.name().into());
 
                     Ok(interop_error_to_addr_error(set(

@@ -25,7 +25,7 @@ use crate::{
         functions::{ArgSize, FunctionExecutionCtx, QCFunctionDef, Statement},
         globals::GlobalRegistry,
     },
-    userdata::{AddrErr, ErasedContext, ErasedEntityHandle, ErasedFunction, FnCall, QuakeCType},
+    userdata::{AddrError, ErasedContext, ErasedEntityHandle, ErasedFunction, FnCall, QuakeCType},
 };
 
 mod entity;
@@ -270,8 +270,11 @@ impl TryFrom<[VmScalar; 3]> for Value {
     }
 }
 
+#[derive(Snafu, Debug, Copy, Clone, PartialEq, Eq)]
+struct NotScalarError;
+
 impl TryFrom<Value> for VmScalar {
-    type Error = anyhow::Error;
+    type Error = NotScalarError;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         Ok(match value {
@@ -282,7 +285,7 @@ impl TryFrom<Value> for VmScalar {
             }
             Value::Float(float) => VmScalar::Float(float),
             // TODO: Just read x value?
-            Value::Vector(_) => anyhow::bail!("Tried to read vector as a scalar"),
+            Value::Vector(_) => return Err(NotScalarError),
             Value::String(cstr) => VmScalar::String(StringRef::Temp(cstr)),
         })
     }
@@ -373,7 +376,7 @@ pub trait QCParams: fmt::Debug {
 }
 
 /// Errors that can happen when parsing an argument list.
-#[derive(Debug)]
+#[derive(Snafu, Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ArgError<E> {
     /// An argument index was specified that was out of range for the number of supported arguments.
     ArgOutOfRange {
@@ -383,30 +386,17 @@ pub enum ArgError<E> {
         index: usize,
     },
     /// Some other kind of error occurred (usually in conversion to a [`Value`])
-    Other(E),
+    Other {
+        /// The underlying cause.
+        error: E,
+    },
 }
 
 impl<E> From<E> for ArgError<E> {
     fn from(other: E) -> Self {
-        Self::Other(other)
+        Self::Other { error: other }
     }
 }
-
-impl<E> fmt::Display for ArgError<E>
-where
-    E: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ArgOutOfRange { len, index } => {
-                write!(f, "Argument {index} out of range for list of length {len}")
-            }
-            Self::Other(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl<E> std::error::Error for ArgError<E> where E: std::fmt::Debug + std::fmt::Display {}
 
 macro_rules! impl_memory_tuple {
     ($first:ident $(, $rest:ident)*) => {
@@ -497,7 +487,11 @@ where
                 len: self.count(),
                 index,
             })
-            .and_then(|val| val.clone().try_into().map_err(ArgError::Other))
+            .and_then(|val| {
+                val.clone()
+                    .try_into()
+                    .map_err(|error| ArgError::Other { error })
+            })
     }
 }
 
@@ -518,7 +512,11 @@ where
                 len: self.count(),
                 index,
             })
-            .and_then(|val| val.clone().try_into().map_err(ArgError::Other))
+            .and_then(|val| {
+                val.clone()
+                    .try_into()
+                    .map_err(|error| ArgError::Other { error })
+            })
     }
 }
 
@@ -539,7 +537,11 @@ where
                 len: self.count(),
                 index,
             })
-            .and_then(|val| val.clone().try_into().map_err(ArgError::Other))
+            .and_then(|val| {
+                val.clone()
+                    .try_into()
+                    .map_err(|error| ArgError::Other { error })
+            })
     }
 }
 
@@ -554,24 +556,12 @@ where
             return Ok(None);
         };
 
-        match callback_args().find_map(|arg| arg.try_match_scalar(index)) {
-            Some((ArgType::FunctionArg(arg_index), ofs)) => match self.params.nth(arg_index) {
+        match function_args().find_map(|arg| arg.try_match_scalar(index)) {
+            Some((arg_index, ofs)) => match self.params.nth(arg_index) {
                 Ok(val) => Ok(Some(val.try_scalar(ofs).unwrap_or(VmScalar::Void))),
                 Err(ArgError::ArgOutOfRange { .. }) => Ok(None),
-                Err(ArgError::Other(e)) => Err(e.into()),
+                Err(ArgError::Other { error: e }) => Err(e.into()),
             },
-            // TODO: Reimplement special args via `Context::global` etc
-            // Some((ArgType::Self_, VectorField::X)) => Ok(self
-            //     .special
-            //     .self_
-            //     .map(|ent| VmScalar::Entity(EntityRef::Entity(ent)))),
-            // Some((ArgType::Other, VectorField::X)) => Ok(self
-            //     .special
-            //     .other
-            //     .map(|ent| VmScalar::Entity(EntityRef::Entity(ent)))),
-            Some(_) => {
-                unreachable!("TODO: This should be impossible - express this in the type system")
-            }
             None => Ok(None),
         }
     }
@@ -621,6 +611,27 @@ impl Type {
     /// Returns true if this is a scalar type, false if it is [`Type::Vector`].
     pub const fn is_scalar(&self) -> bool {
         !matches!(self, Self::Vector)
+    }
+
+    pub(crate) const fn typeck(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Type::AnyScalar
+                | Type::Void
+                | Type::Entity
+                | Type::Function
+                | Type::Float
+                | Type::String,
+                Type::AnyScalar,
+            ) => true,
+            (Type::Void, Type::Void) => true,
+            (Type::Entity, Type::Entity) => true,
+            (Type::Function, Type::Function) => true,
+            (Type::Vector, Type::Vector) => true,
+            (Type::Float, Type::Float) => true,
+            (Type::String, Type::String) => true,
+            _ => false,
+        }
     }
 }
 
@@ -923,45 +934,23 @@ impl From<[VmScalar; 3]> for OpResult {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub(crate) enum ArgType {
-    /// Standard argument with index
-    FunctionArg(usize),
-    /// "self" special argument
-    Self_,
-    /// "other" special argument
-    Other,
-}
-
-#[derive(Copy, Clone, Debug)]
 pub(crate) struct ArgAddr {
     pub addr: u16,
-    pub ty: ArgType,
+    pub index: usize,
 }
 
 impl ArgAddr {
-    pub(crate) fn vector_field_addrs(&self) -> Option<impl Iterator<Item = u16>> {
-        match self.ty {
-            ArgType::FunctionArg(_) => Some(
-                VectorField::FIELDS
-                    .map(|field| self.addr + field as u16)
-                    .into_iter(),
-            ),
-            _ => None,
-        }
+    pub(crate) fn vector_field_addrs(&self) -> impl Iterator<Item = u16> {
+        VectorField::FIELDS
+            .map(|field| self.addr + field as u16)
+            .into_iter()
     }
 }
 
 impl ArgAddr {
-    pub(crate) fn try_match_scalar(&self, idx: u16) -> Option<(ArgType, VectorField)> {
-        if let ArgType::FunctionArg(arg_index) = self.ty
-            && (self.addr..self.addr + 3).contains(&idx)
-        {
-            Some((
-                ArgType::FunctionArg(arg_index),
-                VectorField::from_u16(idx - self.addr)?,
-            ))
-        } else if self.addr == idx {
-            Some((self.ty, VectorField::XOrScalar))
+    pub(crate) fn try_match_scalar(&self, idx: u16) -> Option<(usize, VectorField)> {
+        if (self.addr..self.addr + VectorField::FIELDS.len() as u16).contains(&idx) {
+            Some((self.index, VectorField::from_u16(idx - self.addr)?))
         } else {
             None
         }
@@ -972,77 +961,26 @@ pub(crate) fn function_args() -> impl ExactSizeIterator<Item = ArgAddr> {
     // TODO: Make this generic so contexts can use different arg addrs
 
     [
+        ArgAddr { addr: 4, index: 0 },
+        ArgAddr { addr: 7, index: 1 },
+        ArgAddr { addr: 10, index: 2 },
+        ArgAddr { addr: 13, index: 3 },
+        ArgAddr { addr: 16, index: 4 },
+        ArgAddr { addr: 19, index: 5 },
+        ArgAddr { addr: 22, index: 6 },
+        ArgAddr { addr: 25, index: 7 },
+        ArgAddr { addr: 25, index: 8 },
+        ArgAddr { addr: 25, index: 9 },
         ArgAddr {
-            addr: 4,
-            ty: ArgType::FunctionArg(0),
-        },
-        ArgAddr {
-            addr: 7,
-            ty: ArgType::FunctionArg(1),
-        },
-        ArgAddr {
-            addr: 10,
-            ty: ArgType::FunctionArg(2),
-        },
-        ArgAddr {
-            addr: 13,
-            ty: ArgType::FunctionArg(3),
-        },
-        ArgAddr {
-            addr: 16,
-            ty: ArgType::FunctionArg(4),
-        },
-        ArgAddr {
-            addr: 19,
-            ty: ArgType::FunctionArg(5),
-        },
-        ArgAddr {
-            addr: 22,
-            ty: ArgType::FunctionArg(6),
+            addr: 25,
+            index: 10,
         },
         ArgAddr {
             addr: 25,
-            ty: ArgType::FunctionArg(7),
-        },
-        ArgAddr {
-            addr: 25,
-            ty: ArgType::FunctionArg(8),
-        },
-        ArgAddr {
-            addr: 25,
-            ty: ArgType::FunctionArg(9),
-        },
-        ArgAddr {
-            addr: 25,
-            ty: ArgType::FunctionArg(10),
-        },
-        ArgAddr {
-            addr: 25,
-            ty: ArgType::FunctionArg(11),
+            index: 11,
         },
     ]
     .into_iter()
-}
-
-// TODO: Make this configurable
-pub(crate) fn special_args() -> impl ExactSizeIterator<Item = ArgAddr> {
-    use crate::quake1::globals::GlobalAddr;
-
-    [
-        ArgAddr {
-            addr: GlobalAddr::Self_.to_u16(),
-            ty: ArgType::Self_,
-        },
-        ArgAddr {
-            addr: GlobalAddr::Other.to_u16(),
-            ty: ArgType::Other,
-        },
-    ]
-    .into_iter()
-}
-
-pub(crate) fn callback_args() -> impl Iterator<Item = ArgAddr> {
-    special_args().into_iter().chain(function_args())
 }
 
 const RETURN_ADDRS: Range<usize> = 1..4;
@@ -1306,11 +1244,7 @@ where
                     }
 
                     ArgSize::Vector => {
-                        for (src, dst) in src
-                            .vector_field_addrs()
-                            .expect("Programmer error: function arg that is not a vector")
-                            .zip(dst_locals.by_ref())
-                        {
+                        for (src, dst) in src.vector_field_addrs().zip(dst_locals.by_ref()) {
                             new_memory.set(dst, memory.get(src as usize)?)?;
                         }
                     }
@@ -1363,8 +1297,8 @@ impl ExecutionCtx<'_> {
         let index = index.try_into()?;
         match self.context.dyn_global(index.try_into()?) {
             Ok(val) => Ok(val.try_scalar(VectorField::XOrScalar)?.try_into()?),
-            Err(AddrErr::Other(other)) => Err(other),
-            Err(AddrErr::OutOfRange) => Ok(self.memory.get(index)?.try_into()?),
+            Err(AddrError::Other { error: other }) => Err(other),
+            Err(AddrError::OutOfRange) => Ok(self.memory.get(index)?.try_into()?),
         }
     }
 
@@ -1386,8 +1320,8 @@ impl ExecutionCtx<'_> {
             .dyn_set_global(index.try_into()?, value.clone())
         {
             Ok(()) => Ok(()),
-            Err(AddrErr::Other(other)) => Err(other),
-            Err(AddrErr::OutOfRange) => self.memory.set(index.try_into()?, value.try_into()?),
+            Err(AddrError::Other { error: other }) => Err(other),
+            Err(AddrError::OutOfRange) => self.memory.set(index.try_into()?, value.try_into()?),
         }
     }
 

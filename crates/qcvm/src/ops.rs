@@ -8,9 +8,9 @@ use tracing::{debug, error};
 
 use crate::{
     ArgAddr, ExecutionCtx, MAGIC_OP_STATE_IMPL_FUNC, MAGIC_OP_STATE_IMPL_NUM_ARGS, OpResult, Type,
-    Value, function_args,
+    function_args,
     progs::{
-        EntityField, EntityRef, FieldPtr, StringRef, VectorField, VmFunctionRef, VmScalar, VmValue,
+        EntityField, EntityRef, FieldPtr, StringRef, VmFunctionRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
     },
     userdata::{Context, EntityHandle as _, ErasedFunction, FnCall, Function as _},
@@ -347,32 +347,20 @@ impl ExecutionCtx<'_> {
     fn load_scalar(&mut self, entity: i16, field: i16, out_ptr: i16) -> anyhow::Result<()> {
         let ent: EntityRef = self.get(entity)?;
         let FieldPtr(ptr) = self.get(field)?;
-        let field_def = self.entity_def.get(ptr)?;
 
-        let value = ent.non_null()?.get(&*self.context, &field_def.def)?;
+        let value = ent.non_null()?.get(&*self.context, ptr.0.try_into()?)?;
 
-        let scalar = match (value, field_def.field) {
-            (Value::Vector(vec), VectorField::XOrScalar) => vec.x.into(),
-            (Value::Vector(vec), VectorField::Y) => vec.y.into(),
-            (Value::Vector(vec), VectorField::Z) => vec.z.into(),
-            (value, VectorField::XOrScalar) => VmScalar::try_from(value)?,
-            (_, VectorField::Y | VectorField::Z) => {
-                anyhow::bail!("Tried to get a field of a non-vector")
-            }
-        };
-
-        self.set(out_ptr, scalar)
+        self.set(out_ptr, value)
     }
 
     // LOAD_V: load vector field from entity
     fn op_load_v(&mut self, entity: i16, field: i16, out_ptr: i16) -> anyhow::Result<()> {
         let ent: EntityRef = self.get(entity)?;
         let FieldPtr(ptr) = self.get(field)?;
-        let field = self.entity_def.get(ptr)?;
 
         let value: Vec3 = ent
             .non_null()?
-            .get(&*self.context, &field.def)?
+            .get(&*self.context, ptr.0.try_into()?)?
             .try_into()?;
 
         self.set_vector(out_ptr, value.into())
@@ -401,11 +389,9 @@ impl ExecutionCtx<'_> {
         let value = self.to_value(f.into())?;
         let EntityField { entity, field } = self.get(out_ptr)?;
 
-        let field_def = self.entity_def.get(field)?;
-
         entity
             .non_null()?
-            .set(self.context, &field_def.def, field_def.field, value)?;
+            .set(self.context, field.0.try_into()?, value)?;
 
         Ok(())
     }
@@ -418,11 +404,9 @@ impl ExecutionCtx<'_> {
         let f = self.get_vec3(src_ptr)?;
         let EntityField { entity, field } = self.get(out_ptr)?;
 
-        let field_def = self.entity_def.get(field)?;
-
         entity
             .non_null()?
-            .set(self.context, &field_def.def, Default::default(), f.into())?;
+            .set(self.context, field.0.try_into()?, f.into())?;
 
         Ok(())
     }
@@ -800,14 +784,15 @@ impl ExecutionCtx<'_> {
 // Need `quake1` feature for tests.
 #[cfg(all(test, feature = "quake1"))]
 mod test {
-    use std::{
-        ffi::{CStr, CString},
-        fmt,
-        sync::Arc,
-    };
+    use std::{ffi::CString, fmt, sync::Arc};
 
-    use crate::{HashMap, userdata::ErasedEntityHandle};
+    use crate::{
+        HashMap, VectorField,
+        userdata::{AddrError, ErasedEntityHandle},
+    };
     use itertools::Itertools;
+    use num::FromPrimitive;
+    use strum::VariantArray;
 
     use crate::{
         EntityRef, Type, Value,
@@ -815,8 +800,7 @@ mod test {
         load::{LoadFn, Progs},
         ops::test::assembler::{FunctionBodyBuilder, Reg},
         progs::{
-            FieldDef, FieldPtr, GlobalDef, GlobalPtr, Ptr, StringTable, VectorField, VmScalarType,
-            VmType,
+            FieldDef, FieldPtr, GlobalDef, GlobalPtr, Ptr, StringTable, VmScalarType, VmType,
             functions::{FunctionRegistry, MAX_ARGS, Statement},
             globals::GlobalRegistry,
         },
@@ -1233,12 +1217,91 @@ mod test {
     }
 
     struct TestContext {
-        fields: HashMap<(usize, Arc<CStr>), Value>,
+        fields: HashMap<(usize, &'static str), Value>,
     }
 
-    const FIELDS: &[(&CStr, Value)] = &[
-        (c"vector_field", Value::Vector(glam::Vec3::new(0., 0., 0.))),
-        (c"float_field", Value::Float(100.)),
+    #[derive(VariantArray, Debug, Copy, Clone, PartialEq, Eq)]
+    enum FieldAddr {
+        Float,
+        Vector,
+        VectorX,
+        VectorY,
+        VectorZ,
+    }
+
+    impl FromPrimitive for FieldAddr {
+        fn from_u16(n: u16) -> Option<Self> {
+            dbg!(Self::from_u16(dbg!(n), Type::AnyScalar))
+        }
+
+        fn from_i64(n: i64) -> Option<Self> {
+            FromPrimitive::from_u16(n.try_into().ok()?)
+        }
+
+        fn from_u64(n: u64) -> Option<Self> {
+            FromPrimitive::from_u16(n.try_into().ok()?)
+        }
+    }
+
+    impl FieldAddr {
+        const fn name(&self) -> &'static str {
+            match self {
+                FieldAddr::Float => "float_field",
+                FieldAddr::Vector => "vector_field",
+                FieldAddr::VectorX => "vector_field_x",
+                FieldAddr::VectorY => "vector_field_y",
+                FieldAddr::VectorZ => "vector_field_z",
+            }
+        }
+
+        const fn vector_field_or_scalar(&self) -> (Self, VectorField) {
+            match self {
+                FieldAddr::VectorX => (FieldAddr::Vector, VectorField::XOrScalar),
+                FieldAddr::VectorY => (FieldAddr::Vector, VectorField::Y),
+                FieldAddr::VectorZ => (FieldAddr::Vector, VectorField::Z),
+                other => (*other, VectorField::XOrScalar),
+            }
+        }
+
+        const fn type_(&self) -> Type {
+            match self {
+                FieldAddr::Float => Type::Float,
+                FieldAddr::Vector => Type::Vector,
+                FieldAddr::VectorX => Type::Float,
+                FieldAddr::VectorY => Type::Float,
+                FieldAddr::VectorZ => Type::Float,
+            }
+        }
+
+        const fn from_u16(val: u16, ty: Type) -> Option<Self> {
+            // Can't just iter over `VARIANTS` as that isn't stable in const fns.
+            let mut i = 0;
+            while i < Self::VARIANTS.len() {
+                let variant = Self::VARIANTS[i];
+
+                if variant.to_u16() == val && variant.type_().typeck(&ty) {
+                    return Some(variant);
+                }
+
+                i += 1;
+            }
+
+            None
+        }
+
+        const fn to_u16(&self) -> u16 {
+            match self {
+                FieldAddr::Float => 0,
+                FieldAddr::Vector | FieldAddr::VectorX => 1,
+                FieldAddr::VectorY => 2,
+                FieldAddr::VectorZ => 3,
+            }
+        }
+    }
+
+    const FIELDS: &[(&str, Value)] = &[
+        ("float_field", Value::Float(100.)),
+        ("vector_field", Value::Vector(glam::Vec3::new(0., 0., 0.))),
     ];
     const ENTITIES: &[usize] = &[0, 1, 2];
 
@@ -1248,7 +1311,7 @@ mod test {
                 fields: ENTITIES
                     .iter()
                     .cartesian_product(FIELDS)
-                    .map(|(id, (name, val))| ((*id, name.to_owned().into()), val.clone()))
+                    .map(|(id, (name, val))| ((*id, *name), val.clone()))
                     .collect(),
             }
         }
@@ -1267,37 +1330,49 @@ mod test {
     impl EntityHandle for TestEnt {
         type Context = TestContext;
         type Error = <TestContext as Context>::Error;
+        type FieldAddr = FieldAddr;
 
-        fn get(&self, context: &Self::Context, field: &FieldDef) -> Result<Value, Self::Error> {
+        fn get(
+            &self,
+            context: &Self::Context,
+            field: Self::FieldAddr,
+        ) -> Result<Value, AddrError<Self::Error>> {
+            let (field, offset) = field.vector_field_or_scalar();
             context
                 .fields
-                .get(&(self.id, field.name.clone()))
-                .cloned()
+                .get(&(self.id, field.name()))
+                .and_then(|v| v.field(offset).ok())
                 .ok_or_else(|| {
-                    anyhow::format_err!("No field with name {:?}", field.name)
-                        .into_boxed_dyn_error()
-                        .into()
+                    AddrError::Other {
+                        error: anyhow::format_err!("No field with name {:?}", field.name()),
+                    }
+                    .into_arc_dyn_error()
                 })
         }
 
         fn set(
             &self,
             context: &mut Self::Context,
-            field: &FieldDef,
-            offset: VectorField,
+            field: Self::FieldAddr,
             value: Value,
-        ) -> Result<(), Self::Error> {
+        ) -> Result<(), AddrError<Self::Error>> {
+            let (field, offset) = field.vector_field_or_scalar();
             let existing_value: &mut Value = context
                 .fields
-                .get_mut(&(self.id, field.name.clone()))
+                .get_mut(&(self.id, field.name()))
                 .ok_or_else(|| {
-                    anyhow::format_err!("No field with name {:?}", field.name)
-                        .into_boxed_dyn_error()
+                    AddrError::Other {
+                        error: anyhow::format_err!("No field with name {:?}", field.name()),
+                    }
+                    .into_arc_dyn_error()
                 })?;
 
-            existing_value
-                .set(offset, value)
-                .map_err(|e| anyhow::Error::from(e).into_boxed_dyn_error())?;
+            existing_value.set(offset, value).map_err(|e| {
+                AddrError::Other {
+                    error: anyhow::Error::from(e),
+                }
+                .into_arc_dyn_error()
+            })?;
 
             Ok(())
         }
@@ -1379,16 +1454,16 @@ mod test {
             }
         }
 
-        fn global(&self, _def: u16) -> Result<Value, crate::userdata::AddrErr<Self::Error>> {
-            Err(crate::userdata::AddrErr::OutOfRange)
+        fn global(&self, _def: u16) -> Result<Value, crate::userdata::AddrError<Self::Error>> {
+            Err(crate::userdata::AddrError::OutOfRange)
         }
 
         fn set_global(
             &mut self,
             _def: u16,
             _value: Value,
-        ) -> Result<(), crate::userdata::AddrErr<Self::Error>> {
-            Err(crate::userdata::AddrErr::OutOfRange)
+        ) -> Result<(), crate::userdata::AddrError<Self::Error>> {
+            Err(crate::userdata::AddrError::OutOfRange)
         }
     }
 

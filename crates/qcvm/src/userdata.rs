@@ -11,11 +11,12 @@ use anyhow::bail;
 use arrayvec::ArrayVec;
 use bump_scope::BumpScope;
 use num::FromPrimitive;
+use snafu::Snafu;
 
 use crate::{
     AsErasedContext, BuiltinDef, CallArgs, ExecutionCtx, FunctionRef, MAX_ARGS, QCMemory, QCParams,
     Type, Value, function_args,
-    progs::{FieldDef, VectorField, VmScalar, VmValue},
+    progs::{VmScalar, VmValue},
 };
 
 /// A type-erased entity handle.
@@ -23,39 +24,51 @@ use crate::{
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct ErasedEntityHandle(pub u64);
 
+type ErasedAddr = u16;
+
 /// An error when getting/setting an address
-pub enum AddrErr<E> {
+#[derive(Snafu, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum AddrError<E> {
     /// The address does not exist
     OutOfRange,
     /// Another error occurred
-    Other(E),
+    Other {
+        /// The underlying error.
+        error: E,
+    },
 }
 
-impl<E> From<E> for AddrErr<E> {
+impl<E> From<E> for AddrError<E> {
     fn from(value: E) -> Self {
-        Self::Other(value)
+        Self::Other { error: value }
     }
 }
 
-impl<E> AddrErr<E>
+impl<E> AddrError<E>
 where
     E: fmt::Display,
 {
-    fn into_anyhow(self) -> AddrErr<anyhow::Error> {
+    pub(crate) fn into_anyhow(self) -> AddrError<anyhow::Error> {
         {
             match self {
-                Self::OutOfRange => AddrErr::OutOfRange,
-                Self::Other(e) => AddrErr::Other(anyhow::format_err!("{e}")),
+                Self::OutOfRange => AddrError::OutOfRange,
+                Self::Other { error: e } => AddrError::Other {
+                    error: anyhow::format_err!("{e}"),
+                },
             }
         }
     }
 }
 
-impl AddrErr<anyhow::Error> {
-    fn into_arc_dyn_error(self) -> AddrErr<Arc<dyn std::error::Error + Send + Sync + 'static>> {
+impl AddrError<anyhow::Error> {
+    pub(crate) fn into_arc_dyn_error(
+        self,
+    ) -> AddrError<Arc<dyn std::error::Error + Send + Sync + 'static>> {
         match self {
-            Self::OutOfRange => AddrErr::OutOfRange,
-            Self::Other(e) => AddrErr::Other(e.into_boxed_dyn_error().into()),
+            Self::OutOfRange => AddrError::OutOfRange,
+            Self::Other { error: e } => AddrError::Other {
+                error: e.into_boxed_dyn_error().into(),
+            },
         }
     }
 }
@@ -71,40 +84,40 @@ pub trait Context {
     /// The error that is returned by [`Context::builtin`].
     type Error: std::error::Error;
     /// The type representing valid globals
-    type GlobalAddr: FromPrimitive + fmt::Display;
+    type GlobalAddr: FromPrimitive;
 
     /// Given a function definition, get the builtin that it corresponds to (if one exists).
     fn builtin(&self, def: &BuiltinDef) -> Result<Arc<Self::Function>, Self::Error>;
 
     /// Get a global with the given definition
-    fn global(&self, def: Self::GlobalAddr) -> Result<Value, AddrErr<Self::Error>>;
+    fn global(&self, def: Self::GlobalAddr) -> Result<Value, AddrError<Self::Error>>;
 
     /// Set a global with the given definition
     fn set_global(
         &mut self,
         def: Self::GlobalAddr,
         value: Value,
-    ) -> Result<(), AddrErr<Self::Error>>;
+    ) -> Result<(), AddrError<Self::Error>>;
 }
 
 impl Context for dyn ErasedContext {
     type Entity = ErasedEntityHandle;
     type Function = dyn ErasedFunction;
     type Error = Arc<dyn std::error::Error + Send + Sync + 'static>;
-    type GlobalAddr = u16;
+    type GlobalAddr = ErasedAddr;
 
     fn builtin(&self, def: &BuiltinDef) -> Result<Arc<dyn ErasedFunction>, Self::Error> {
         self.dyn_builtin(def)
             .map_err(|e| e.into_boxed_dyn_error().into())
     }
 
-    fn global(&self, def: u16) -> Result<Value, AddrErr<Self::Error>> {
-        self.dyn_global(def).map_err(AddrErr::into_arc_dyn_error)
+    fn global(&self, def: ErasedAddr) -> Result<Value, AddrError<Self::Error>> {
+        self.dyn_global(def).map_err(AddrError::into_arc_dyn_error)
     }
 
-    fn set_global(&mut self, def: u16, value: Value) -> Result<(), AddrErr<Self::Error>> {
+    fn set_global(&mut self, def: ErasedAddr, value: Value) -> Result<(), AddrError<Self::Error>> {
         self.dyn_set_global(def, value)
-            .map_err(AddrErr::into_arc_dyn_error)
+            .map_err(AddrError::into_arc_dyn_error)
     }
 }
 
@@ -114,22 +127,29 @@ pub trait ErasedContext: Any {
     fn dyn_builtin(&self, def: &BuiltinDef) -> anyhow::Result<Arc<dyn ErasedFunction>>;
 
     /// Dynamic version of `<Context::Entity as EntityHandle>::get`.
-    fn dyn_entity_get(&self, erased_ent: u64, field: &FieldDef) -> anyhow::Result<Value>;
+    fn dyn_entity_get(
+        &self,
+        erased_ent: u64,
+        field: ErasedAddr,
+    ) -> anyhow::Result<Value, AddrError<anyhow::Error>>;
 
     /// Dynamic version of `<Context::Entity as EntityHandle>::set`.
     fn dyn_entity_set(
         &mut self,
         erased_ent: u64,
-        field: &FieldDef,
-        offset: VectorField,
+        field: ErasedAddr,
         value: Value,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<(), AddrError<anyhow::Error>>;
 
     /// Dynamic version of [`Context::global`]
-    fn dyn_global(&self, def: u16) -> Result<Value, AddrErr<anyhow::Error>>;
+    fn dyn_global(&self, def: ErasedAddr) -> Result<Value, AddrError<anyhow::Error>>;
 
     /// Dynamic version of [`Context::set_global`]
-    fn dyn_set_global(&mut self, def: u16, value: Value) -> Result<(), AddrErr<anyhow::Error>>;
+    fn dyn_set_global(
+        &mut self,
+        def: ErasedAddr,
+        value: Value,
+    ) -> Result<(), AddrError<anyhow::Error>>;
 }
 
 impl fmt::Debug for &'_ mut dyn ErasedContext {
@@ -153,37 +173,50 @@ where
         Ok(self.builtin(def).map_err(|e| anyhow::format_err!("{e}"))? as Arc<dyn ErasedFunction>)
     }
 
-    fn dyn_entity_get(&self, erased_ent: u64, field: &FieldDef) -> anyhow::Result<Value> {
-        <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| ent.get(self, field))
+    fn dyn_entity_get(
+        &self,
+        erased_ent: u64,
+        field: ErasedAddr,
+    ) -> anyhow::Result<Value, AddrError<anyhow::Error>> {
+        let field_addr = <<T::Entity as EntityHandle>::FieldAddr as FromPrimitive>::from_u16(field)
+            .ok_or(AddrError::OutOfRange)?;
+        <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| ent.get(self, field_addr))
             .map_err(|e| anyhow::format_err!("{e}"))?
-            .map_err(|e| anyhow::format_err!("{e}"))
+            .map_err(|e| AddrError::Other {
+                error: anyhow::format_err!("{e}"),
+            })
     }
 
     fn dyn_entity_set(
         &mut self,
         erased_ent: u64,
-        field: &FieldDef,
-        offset: VectorField,
+        field: ErasedAddr,
         value: Value,
-    ) -> anyhow::Result<()> {
-        <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| {
-            ent.set(self, field, offset, value)
-        })
-        .map_err(|e| anyhow::format_err!("{e}"))?
-        .map_err(|e| anyhow::format_err!("{e}"))
+    ) -> Result<(), AddrError<anyhow::Error>> {
+        let field_addr = <<T::Entity as EntityHandle>::FieldAddr as FromPrimitive>::from_u16(field)
+            .ok_or(AddrError::OutOfRange)?;
+        <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| ent.set(self, field_addr, value))
+            .map_err(|e| anyhow::format_err!("{e}"))?
+            .map_err(|e| AddrError::Other {
+                error: anyhow::format_err!("{e}"),
+            })
     }
 
-    fn dyn_global(&self, def: u16) -> Result<Value, AddrErr<anyhow::Error>> {
-        self.global(<T as Context>::GlobalAddr::from_u16(def).ok_or(AddrErr::OutOfRange)?)
-            .map_err(AddrErr::into_anyhow)
+    fn dyn_global(&self, def: ErasedAddr) -> Result<Value, AddrError<anyhow::Error>> {
+        self.global(<T as Context>::GlobalAddr::from_u16(def).ok_or(AddrError::OutOfRange)?)
+            .map_err(AddrError::into_anyhow)
     }
 
-    fn dyn_set_global(&mut self, def: u16, value: Value) -> Result<(), AddrErr<anyhow::Error>> {
+    fn dyn_set_global(
+        &mut self,
+        def: ErasedAddr,
+        value: Value,
+    ) -> Result<(), AddrError<anyhow::Error>> {
         self.set_global(
-            <T as Context>::GlobalAddr::from_u16(def).ok_or(AddrErr::OutOfRange)?,
+            <T as Context>::GlobalAddr::from_u16(def).ok_or(AddrError::OutOfRange)?,
             value,
         )
-        .map_err(AddrErr::into_anyhow)
+        .map_err(AddrError::into_anyhow)
     }
 }
 
@@ -229,6 +262,8 @@ pub trait EntityHandle: QuakeCType {
     type Context: ?Sized + Context<Entity = Self>;
     /// The error returned from this
     type Error: std::error::Error;
+    /// The type representing fields
+    type FieldAddr: FromPrimitive;
 
     /// Convert from an opaque handle to a reference to this type (must be a reference in order to allow unsized handles)
     fn from_erased<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
@@ -247,16 +282,19 @@ pub trait EntityHandle: QuakeCType {
     fn to_erased(&self) -> u64;
 
     /// Get a field given this handle and reference to the context.
-    fn get(&self, context: &Self::Context, field: &FieldDef) -> Result<Value, Self::Error>;
+    fn get(
+        &self,
+        context: &Self::Context,
+        field: Self::FieldAddr,
+    ) -> Result<Value, AddrError<Self::Error>>;
 
     /// Set a field given this handle and a mutable reference to the context.
     fn set(
         &self,
         context: &mut Self::Context,
-        field: &FieldDef,
-        offset: VectorField,
+        field: Self::FieldAddr,
         value: Value,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), AddrError<Self::Error>>;
 }
 
 /// A function callable from QuakeC code. This may call further internal functions, and is
@@ -417,23 +455,27 @@ impl QuakeCType for ErasedEntityHandle {
 impl EntityHandle for ErasedEntityHandle {
     type Context = dyn ErasedContext;
     type Error = Arc<dyn std::error::Error + Send + Sync + 'static>;
+    type FieldAddr = ErasedAddr;
 
-    fn get(&self, context: &Self::Context, field: &FieldDef) -> Result<Value, Self::Error> {
+    fn get(
+        &self,
+        context: &Self::Context,
+        field: Self::FieldAddr,
+    ) -> Result<Value, AddrError<Self::Error>> {
         context
             .dyn_entity_get(self.0, field)
-            .map_err(|e| e.into_boxed_dyn_error().into())
+            .map_err(|e| e.into_arc_dyn_error())
     }
 
     fn set(
         &self,
         context: &mut Self::Context,
-        field: &FieldDef,
-        offset: VectorField,
+        field: Self::FieldAddr,
         value: Value,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), AddrError<Self::Error>> {
         context
-            .dyn_entity_set(self.0, field, offset, value)
-            .map_err(|e| e.into_boxed_dyn_error().into())
+            .dyn_entity_set(self.0, field, value)
+            .map_err(|e| e.into_arc_dyn_error())
     }
 
     fn from_erased_mut<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>

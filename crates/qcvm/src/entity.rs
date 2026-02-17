@@ -59,6 +59,7 @@ impl EntityTypeDef {
         }
     }
 
+    #[expect(dead_code, reason = "TODO: Typeck against entity field addr")]
     pub fn get(&self, field_ref: Ptr) -> anyhow::Result<&ScalarFieldDef> {
         let offset: usize = field_ref.0.try_into()?;
 
