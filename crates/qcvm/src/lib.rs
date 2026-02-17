@@ -16,6 +16,7 @@ use bump_scope::{Bump, BumpScope};
 use glam::Vec3;
 use num::FromPrimitive as _;
 use snafu::Snafu;
+use strum::VariantArray;
 
 use crate::{
     entity::EntityTypeDef,
@@ -25,7 +26,7 @@ use crate::{
         functions::{ArgSize, FunctionExecutionCtx, QCFunctionDef, Statement},
         globals::GlobalRegistry,
     },
-    userdata::{AddrError, ErasedContext, ErasedEntityHandle, ErasedFunction, FnCall, QuakeCType},
+    userdata::{AddrError, ErasedContext, ErasedEntityHandle, ErasedFunction, FnCall, QCType},
 };
 
 mod entity;
@@ -45,6 +46,113 @@ pub use crate::progs::{
 
 #[cfg(feature = "quake1")]
 pub mod quake1;
+
+/// Trait for global or field addresses
+pub trait Address: strum::VariantArray + Clone + Send + Sync + Sized + 'static {
+    /// For vector globals, returns the component fields. For scalars, just returns `self`.
+    fn fields(&self) -> Option<[(Self, VectorField); 3]> {
+        fn float_field<A: Address>(addr: u16, field: VectorField) -> Option<(A, VectorField)> {
+            if let Some(addr) = A::from_u16_typed(addr + field as u16, Type::Float) {
+                Some((addr, field))
+            } else {
+                None
+            }
+        }
+
+        match self.type_() {
+            Type::Vector => {
+                let addr = self.to_u16();
+                let [x, y, z] = VectorField::FIELDS;
+                let [Some(x), Some(y), Some(z)] = [
+                    float_field::<Self>(addr, x),
+                    float_field::<Self>(addr, y),
+                    float_field::<Self>(addr, z),
+                ] else {
+                    return None;
+                };
+
+                Some([x, y, z])
+            }
+            _ => None,
+        }
+    }
+
+    /// For addresses that are a component of a vector, this returns the address of the vector itself along with the field of the
+    /// vector that it relates to (x, y, or z). For other fields, this is a no-op.
+    fn vector_field_or_scalar(&self) -> (Self, VectorField);
+
+    /// Convert a raw offset into the relevant `FieldAddr`, given the type. Certain
+    /// field offsets are specified to overlap in the `progdefs.qc` in order to have
+    /// quick access to fields of vectors, and this can distinguish between `vector foo`
+    /// and `float foo_x`.
+    fn from_u16_typed(val: u16, ty: Type) -> Option<Self> {
+        // Can't just iter over `VARIANTS` as that isn't stable in fns.
+        let mut i = 0;
+        while i < Self::VARIANTS.len() {
+            let variant = Self::VARIANTS[i].clone();
+
+            if variant.to_u16() == val && variant.type_().typeck(&ty) {
+                return Some(variant);
+            }
+
+            i += 1;
+        }
+
+        None
+    }
+
+    /// Get the offset to this global.
+    fn to_u16(&self) -> u16;
+
+    /// Get the name of this global.
+    fn name(&self) -> &'static str;
+
+    /// Given a name, get the global address the name corresponds to.
+    fn from_name(name: &str) -> Option<Self> {
+        // Can't just iter over `VARIANTS` as that isn't stable in fns.
+        let mut i = 0;
+        while i < Self::VARIANTS.len() {
+            let variant = Self::VARIANTS[i].clone();
+
+            if variant.name() == name {
+                return Some(variant);
+            }
+
+            i += 1;
+        }
+
+        None
+    }
+
+    /// Get the type of values at this address
+    fn type_(&self) -> Type;
+}
+
+/// Dummy address for when there are no external globals
+#[derive(VariantArray, PartialEq, Hash, Clone)]
+pub enum EmptyAddress {}
+
+impl Address for EmptyAddress {
+    fn type_(&self) -> Type {
+        unreachable!()
+    }
+
+    fn vector_field_or_scalar(&self) -> (Self, VectorField) {
+        unreachable!()
+    }
+
+    fn from_u16_typed(_: u16, _: Type) -> Option<Self> {
+        None
+    }
+
+    fn to_u16(&self) -> u16 {
+        unreachable!()
+    }
+
+    fn name(&self) -> &'static str {
+        unreachable!()
+    }
+}
 
 /// Special arguments for certain functions
 ///
@@ -567,7 +675,7 @@ where
     }
 }
 
-impl QuakeCType for QCFunctionDef {
+impl QCType for QCFunctionDef {
     fn type_(&self) -> Type {
         Type::Function
     }
@@ -584,11 +692,12 @@ impl QuakeCType for QCFunctionDef {
 /// > within entities and absolute pointers to globals respectively - but these are implementation
 /// > details due to some quirks about how QuakeC's opcodes are defined. The values exposed to the
 /// > host are deliberately limited to values that are exposed when writing QuakeC code.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// Any scalar value. If a function wants to be generic in its arguments, it can specify
     /// [`Type::AnyScalar`] in its arguments. The only non-scalar type is vector, and for now
     /// it is not possible to be generic over both scalars and vectors in the same argument.
+    #[default]
     AnyScalar,
     /// Corresponds to QuakeC's `void`. Should rarely be used, and is mostly
     /// for the return value of functions that do not return any sensible value.
@@ -766,6 +875,8 @@ impl QCVm {
     where
         R: std::io::Read + std::io::Seek,
     {
+        // TODO: Take a context argument so we can typeck the globals/fields, check names, and set
+        //       globals to the defaults specified in the progs.dat
         Ok(Self {
             progs: Progs::load(bytes)?,
         })
@@ -870,10 +981,6 @@ where
 impl ExecutionMemory<'_> {
     fn set(&mut self, index: usize, value: VmScalar) -> anyhow::Result<()> {
         self.local.set(index, value)
-    }
-
-    fn set_vector(&mut self, index: usize, values: [VmScalar; 3]) -> anyhow::Result<()> {
-        self.local.set_vector(index, values)
     }
 }
 
@@ -1287,7 +1394,7 @@ where
 }
 
 impl ExecutionCtx<'_> {
-    pub fn get<I, O>(&self, index: I) -> anyhow::Result<O>
+    pub fn get_scalar<I, O>(&self, index: I) -> anyhow::Result<O>
     where
         I: TryInto<usize>,
         I::Error: std::error::Error + Send + Sync + 'static,
@@ -1295,7 +1402,7 @@ impl ExecutionCtx<'_> {
         <VmScalar as TryInto<O>>::Error: std::error::Error + Send + Sync + 'static,
     {
         let index = index.try_into()?;
-        match self.context.dyn_global(index.try_into()?) {
+        match self.context.dyn_global(index.try_into()?, Type::AnyScalar) {
             Ok(val) => Ok(val.try_scalar(VectorField::XOrScalar)?.try_into()?),
             Err(AddrError::Other { error: other }) => Err(other),
             Err(AddrError::OutOfRange) => Ok(self.memory.get(index)?.try_into()?),
@@ -1306,7 +1413,7 @@ impl ExecutionCtx<'_> {
     where
         I: TryInto<usize>,
         I::Error: std::error::Error + Send + Sync + 'static,
-        V: TryInto<VmScalar>,
+        V: TryInto<VmValue>,
         V::Error: std::error::Error + Send + Sync + 'static,
     {
         // TODO: Performance is unnecessarily wasted here, where we check context for every global.
@@ -1334,6 +1441,7 @@ impl ExecutionCtx<'_> {
         self.memory.last_ret = Some(values);
     }
 
+    /// Gets 3 values of any type, not just vec3
     pub fn get_vector<I, O>(&self, index: I) -> anyhow::Result<[O; 3]>
     where
         I: TryInto<usize>,
@@ -1343,7 +1451,11 @@ impl ExecutionCtx<'_> {
     {
         let index = index.try_into()?;
 
-        Ok([self.get(index)?, self.get(index + 1)?, self.get(index + 2)?])
+        Ok([
+            self.get_scalar(index)?,
+            self.get_scalar(index + 1)?,
+            self.get_scalar(index + 2)?,
+        ])
     }
 
     pub fn get_vec3<I>(&self, index: I) -> anyhow::Result<Vec3>
@@ -1352,8 +1464,15 @@ impl ExecutionCtx<'_> {
         I::Error: std::error::Error + Send + Sync + 'static,
     {
         let index = index.try_into()?;
-
-        Ok(self.get_vector::<_, f32>(index)?.into())
+        match self.context.dyn_global(index.try_into()?, Type::Vector) {
+            Ok(val) => Ok(val.try_into()?),
+            Err(AddrError::Other { error: other }) => Err(other),
+            Err(AddrError::OutOfRange) => {
+                let [x, y, z] = self.memory.get_vector(index)?.map(TryInto::try_into);
+                let vec: [f32; 3] = [x?, y?, z?];
+                Ok(vec.into())
+            }
+        }
     }
 
     pub fn set_vector<I, V>(&mut self, index: I, values: [V; 3]) -> anyhow::Result<()>
@@ -1366,7 +1485,12 @@ impl ExecutionCtx<'_> {
         let index = index.try_into()?;
         let [v0, v1, v2] = values.map(|val| val.try_into());
         let values = [v0?, v1?, v2?];
-        self.memory.set_vector(index, values)
+
+        for (i, value) in values.into_iter().enumerate() {
+            self.set(index + i, value)?;
+        }
+
+        Ok(())
     }
 
     pub fn set_vec3<I, V>(&mut self, index: I, values: V) -> anyhow::Result<()>
@@ -1378,7 +1502,8 @@ impl ExecutionCtx<'_> {
     {
         let index = index.try_into()?;
         let values = values.try_into()?;
-        self.memory.set_vector(index, values.map(Into::into))
+
+        self.set(index, values)
     }
 
     fn execute_internal(&mut self) -> anyhow::Result<[VmScalar; 3]> {

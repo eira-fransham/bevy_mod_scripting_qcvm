@@ -529,6 +529,7 @@ dependencies = [
  "bevy_platform",
  "hashbrown",
  "itertools",
+ "num",
  "qcvm",
 ]
 

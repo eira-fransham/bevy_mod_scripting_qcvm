@@ -13,7 +13,7 @@ use crate::{
         EntityField, EntityRef, FieldPtr, StringRef, VmFunctionRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
     },
-    userdata::{Context, EntityHandle as _, ErasedFunction, FnCall, Function as _},
+    userdata::{ErasedFunction, FnCall},
 };
 
 #[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq)]
@@ -168,7 +168,7 @@ impl ExecutionCtx<'_> {
         builtin: &dyn ErasedFunction,
         num_args: usize,
     ) -> anyhow::Result<[VmScalar; 3]> {
-        let sig = builtin.signature()?;
+        let sig = builtin.dyn_signature()?;
         if sig.len() != num_args {
             error!(
                 "Builtin called with wrong number of args. Proceeding, but this is probably a bug"
@@ -181,11 +181,11 @@ impl ExecutionCtx<'_> {
             .zip(sig)
             .map(|(ArgAddr { addr, .. }, ty)| match ty {
                 Type::Vector => Ok(self.get_vec3(addr)?.into()),
-                Type::AnyScalar => Ok(self.get::<_, VmValue>(addr)?),
-                Type::Entity => Ok(self.get::<_, EntityRef>(addr)?.into()),
-                Type::Function => Ok(self.get::<_, VmFunctionRef>(addr)?.into()),
-                Type::Float => Ok(self.get::<_, f32>(addr)?.into()),
-                Type::String => Ok(self.get::<_, StringRef>(addr)?.into()),
+                Type::AnyScalar => Ok(self.get_scalar::<_, VmValue>(addr)?),
+                Type::Entity => Ok(self.get_scalar::<_, EntityRef>(addr)?.into()),
+                Type::Function => Ok(self.get_scalar::<_, VmFunctionRef>(addr)?.into()),
+                Type::Float => Ok(self.get_scalar::<_, f32>(addr)?.into()),
+                Type::String => Ok(self.get_scalar::<_, StringRef>(addr)?.into()),
                 Type::Void => Ok(Default::default()),
             })
             .map(|value| match value {
@@ -212,6 +212,7 @@ impl ExecutionCtx<'_> {
         let c = statement.arg3;
 
         debug!("{:<12} {:>5} {:>5} {:>5}", op.to_string(), a, b, c);
+        println!("{:<12} {:>5} {:>5} {:>5}", op.to_string(), a, b, c);
 
         Ok(match op {
             // Control flow ================================================
@@ -227,7 +228,7 @@ impl ExecutionCtx<'_> {
             | O::Call6
             | O::Call7
             | O::Call8 => {
-                let func_ref: VmFunctionRef = self.get(a)?;
+                let func_ref: VmFunctionRef = self.get_scalar(a)?;
 
                 let num_args = op as usize - O::Call0 as usize;
 
@@ -237,7 +238,7 @@ impl ExecutionCtx<'_> {
                             Ok(quakec) => self.execute_def(&quakec)?,
                             Err(builtin) => self.enter_builtin(
                                 &builtin.name,
-                                &*self.context.builtin(&builtin)?,
+                                &*self.context.dyn_builtin(&builtin)?,
                                 num_args,
                             )?,
                         }
@@ -305,7 +306,7 @@ impl ExecutionCtx<'_> {
     }
 
     fn op_if(&mut self, a: i16, b: i16, _c: i16) -> anyhow::Result<OpResult> {
-        let cond = !self.get::<_, VmScalar>(a)?.is_null();
+        let cond = !self.get_scalar::<_, VmScalar>(a)?.is_null();
         // debug!("{op}: cond == {cond}");
 
         if cond {
@@ -318,7 +319,7 @@ impl ExecutionCtx<'_> {
     }
 
     fn op_if_not(&mut self, a: i16, b: i16, _c: i16) -> anyhow::Result<OpResult> {
-        let cond = !self.get::<_, VmScalar>(a)?.is_null();
+        let cond = !self.get_scalar::<_, VmScalar>(a)?.is_null();
         // debug!("{op}: cond == {cond}");
 
         if cond {
@@ -336,39 +337,41 @@ impl ExecutionCtx<'_> {
         )?))
     }
 
-    fn op_return(&mut self, a: i16, b: i16, c: i16) -> anyhow::Result<[VmScalar; 3]> {
-        let val1: VmScalar = self.get(a).unwrap_or_default();
-        let val2: VmScalar = self.get(b).unwrap_or_default();
-        let val3: VmScalar = self.get(c).unwrap_or_default();
-
-        Ok([val1, val2, val3])
+    fn op_return(&mut self, a: i16, _b: i16, _c: i16) -> anyhow::Result<[VmScalar; 3]> {
+        Ok([
+            self.get_scalar(a).unwrap_or_default(),
+            self.get_scalar(a + 1).unwrap_or_default(),
+            self.get_scalar(a + 2).unwrap_or_default(),
+        ])
     }
 
     fn load_scalar(&mut self, entity: i16, field: i16, out_ptr: i16) -> anyhow::Result<()> {
-        let ent: EntityRef = self.get(entity)?;
-        let FieldPtr(ptr) = self.get(field)?;
+        let ent: EntityRef = self.get_scalar(entity)?;
+        let FieldPtr(ptr) = self.get_scalar(field)?;
 
-        let value = ent.non_null()?.get(&*self.context, ptr.0.try_into()?)?;
+        let value =
+            self.context
+                .dyn_entity_get(ent.non_null()?.0, ptr.0.try_into()?, Type::AnyScalar)?;
 
         self.set(out_ptr, value)
     }
 
     // LOAD_V: load vector field from entity
     fn op_load_v(&mut self, entity: i16, field: i16, out_ptr: i16) -> anyhow::Result<()> {
-        let ent: EntityRef = self.get(entity)?;
-        let FieldPtr(ptr) = self.get(field)?;
+        let ent: EntityRef = self.get_scalar(entity)?;
+        let FieldPtr(ptr) = self.get_scalar(field)?;
 
-        let value: Vec3 = ent
-            .non_null()?
-            .get(&*self.context, ptr.0.try_into()?)?
+        let value: Vec3 = self
+            .context
+            .dyn_entity_get(ent.non_null()?.0, ptr.0.try_into()?, Type::Vector)?
             .try_into()?;
 
         self.set_vector(out_ptr, value.into())
     }
 
     fn op_address(&mut self, entity: i16, field: i16, out_ptr: i16) -> anyhow::Result<()> {
-        let entity: EntityRef = self.get(entity)?;
-        let field_offset: FieldPtr = self.get(field)?;
+        let entity: EntityRef = self.get_scalar(entity)?;
+        let field_offset: FieldPtr = self.get_scalar(field)?;
 
         let field_ptr = VmScalar::EntityField(entity, field_offset.0);
 
@@ -385,13 +388,12 @@ impl ExecutionCtx<'_> {
             return Err(anyhow::Error::msg("storep_f: nonzero arg3"));
         }
 
-        let f: VmScalar = self.get(src_ptr)?;
+        let f: VmScalar = self.get_scalar(src_ptr)?;
         let value = self.to_value(f.into())?;
-        let EntityField { entity, field } = self.get(out_ptr)?;
+        let EntityField { entity, field } = self.get_scalar(out_ptr)?;
 
-        entity
-            .non_null()?
-            .set(self.context, field.0.try_into()?, value)?;
+        self.context
+            .dyn_entity_set(entity.non_null()?.0, field.0.try_into()?, value)?;
 
         Ok(())
     }
@@ -402,11 +404,10 @@ impl ExecutionCtx<'_> {
         }
 
         let f = self.get_vec3(src_ptr)?;
-        let EntityField { entity, field } = self.get(out_ptr)?;
+        let EntityField { entity, field } = self.get_scalar(out_ptr)?;
 
-        entity
-            .non_null()?
-            .set(self.context, field.0.try_into()?, f.into())?;
+        self.context
+            .dyn_entity_set(entity.non_null()?.0, field.0.try_into()?, f.into())?;
 
         Ok(())
     }
@@ -424,8 +425,8 @@ impl ExecutionCtx<'_> {
         F: FnOnce(T, T) -> O,
         O: Into<VmScalar>,
     {
-        let val1: T = self.get(ptr1)?;
-        let val2: T = self.get(ptr2)?;
+        let val1: T = self.get_scalar(ptr1)?;
+        let val2: T = self.get_scalar(ptr2)?;
 
         self.set(out, map(val1, val2))
     }
@@ -449,7 +450,7 @@ impl ExecutionCtx<'_> {
 
     // MUL_FV: Component-wise multiplication of vector by scalar
     fn op_mul_fv(&mut self, f_id: i16, v_id: i16, out_ptr: i16) -> anyhow::Result<()> {
-        let f: f32 = self.get(f_id)?;
+        let f: f32 = self.get_scalar(f_id)?;
         let v = self.get_vec3(v_id)?;
 
         // log_op!(self; prod_id = MulFV(f, v));
@@ -462,7 +463,7 @@ impl ExecutionCtx<'_> {
     // MUL_VF: Component-wise multiplication of vector by scalar
     fn op_mul_vf(&mut self, v_id: i16, f_id: i16, out_ptr: i16) -> anyhow::Result<()> {
         let v = self.get_vec3(v_id)?;
-        let f: f32 = self.get(f_id)?;
+        let f: f32 = self.get_scalar(f_id)?;
 
         // log_op!(self; prod_id = MulVF(v, f));
 
@@ -538,8 +539,8 @@ impl ExecutionCtx<'_> {
 
     // EQ_S: Test equality of two strings
     fn op_eq_s(&mut self, s1_ptr: i16, s2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
-        let s1: StringRef = self.get(s1_ptr)?;
-        let s2: StringRef = self.get(s2_ptr)?;
+        let s1: StringRef = self.get_scalar(s1_ptr)?;
+        let s2: StringRef = self.get_scalar(s2_ptr)?;
 
         let s1 = self.string_table.get(s1)?;
         let s2 = self.string_table.get(s2)?;
@@ -589,8 +590,8 @@ impl ExecutionCtx<'_> {
 
     // NE_S: Test inequality of two strings
     fn op_ne_s(&mut self, s1_ptr: i16, s2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
-        let s1: StringRef = self.get(s1_ptr)?;
-        let s2: StringRef = self.get(s2_ptr)?;
+        let s1: StringRef = self.get_scalar(s1_ptr)?;
+        let s2: StringRef = self.get_scalar(s2_ptr)?;
 
         let s1 = self.string_table.get(s1)?;
         let s2 = self.string_table.get(s2)?;
@@ -631,7 +632,7 @@ impl ExecutionCtx<'_> {
     }
 
     fn copy(&mut self, src_ptr: i16, dst_ptr: i16, _: i16) -> anyhow::Result<()> {
-        self.set(dst_ptr, self.get::<_, VmScalar>(src_ptr)?)
+        self.set(dst_ptr, self.get_scalar::<_, VmScalar>(src_ptr)?)
     }
 
     // STORE_V
@@ -640,13 +641,13 @@ impl ExecutionCtx<'_> {
             return Err(anyhow::Error::msg("Nonzero arg3 to STORE_V"));
         }
 
-        self.set_vec3(dest_ofs, self.get_vector(src_ofs)?)?;
+        self.set_vec3(dest_ofs, self.get_vec3(src_ofs)?)?;
 
         Ok(())
     }
 
     fn not(&mut self, ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
-        self.set(out_ptr, self.get::<_, VmScalar>(ptr)?.is_null())
+        self.set(out_ptr, self.get_scalar::<_, VmScalar>(ptr)?.is_null())
     }
 
     // NOT_V: Compare vec to { 0.0, 0.0, 0.0 }
@@ -664,7 +665,7 @@ impl ExecutionCtx<'_> {
             return Err(anyhow::Error::msg("Nonzero arg2 to NOT_S"));
         }
 
-        let string_ref = self.get::<_, StringRef>(s_ofs)?;
+        let string_ref = self.get_scalar::<_, StringRef>(s_ofs)?;
 
         let is_null = string_ref.is_null() || self.string_table.get(string_ref)?.is_empty();
 
@@ -744,8 +745,8 @@ impl ExecutionCtx<'_> {
 
         let old_args: [Result<[VmScalar; 3], _>; 2] =
             arg_addrs.map(|i| self.get_vector(i.addr as usize));
-        let frame_id: f32 = self.get(frame_id_addr)?;
-        let think_function: VmFunctionRef = self.get(think_function_addr)?;
+        let frame_id: f32 = self.get_scalar(frame_id_addr)?;
+        let think_function: VmFunctionRef = self.get_scalar(think_function_addr)?;
 
         self.set(arg_addrs[0].addr as usize, frame_id)?;
         self.set(arg_addrs[1].addr as usize, think_function)?;
@@ -760,7 +761,7 @@ impl ExecutionCtx<'_> {
             Ok(quakec) => self.execute_def(&quakec)?,
             Err(builtin) => self.enter_builtin(
                 &builtin.name,
-                &*self.context.builtin(&builtin)?,
+                &*self.context.dyn_builtin(&builtin)?,
                 MAGIC_OP_STATE_IMPL_NUM_ARGS,
             )?,
         };
@@ -784,14 +785,13 @@ impl ExecutionCtx<'_> {
 // Need `quake1` feature for tests.
 #[cfg(all(test, feature = "quake1"))]
 mod test {
-    use std::{ffi::CString, fmt, sync::Arc};
+    use std::{ffi::CString, fmt, ops::Range, sync::Arc};
 
     use crate::{
-        HashMap, VectorField,
+        Address, EmptyAddress, HashMap, VectorField,
         userdata::{AddrError, ErasedEntityHandle},
     };
     use itertools::Itertools;
-    use num::FromPrimitive;
     use strum::VariantArray;
 
     use crate::{
@@ -804,7 +804,7 @@ mod test {
             functions::{FunctionRegistry, MAX_ARGS, Statement},
             globals::GlobalRegistry,
         },
-        userdata::{Context, EntityHandle, FnCall, Function, QuakeCType},
+        userdata::{Context, EntityHandle, FnCall, Function, QCType},
     };
 
     mod assembler {
@@ -994,35 +994,26 @@ mod test {
                     Type::AnyScalar => panic!("Can't copy any to any"),
                 };
 
-                self.statements.extend([Statement {
+                self.statements.push(Statement {
                     opcode,
                     arg1: src.offset as _,
                     arg2: dst.offset as _,
                     arg3: 0,
-                }]);
+                });
             }
 
             pub fn ret(&mut self, ofs: Reg) {
-                let statement = match ofs.ty {
-                    Type::Vector => Statement {
-                        opcode: Opcode::Return,
-                        arg1: ofs.offset as i16,
-                        arg2: ofs.offset as i16 + 1,
-                        arg3: ofs.offset as i16 + 2,
-                    },
-                    _ => Statement {
-                        opcode: Opcode::Return,
-                        arg1: ofs.offset as _,
-                        arg2: 0,
-                        arg3: 0,
-                    },
-                };
-
-                self.statements.extend([statement]);
+                self.statements.push(Statement {
+                    opcode: Opcode::Return,
+                    arg1: ofs.offset as _,
+                    arg2: 0,
+                    arg3: 0,
+                });
             }
         }
     }
 
+    #[derive(Debug)]
     struct DefinedFunction {
         /// For calling externally.
         function_id: Ptr,
@@ -1045,16 +1036,18 @@ mod test {
 
     impl Default for HeaderBuilder {
         fn default() -> Self {
+            const GLOBAL_RANGE: Range<usize> = 28..92;
+
             Self {
                 globals: vec![],
-                global_idx: crate::quake1::GLOBALS_RANGE.start as u16,
-                global_values: vec![0; crate::quake1::GLOBALS_RANGE.start * 4],
+                global_idx: GLOBAL_RANGE.start as u16,
+                global_values: vec![0; GLOBAL_RANGE.start * std::mem::size_of::<u32>()],
                 fields: vec![],
                 field_idx: 0,
                 strings: vec![],
                 statements: vec![],
                 functions: vec![],
-                locals_start: crate::quake1::GLOBALS_RANGE.end,
+                locals_start: GLOBAL_RANGE.end,
                 next_builtin: -1,
             }
         }
@@ -1181,7 +1174,7 @@ mod test {
 
         fn build(self) -> Progs {
             Progs {
-                globals: GlobalRegistry::new(self.globals, &self.global_values).unwrap(),
+                globals: GlobalRegistry::new(dbg!(self.globals), &self.global_values).unwrap(),
                 entity_def: EntityTypeDef::new(self.fields),
                 string_table: StringTable::new(self.strings).unwrap(),
                 functions: FunctionRegistry::new(self.statements.into(), &self.functions).unwrap(),
@@ -1229,22 +1222,8 @@ mod test {
         VectorZ,
     }
 
-    impl FromPrimitive for FieldAddr {
-        fn from_u16(n: u16) -> Option<Self> {
-            dbg!(Self::from_u16(dbg!(n), Type::AnyScalar))
-        }
-
-        fn from_i64(n: i64) -> Option<Self> {
-            FromPrimitive::from_u16(n.try_into().ok()?)
-        }
-
-        fn from_u64(n: u64) -> Option<Self> {
-            FromPrimitive::from_u16(n.try_into().ok()?)
-        }
-    }
-
-    impl FieldAddr {
-        const fn name(&self) -> &'static str {
+    impl Address for FieldAddr {
+        fn name(&self) -> &'static str {
             match self {
                 FieldAddr::Float => "float_field",
                 FieldAddr::Vector => "vector_field",
@@ -1254,7 +1233,7 @@ mod test {
             }
         }
 
-        const fn vector_field_or_scalar(&self) -> (Self, VectorField) {
+        fn vector_field_or_scalar(&self) -> (Self, VectorField) {
             match self {
                 FieldAddr::VectorX => (FieldAddr::Vector, VectorField::XOrScalar),
                 FieldAddr::VectorY => (FieldAddr::Vector, VectorField::Y),
@@ -1263,7 +1242,7 @@ mod test {
             }
         }
 
-        const fn type_(&self) -> Type {
+        fn type_(&self) -> Type {
             match self {
                 FieldAddr::Float => Type::Float,
                 FieldAddr::Vector => Type::Vector,
@@ -1273,8 +1252,7 @@ mod test {
             }
         }
 
-        const fn from_u16(val: u16, ty: Type) -> Option<Self> {
-            // Can't just iter over `VARIANTS` as that isn't stable in const fns.
+        fn from_u16_typed(val: u16, ty: Type) -> Option<Self> {
             let mut i = 0;
             while i < Self::VARIANTS.len() {
                 let variant = Self::VARIANTS[i];
@@ -1289,7 +1267,7 @@ mod test {
             None
         }
 
-        const fn to_u16(&self) -> u16 {
+        fn to_u16(&self) -> u16 {
             match self {
                 FieldAddr::Float => 0,
                 FieldAddr::Vector | FieldAddr::VectorX => 1,
@@ -1317,7 +1295,7 @@ mod test {
         }
     }
 
-    impl QuakeCType for TestEnt {
+    impl QCType for TestEnt {
         fn type_(&self) -> Type {
             Type::Entity
         }
@@ -1389,7 +1367,7 @@ mod test {
         }
     }
 
-    impl QuakeCType for TestFn {
+    impl QCType for TestFn {
         fn type_(&self) -> Type {
             Type::Function
         }
@@ -1418,7 +1396,7 @@ mod test {
         type Entity = TestEnt;
         type Function = TestFn;
         type Error = Arc<dyn std::error::Error + Send + Sync>;
-        type GlobalAddr = u16;
+        type GlobalAddr = EmptyAddress;
 
         fn builtin(
             &self,
@@ -1454,16 +1432,19 @@ mod test {
             }
         }
 
-        fn global(&self, _def: u16) -> Result<Value, crate::userdata::AddrError<Self::Error>> {
-            Err(crate::userdata::AddrError::OutOfRange)
+        fn global(
+            &self,
+            _def: EmptyAddress,
+        ) -> Result<Value, crate::userdata::AddrError<Self::Error>> {
+            unreachable!()
         }
 
         fn set_global(
             &mut self,
-            _def: u16,
+            _def: EmptyAddress,
             _value: Value,
         ) -> Result<(), crate::userdata::AddrError<Self::Error>> {
-            Err(crate::userdata::AddrError::OutOfRange)
+            unreachable!()
         }
     }
 
@@ -1581,7 +1562,7 @@ mod test {
         let ent_global_1 =
             header_builder.push_global("ent_id_1", VmScalarType::Entity, 0i32.to_le_bytes());
         let ent_global_2 =
-            header_builder.push_global("ent_id_1", VmScalarType::Entity, 0i32.to_le_bytes());
+            header_builder.push_global("ent_id_2", VmScalarType::Entity, 0i32.to_le_bytes());
         let float_field = header_builder.push_field("float_field", VmScalarType::Float);
         let field_ref = header_builder.push_global(
             "ent_field_float",

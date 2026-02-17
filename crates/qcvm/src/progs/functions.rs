@@ -154,14 +154,6 @@ impl FunctionExecutionCtx<'_> {
 
         Ok(())
     }
-
-    pub fn set_vector(&mut self, index: usize, values: [VmScalar; 3]) -> anyhow::Result<()> {
-        for (offset, value) in values.into_iter().enumerate() {
-            self.set(index + offset, value)?;
-        }
-
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

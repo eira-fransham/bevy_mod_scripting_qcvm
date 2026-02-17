@@ -7,26 +7,14 @@
 //!
 //! This is compatible with [`progdefs.q1`](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 
-pub use globals::GLOBALS_RANGE;
-
 /// Global definitions for `progdefs.q1`, see [the Quake GPL release](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 pub mod globals {
-    use std::{fmt, ops::Range};
+    use std::fmt;
 
     use num::FromPrimitive;
     use strum::{EnumIter, VariantArray};
 
-    use crate::{Type, VectorField};
-
-    /// The first static global address.
-    pub const GLOBALS_START: u32 = 28;
-
-    /// Seismon has "true" locals and does not reuse globals for locals, for correctness and
-    /// resiliency.
-    pub const LOCALS_START: u32 = GlobalAddr::SetChangeArgs.to_u16() as u32 + 1;
-
-    /// The range of static global addresses.
-    pub const GLOBALS_RANGE: Range<usize> = GLOBALS_START as usize..LOCALS_START as usize;
+    use crate::{Address, Type, VectorField};
 
     // int      pad[28];
     // int      self;
@@ -237,7 +225,7 @@ pub mod globals {
 
     impl FromPrimitive for GlobalAddr {
         fn from_u16(n: u16) -> Option<Self> {
-            Self::from_u16(n, Type::AnyScalar)
+            Self::from_u16_typed(n, Type::AnyScalar)
         }
 
         fn from_i64(n: i64) -> Option<Self> {
@@ -249,41 +237,8 @@ pub mod globals {
         }
     }
 
-    impl GlobalAddr {
-        /// For vector globals, returns the component fields. For scalars, just returns `self`.
-        pub const fn fields(&self) -> Option<[(Self, VectorField); 3]> {
-            const fn float_field(
-                addr: u16,
-                field: VectorField,
-            ) -> Option<(GlobalAddr, VectorField)> {
-                if let Some(addr) = GlobalAddr::from_u16(addr + field as u16, Type::Float) {
-                    Some((addr, field))
-                } else {
-                    None
-                }
-            }
-
-            match self.type_() {
-                Type::Vector => {
-                    let addr = self.to_u16();
-                    let [x, y, z] = VectorField::FIELDS;
-                    let [Some(x), Some(y), Some(z)] = [
-                        float_field(addr, x),
-                        float_field(addr, y),
-                        float_field(addr, z),
-                    ] else {
-                        return None;
-                    };
-
-                    Some([x, y, z])
-                }
-                _ => None,
-            }
-        }
-
-        /// For fields that are a component of a vector, this returns the field name of the vector itself along with the field of the
-        /// vector that it relates to (x, y, or z). For other fields, this is a no-op.
-        pub const fn vector_field_or_scalar(&self) -> (Self, VectorField) {
+    impl Address for GlobalAddr {
+        fn vector_field_or_scalar(&self) -> (Self, VectorField) {
             match self {
                 GlobalAddr::VForwardX => (GlobalAddr::VForward, VectorField::XOrScalar),
                 GlobalAddr::VForwardY => (GlobalAddr::VForward, VectorField::Y),
@@ -306,28 +261,7 @@ pub mod globals {
             }
         }
 
-        /// Convert a raw offset into the relevant `GlobalAddr`, given the type. Certain
-        /// field offsets are specified to overlap in the `progdefs.qc` in order to have
-        /// quick access to fields of vectors, and this can distinguish between `vector foo`
-        /// and `float foo_x`.
-        pub const fn from_u16(val: u16, ty: Type) -> Option<Self> {
-            // Can't just iter over `VARIANTS` as that isn't stable in const fns.
-            let mut i = 0;
-            while i < Self::VARIANTS.len() {
-                let variant = Self::VARIANTS[i];
-
-                if variant.to_u16() == val && variant.type_().typeck(&ty) {
-                    return Some(variant);
-                }
-
-                i += 1;
-            }
-
-            None
-        }
-
-        /// Get the offset to this global.
-        pub const fn to_u16(&self) -> u16 {
+        fn to_u16(&self) -> u16 {
             match self {
                 Self::Self_ => 28,
                 Self::Other => 29,
@@ -403,8 +337,7 @@ pub mod globals {
             }
         }
 
-        /// Get the name of this global.
-        pub const fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
             match self {
                 Self::Self_ => "self",
                 Self::Other => "other",
@@ -479,8 +412,7 @@ pub mod globals {
             }
         }
 
-        /// Given a name, get the global address the name corresponds to.
-        pub fn from_name(name: &str) -> Option<Self> {
+        fn from_name(name: &str) -> Option<Self> {
             match name {
                 "self" => Some(Self::Self_),
                 "other" => Some(Self::Other),
@@ -556,8 +488,7 @@ pub mod globals {
             }
         }
 
-        /// Get the type of this global.
-        pub const fn type_(&self) -> Type {
+        fn type_(&self) -> Type {
             match self {
                 Self::Self_ => Type::Entity,
                 Self::Other => Type::Entity,
@@ -639,14 +570,14 @@ pub mod globals {
     mod test {
         use strum::IntoEnumIterator;
 
-        use crate::quake1::globals::GlobalAddr;
+        use crate::{Address as _, quake1::globals::GlobalAddr};
 
         #[test]
         fn check_to_from_parity() {
             for glob in <GlobalAddr as IntoEnumIterator>::iter() {
                 let (idx, ty) = (glob.to_u16(), glob.type_());
 
-                assert_eq!(GlobalAddr::from_u16(idx, ty), Some(glob));
+                assert_eq!(GlobalAddr::from_u16_typed(idx, ty), Some(glob));
 
                 let name = glob.name();
 
@@ -662,7 +593,7 @@ pub mod fields {
     use std::fmt;
     use strum::{EnumIter, VariantArray};
 
-    use crate::{Type, VectorField};
+    use crate::{Address, Type, VectorField};
 
     // float    modelindex;
     // vec3_t   absmin;
@@ -993,7 +924,7 @@ pub mod fields {
 
     impl FromPrimitive for FieldAddr {
         fn from_u16(n: u16) -> Option<Self> {
-            Self::from_u16(n, Type::AnyScalar)
+            Self::from_u16_typed(n, Type::AnyScalar)
         }
 
         fn from_i64(n: i64) -> Option<Self> {
@@ -1005,41 +936,8 @@ pub mod fields {
         }
     }
 
-    impl FieldAddr {
-        /// For vector globals, returns the component fields. For scalars, just returns `self`.
-        pub const fn fields(&self) -> Option<[(Self, VectorField); 3]> {
-            const fn float_field(
-                addr: u16,
-                field: VectorField,
-            ) -> Option<(FieldAddr, VectorField)> {
-                if let Some(addr) = FieldAddr::from_u16(addr + field as u16, Type::Float) {
-                    Some((addr, field))
-                } else {
-                    None
-                }
-            }
-
-            match self.type_() {
-                Type::Vector => {
-                    let addr = self.to_u16();
-                    let [x, y, z] = VectorField::FIELDS;
-                    let [Some(x), Some(y), Some(z)] = [
-                        float_field(addr, x),
-                        float_field(addr, y),
-                        float_field(addr, z),
-                    ] else {
-                        return None;
-                    };
-
-                    Some([x, y, z])
-                }
-                _ => None,
-            }
-        }
-
-        /// For fields that are a component of a vector, this returns the field name of the vector itself along with the field of the
-        /// vector that it relates to (x, y, or z). For other fields, this is a no-op.
-        pub const fn vector_field_or_scalar(&self) -> (Self, VectorField) {
+    impl Address for FieldAddr {
+        fn vector_field_or_scalar(&self) -> (Self, VectorField) {
             match self {
                 Self::AbsMinX => (Self::AbsMin, VectorField::XOrScalar),
                 Self::AbsMinY => (Self::AbsMin, VectorField::Y),
@@ -1087,28 +985,7 @@ pub mod fields {
             }
         }
 
-        /// Convert a raw offset into the relevant `FieldAddr`, given the type. Certain
-        /// field offsets are specified to overlap in the `progdefs.qc` in order to have
-        /// quick access to fields of vectors, and this can distinguish between `vector foo`
-        /// and `float foo_x`.
-        pub const fn from_u16(val: u16, ty: Type) -> Option<Self> {
-            // Can't just iter over `VARIANTS` as that isn't stable in const fns.
-            let mut i = 0;
-            while i < Self::VARIANTS.len() {
-                let variant = Self::VARIANTS[i];
-
-                if variant.to_u16() == val && variant.type_().typeck(&ty) {
-                    return Some(variant);
-                }
-
-                i += 1;
-            }
-
-            None
-        }
-
-        /// Get the offset to this global.
-        pub const fn to_u16(&self) -> u16 {
+        fn to_u16(&self) -> u16 {
             match self {
                 Self::ModelId => 0,
                 Self::AbsMin | Self::AbsMinX => 1,
@@ -1218,8 +1095,7 @@ pub mod fields {
             }
         }
 
-        /// Get the name of this global.
-        pub const fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
             match self {
                 Self::ModelId => "modelindex",
                 Self::AbsMin => "absmin",
@@ -1343,8 +1219,7 @@ pub mod fields {
             }
         }
 
-        /// Given a name, get the global address the name corresponds to.
-        pub fn from_name(name: &str) -> Option<Self> {
+        fn from_name(name: &str) -> Option<Self> {
             // Can't just iter over `VARIANTS` as that isn't stable in const fns.
             let mut i = 0;
             while i < Self::VARIANTS.len() {
@@ -1360,8 +1235,7 @@ pub mod fields {
             None
         }
 
-        /// Get the type of this global.
-        pub const fn type_(&self) -> Type {
+        fn type_(&self) -> Type {
             match self {
                 // float    modelindex;
                 Self::ModelId => Type::Float,
