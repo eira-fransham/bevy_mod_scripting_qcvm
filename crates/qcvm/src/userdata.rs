@@ -59,21 +59,6 @@ where
     }
 }
 
-impl AddrError<anyhow::Error> {
-    /// Convert to anyhow, only used for tests
-    #[cfg(test)]
-    pub(crate) fn into_arc_dyn_error(
-        self,
-    ) -> AddrError<Arc<dyn std::error::Error + Send + Sync + 'static>> {
-        match self {
-            Self::OutOfRange => AddrError::OutOfRange,
-            Self::Other { error: e } => AddrError::Other {
-                error: e.into_boxed_dyn_error().into(),
-            },
-        }
-    }
-}
-
 /// User-provided global context. This is passed in to all functions and entity getters/setters.
 pub trait Context {
     /// The type of entity handles.
@@ -93,6 +78,18 @@ pub trait Context {
     /// Get a global with the given definition
     fn global(&self, def: Self::GlobalAddr) -> Result<Value, AddrError<Self::Error>>;
 
+    /// Implement the `OP_STATE` opcode.
+    ///
+    /// This expected behavior is as follows:
+    ///
+    /// - Set `self.nextthink` to `self.time + delta_time`, where `delta_time` is the time between
+    ///   frames.
+    /// - Set `self.frame` to the first argument.
+    /// - Set `self.think` to the second argument.
+    fn state(&self, _frame: f32, _think_fn: Arc<dyn ErasedFunction>) -> Result<(), Self::Error> {
+        unimplemented!("`OP_STATE` not available in this environment");
+    }
+
     /// Set a global with the given definition
     fn set_global(
         &mut self,
@@ -105,6 +102,11 @@ pub trait Context {
 pub trait ErasedContext: Any {
     /// Dynamic version of [`Context::builtin`].
     fn dyn_builtin(&self, def: &BuiltinDef) -> anyhow::Result<Arc<dyn ErasedFunction>>;
+
+    /// Dynamic version of [`Context::state`].
+    fn dyn_state(&self, _frame: f32, _think_fn: Arc<dyn ErasedFunction>) -> anyhow::Result<()> {
+        anyhow::bail!("`OP_STATE` not available in this environment")
+    }
 
     /// Dynamic version of `<Context::Entity as EntityHandle>::get`.
     fn dyn_entity_get(
@@ -296,6 +298,8 @@ pub trait Function: QCType {
 
     /// Get the signature of the function. Note that only this number of arguments will
     /// be passed to the function.
+    ///
+    /// > TODO: It may be useful to annotate the return type, too.
     fn signature(&self) -> Result<ArrayVec<Type, MAX_ARGS>, Self::Error>;
 
     /// Call the function.

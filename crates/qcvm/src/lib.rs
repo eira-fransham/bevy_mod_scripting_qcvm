@@ -86,19 +86,10 @@ pub trait Address: strum::VariantArray + Clone + Send + Sync + Sized + 'static {
     /// quick access to fields of vectors, and this can distinguish between `vector foo`
     /// and `float foo_x`.
     fn from_u16_typed(val: u16, ty: Type) -> Option<Self> {
-        // Can't just iter over `VARIANTS` as that isn't stable in fns.
-        let mut i = 0;
-        while i < Self::VARIANTS.len() {
-            let variant = Self::VARIANTS[i].clone();
-
-            if variant.to_u16() == val && variant.type_().typeck(&ty) {
-                return Some(variant);
-            }
-
-            i += 1;
-        }
-
-        None
+        Self::VARIANTS
+            .iter()
+            .cloned()
+            .find(|variant| variant.to_u16() == val && variant.type_().typeck(&ty))
     }
 
     /// Get the offset to this global.
@@ -109,19 +100,10 @@ pub trait Address: strum::VariantArray + Clone + Send + Sync + Sized + 'static {
 
     /// Given a name, get the global address the name corresponds to.
     fn from_name(name: &str) -> Option<Self> {
-        // Can't just iter over `VARIANTS` as that isn't stable in fns.
-        let mut i = 0;
-        while i < Self::VARIANTS.len() {
-            let variant = Self::VARIANTS[i].clone();
-
-            if variant.name() == name {
-                return Some(variant);
-            }
-
-            i += 1;
-        }
-
-        None
+        Self::VARIANTS
+            .iter()
+            .cloned()
+            .find(|variant| variant.name() == name)
     }
 
     /// Get the type of values at this address
@@ -193,6 +175,15 @@ pub enum Value {
     /// A refcounted string pointer. Quake strings are not strictly ascii, but cannot have internal
     /// `NUL`, so `CStr` is used.
     String(Arc<CStr>),
+}
+
+#[cfg(test)]
+mod test_value {
+    /// Regression test for `Value` size.
+    #[test]
+    fn value_size() {
+        assert_eq!(std::mem::size_of::<super::Value>(), 24);
+    }
 }
 
 /// Errors that can occur when using [`Value::get`].
@@ -473,7 +464,7 @@ impl From<Value> for VmValue {
 /// for tuples up to 8 elements (the maximum number of arguments supported by the
 /// vanilla Quake engine).
 pub trait QCParams: fmt::Debug {
-    /// The error returned by [`QuakeCArgs::nth`].
+    /// The error returned by [`QCParams::nth`].
     type Error: Into<anyhow::Error>;
 
     /// Get the number of parameters available
@@ -984,11 +975,6 @@ impl ExecutionMemory<'_> {
     }
 }
 
-/// The name of the "magic function" implementing `OP_STATE`.
-pub const MAGIC_OP_STATE_IMPL_FUNC: &CStr = c"__state__";
-/// The number of arguments of the "magic function" implementing `OP_STATE`.
-pub const MAGIC_OP_STATE_IMPL_NUM_ARGS: usize = 2;
-
 #[derive(Debug)]
 struct ExecutionCtx<
     'a,
@@ -1439,23 +1425,6 @@ impl ExecutionCtx<'_> {
     /// QuakeC code, only from the engine.
     pub fn set_return(&mut self, values: [VmScalar; 3]) {
         self.memory.last_ret = Some(values);
-    }
-
-    /// Gets 3 values of any type, not just vec3
-    pub fn get_vector<I, O>(&self, index: I) -> anyhow::Result<[O; 3]>
-    where
-        I: TryInto<usize>,
-        I::Error: std::error::Error + Send + Sync + 'static,
-        VmScalar: TryInto<O>,
-        <VmScalar as TryInto<O>>::Error: std::error::Error + Send + Sync + 'static,
-    {
-        let index = index.try_into()?;
-
-        Ok([
-            self.get_scalar(index)?,
-            self.get_scalar(index + 1)?,
-            self.get_scalar(index + 2)?,
-        ])
     }
 
     pub fn get_vec3<I>(&self, index: I) -> anyhow::Result<Vec3>

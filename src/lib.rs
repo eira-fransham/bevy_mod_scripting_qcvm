@@ -20,13 +20,9 @@ use bevy_mod_scripting_bindings::{
     ThreadWorldContainer,
 };
 use bevy_mod_scripting_core::{
-    IntoScriptPluginParams, ScriptingPlugin,
-    config::{GetPluginThreadConfig, ScriptingPluginConfiguration},
-    event::CallbackLabel,
-    make_plugin_config_static,
+    IntoScriptPluginParams, ScriptingPlugin, config::GetPluginThreadConfig, event::CallbackLabel,
 };
 use bevy_mod_scripting_script::ScriptAttachment;
-use itertools::Either;
 use qcvm::{
     Address, ArgError, EmptyAddress, QCParams, anyhow,
     arrayvec::ArrayVec,
@@ -36,10 +32,8 @@ use qcvm::{
 pub use qcvm;
 
 /// The main "entry point" plugin for adding QC Scripting
-pub struct QCScriptingPlugin<
-    GlobalAddr = qcvm::quake1::globals::GlobalAddr,
-    FieldAddr = qcvm::quake1::fields::FieldAddr,
-> where
+pub struct QCScriptingPlugin<GlobalAddr, FieldAddr>
+where
     GlobalAddr: Address + 'static,
     FieldAddr: Address + 'static,
     Self: GetPluginThreadConfig<Self>,
@@ -354,8 +348,9 @@ impl<G, F> QCType for BevyBuiltin<G, F> {
     }
 }
 
-const FUNCTION_CALL_CONTEXT: FunctionCallContext =
-    FunctionCallContext::new(<QCScriptingPlugin as IntoScriptPluginParams>::LANGUAGE);
+const FUNCTION_CALL_CONTEXT: FunctionCallContext = FunctionCallContext::new(
+    <QCScriptingPlugin<EmptyAddress, EmptyAddress> as IntoScriptPluginParams>::LANGUAGE,
+);
 
 impl<GlobalAddr, FieldAddr> qcvm::userdata::Function for BevyBuiltin<GlobalAddr, FieldAddr>
 where
@@ -599,9 +594,37 @@ where
     }
 }
 
-make_plugin_config_static!(QCScriptingPlugin);
+mod config_impl_empty {
+    use bevy_mod_scripting_core::{
+        config::{GetPluginThreadConfig, ScriptingPluginConfiguration},
+        make_plugin_config_static,
+    };
+    use qcvm::EmptyAddress;
 
-impl AsMut<ScriptingPlugin<Self>> for QCScriptingPlugin {
+    use crate::QCScriptingPlugin;
+
+    make_plugin_config_static!(QCScriptingPlugin<EmptyAddress, EmptyAddress>);
+}
+
+#[cfg(feature = "quake1")]
+mod config_impl_quake1 {
+    use bevy_mod_scripting_core::{
+        config::{GetPluginThreadConfig, ScriptingPluginConfiguration},
+        make_plugin_config_static,
+    };
+
+    use crate::QCScriptingPlugin;
+
+    make_plugin_config_static!(QCScriptingPlugin<qcvm::quake1::globals::GlobalAddr, qcvm::quake1::fields::FieldAddr>);
+}
+
+impl<GlobalAddr, FieldAddr> AsMut<ScriptingPlugin<Self>>
+    for QCScriptingPlugin<GlobalAddr, FieldAddr>
+where
+    GlobalAddr: Address + 'static,
+    FieldAddr: Address + 'static,
+    Self: GetPluginThreadConfig<Self>,
+{
     fn as_mut(&mut self) -> &mut ScriptingPlugin<Self> {
         &mut self.scripting_plugin
     }

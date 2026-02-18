@@ -54,9 +54,12 @@ bevy_log = "0.18"
 bevy_math = "0.18"
 bevy_platform = "0.18"
 
-# Pending update to 0.17
 bevy_mod_scripting_core = "0.19"
 bevy_mod_scripting_script = "0.19"
 bevy_mod_scripting_display = "0.19"
 bevy_mod_scripting_bindings = "0.19"
 bevy_mod_scripting_asset = "0.19"
+
+[features]
+default = []
+quake1 = ["qcvm/quake1"]

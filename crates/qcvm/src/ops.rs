@@ -3,12 +3,11 @@ use arrayvec::ArrayVec;
 use bevy_reflect::Reflect;
 use glam::Vec3;
 use num_derive::FromPrimitive;
-use std::{ffi::CStr, fmt, num::NonZeroIsize};
+use std::{ffi::CStr, fmt, num::NonZeroIsize, sync::Arc};
 use tracing::{debug, error};
 
 use crate::{
-    ArgAddr, ExecutionCtx, MAGIC_OP_STATE_IMPL_FUNC, MAGIC_OP_STATE_IMPL_NUM_ARGS, OpResult, Type,
-    function_args,
+    ArgAddr, ExecutionCtx, OpResult, Type, function_args,
     progs::{
         EntityField, EntityRef, FieldPtr, StringRef, VmFunctionRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
@@ -733,57 +732,18 @@ impl ExecutionCtx<'_> {
         think_function_addr: i16,
         _unused_c: i16,
     ) -> anyhow::Result<()> {
-        let mut arg_addrs = function_args().into_iter().take(2);
-        let arg_addrs = [
-            arg_addrs
-                .next()
-                .expect("Programmer error: fewer than 2 arg slots"),
-            arg_addrs
-                .next()
-                .expect("Programmer error: fewer than 2 arg slots"),
-        ];
-
-        let old_args: [Result<[VmScalar; 3], _>; 2] =
-            arg_addrs.map(|i| self.get_vector(i.addr as usize));
         let frame_id: f32 = self.get_scalar(frame_id_addr)?;
-        let think_function: VmFunctionRef = self.get_scalar(think_function_addr)?;
+        let think_function_ref: VmFunctionRef = self.get_scalar(think_function_addr)?;
 
-        self.set(arg_addrs[0].addr as usize, frame_id)?;
-        self.set(arg_addrs[1].addr as usize, think_function)?;
+        let think_function: Arc<dyn ErasedFunction> =
+            self.to_value(think_function_ref.into())?.try_into()?;
 
-        let result = match self
-            .functions
-            .get_by_name(MAGIC_OP_STATE_IMPL_FUNC)
-            .map_err(|e| anyhow::Error::msg("Magic `__state__` function was unset").context(e))?
-            .clone()
-            .try_into_qc()
-        {
-            Ok(quakec) => self.execute_def(&quakec)?,
-            Err(builtin) => self.enter_builtin(
-                &builtin.name,
-                &*self.context.dyn_builtin(&builtin)?,
-                MAGIC_OP_STATE_IMPL_NUM_ARGS,
-            )?,
-        };
-
-        if !matches!(result, [VmScalar::Void, VmScalar::Void, VmScalar::Void]) {
-            error!("State magic function returned something other than `void`");
-        }
-
-        for (i, old_arg) in arg_addrs.iter().zip(old_args) {
-            if let Ok(old_arg) = old_arg {
-                for (j, elem) in old_arg.into_iter().enumerate() {
-                    self.set(i.addr as usize + j, elem)?;
-                }
-            }
-        }
-
-        Ok(())
+        self.context.dyn_state(frame_id, think_function)
     }
 }
 
 // Need `quake1` feature for tests.
-#[cfg(all(test, feature = "quake1"))]
+#[cfg(test)]
 mod test {
     use std::{ffi::CString, fmt, ops::Range, sync::Arc};
 
@@ -806,6 +766,20 @@ mod test {
         },
         userdata::{Context, EntityHandle, FnCall, Function, QCType},
     };
+
+    impl AddrError<anyhow::Error> {
+        /// Convert to anyhow, only used for tests
+        pub(crate) fn into_arc_dyn_error(
+            self,
+        ) -> AddrError<Arc<dyn std::error::Error + Send + Sync + 'static>> {
+            match self {
+                Self::OutOfRange => AddrError::OutOfRange,
+                Self::Other { error: e } => AddrError::Other {
+                    error: e.into_boxed_dyn_error().into(),
+                },
+            }
+        }
+    }
 
     mod assembler {
         use std::{ffi::CStr, ops::Range, sync::Arc};

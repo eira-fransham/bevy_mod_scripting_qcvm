@@ -157,7 +157,7 @@ impl FunctionExecutionCtx<'_> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QuakeCFunctionBody {
+pub struct QCFunctionBody {
     /// `arg_start` + `locals` fields - we do not conflate locals and globals,
     /// so every access needs to check the locals first.
     pub locals: Range<usize>,
@@ -166,12 +166,12 @@ pub struct QuakeCFunctionBody {
 
 #[derive(Debug, Clone)]
 pub enum FunctionBody {
-    Progs(QuakeCFunctionBody),
+    Progs(QCFunctionBody),
     Builtin,
 }
 
 impl FunctionBody {
-    pub fn try_into_qc(self) -> Result<QuakeCFunctionBody, Builtin> {
+    pub fn try_into_qc(self) -> Result<QCFunctionBody, Builtin> {
         match self {
             Self::Progs(quakec) => Ok(quakec),
             Self::Builtin => Err(Builtin),
@@ -179,7 +179,7 @@ impl FunctionBody {
     }
 }
 
-pub type QCFunctionDef = FunctionDef<QuakeCFunctionBody>;
+pub type QCFunctionDef = FunctionDef<QCFunctionBody>;
 
 /// Definition for a QuakeC function.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,7 +285,7 @@ impl FunctionRegistry {
                                     .map(|n| usize::try_from(n.offset))
                                     .unwrap_or(Ok(statements.len()))?;
 
-                                FunctionBody::Progs(QuakeCFunctionBody {
+                                FunctionBody::Progs(QCFunctionBody {
                                     locals: cur.locals.clone(),
                                     statements: statements.subslice(cur_offset..next_offset),
                                 })

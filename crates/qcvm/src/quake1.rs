@@ -7,6 +7,8 @@
 //!
 //! This is compatible with [`progdefs.q1`](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 
+pub use self::{fields::FieldAddr, globals::GlobalAddr};
+
 /// Global definitions for `progdefs.q1`, see [the Quake GPL release](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 pub mod globals {
     use std::fmt;
