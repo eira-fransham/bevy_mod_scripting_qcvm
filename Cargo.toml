@@ -47,6 +47,7 @@ bevy_reflect = "0.18"
 hashbrown.workspace = true
 itertools.workspace = true
 num.workspace = true
+bevy_reflect.workspace = true
 qcvm = { version = "0.2", path = "crates/qcvm" }
 
 bevy_ecs = "0.18"

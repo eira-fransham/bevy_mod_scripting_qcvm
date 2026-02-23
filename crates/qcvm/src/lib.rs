@@ -3,6 +3,7 @@
 
 use std::{
     any::Any,
+    collections::VecDeque,
     ffi::{CStr, CString},
     fmt,
     num::NonZeroIsize,
@@ -619,6 +620,31 @@ where
     }
 }
 
+impl<T> crate::QCParams for VecDeque<T>
+where
+    T: Clone + fmt::Debug + TryInto<Value>,
+    <T as TryInto<Value>>::Error: Into<anyhow::Error>,
+{
+    type Error = <T as TryInto<Value>>::Error;
+
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn nth(&self, index: usize) -> Result<Value, ArgError<Self::Error>> {
+        self.get(index)
+            .ok_or_else(|| ArgError::ArgOutOfRange {
+                len: self.count(),
+                index,
+            })
+            .and_then(|val| {
+                val.clone()
+                    .try_into()
+                    .map_err(|error| ArgError::Other { error })
+            })
+    }
+}
+
 impl<T> crate::QCParams for bump_scope::FixedBumpVec<'_, T>
 where
     T: Clone + fmt::Debug + TryInto<Value>,
@@ -806,6 +832,7 @@ impl ErasedFunction for QCFunctionDef {
 }
 
 /// The core QuakeC runtime.
+#[derive(Debug)]
 pub struct QCVm {
     progs: Progs,
 }
@@ -901,6 +928,36 @@ impl QCVm {
 
         ctx.execute(function)
     }
+
+    /// Run a dynamic function
+    pub fn run_dynamic<'a, T, C>(
+        &'a self,
+        context: &'a mut C,
+        function: &'a dyn ErasedFunction,
+        params: T,
+    ) -> anyhow::Result<Value>
+    where
+        T: QCParams,
+        C: ErasedContext,
+    {
+        let num_params = params.count();
+        let mut ctx: ExecutionCtx<'_, dyn ErasedContext, _, CallArgs<T>> = ExecutionCtx {
+            alloc: Bump::new(),
+            memory: ExecutionMemory {
+                local: CallArgs { params },
+                global: &self.progs.globals,
+                last_ret: None,
+            },
+            backtrace: Default::default(),
+            context,
+            entity_def: &self.progs.entity_def,
+            string_table: &self.progs.string_table,
+            functions: &self.progs.functions,
+        };
+
+        ctx.enter_builtin(c"{anonymous}", function, num_params)
+            .and_then(|vals| vals.try_into().map_err(anyhow::Error::new))
+    }
 }
 
 #[derive(Default, Debug)]
@@ -944,9 +1001,14 @@ trait QCMemory {
     }
 }
 
+trait QCMemoryMut: QCMemory {
+    fn set(&mut self, index: usize, value: Self::Scalar) -> anyhow::Result<()>;
+}
+
 impl<M> QCMemory for ExecutionMemory<'_, M>
 where
-    M: QCMemory<Scalar = Option<VmScalar>>,
+    M: QCMemory,
+    <M as QCMemory>::Scalar: Into<Option<VmScalar>>,
 {
     type Scalar = VmScalar;
 
@@ -961,7 +1023,7 @@ where
                 });
         }
 
-        match self.local.get(index)? {
+        match self.local.get(index)?.into() {
             Some(val) => Ok(val),
             // TODO: Should we make this solely host-controlled?
             None => self.global.get_value(index),
@@ -969,7 +1031,7 @@ where
     }
 }
 
-impl ExecutionMemory<'_> {
+impl QCMemoryMut for ExecutionMemory<'_> {
     fn set(&mut self, index: usize, value: VmScalar) -> anyhow::Result<()> {
         self.local.set(index, value)
     }
@@ -1379,7 +1441,12 @@ where
     }
 }
 
-impl ExecutionCtx<'_> {
+impl<Alloc, Caller> ExecutionCtx<'_, dyn ErasedContext, Alloc, Caller>
+where
+    Alloc: ScopedAlloc,
+    Caller: fmt::Debug + QCMemory,
+    <Caller as QCMemory>::Scalar: Into<Option<VmScalar>>,
+{
     pub fn get_scalar<I, O>(&self, index: I) -> anyhow::Result<O>
     where
         I: TryInto<usize>,
@@ -1395,6 +1462,28 @@ impl ExecutionCtx<'_> {
         }
     }
 
+    pub fn get_vec3<I>(&self, index: I) -> anyhow::Result<Vec3>
+    where
+        I: TryInto<usize>,
+        I::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let index = index.try_into()?;
+        match self.context.dyn_global(index.try_into()?, Type::Vector) {
+            Ok(val) => Ok(val.try_into()?),
+            Err(AddrError::Other { error: other }) => Err(other),
+            Err(AddrError::OutOfRange) => {
+                let [x, y, z] = self.memory.get_vector(index)?.map(TryInto::try_into);
+                let vec: [f32; 3] = [x?, y?, z?];
+                Ok(vec.into())
+            }
+        }
+    }
+}
+
+impl<Alloc> ExecutionCtx<'_, dyn ErasedContext, Alloc>
+where
+    Alloc: ScopedAlloc,
+{
     pub fn set<I, V>(&mut self, index: I, value: V) -> anyhow::Result<()>
     where
         I: TryInto<usize>,
@@ -1425,23 +1514,6 @@ impl ExecutionCtx<'_> {
     /// QuakeC code, only from the engine.
     pub fn set_return(&mut self, values: [VmScalar; 3]) {
         self.memory.last_ret = Some(values);
-    }
-
-    pub fn get_vec3<I>(&self, index: I) -> anyhow::Result<Vec3>
-    where
-        I: TryInto<usize>,
-        I::Error: std::error::Error + Send + Sync + 'static,
-    {
-        let index = index.try_into()?;
-        match self.context.dyn_global(index.try_into()?, Type::Vector) {
-            Ok(val) => Ok(val.try_into()?),
-            Err(AddrError::Other { error: other }) => Err(other),
-            Err(AddrError::OutOfRange) => {
-                let [x, y, z] = self.memory.get_vector(index)?.map(TryInto::try_into);
-                let vec: [f32; 3] = [x?, y?, z?];
-                Ok(vec.into())
-            }
-        }
     }
 
     pub fn set_vector<I, V>(&mut self, index: I, values: [V; 3]) -> anyhow::Result<()>

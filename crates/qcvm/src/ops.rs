@@ -7,12 +7,12 @@ use std::{ffi::CStr, fmt, num::NonZeroIsize, sync::Arc};
 use tracing::{debug, error};
 
 use crate::{
-    ArgAddr, ExecutionCtx, OpResult, Type, function_args,
+    ArgAddr, ExecutionCtx, OpResult, QCMemory, ScopedAlloc, Type, function_args,
     progs::{
         EntityField, EntityRef, FieldPtr, StringRef, VmFunctionRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
     },
-    userdata::{ErasedFunction, FnCall},
+    userdata::{ErasedContext, ErasedFunction, FnCall},
 };
 
 #[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq)]
@@ -160,7 +160,12 @@ impl fmt::Display for Opcode {
     }
 }
 
-impl ExecutionCtx<'_> {
+impl<Alloc, Caller> ExecutionCtx<'_, dyn ErasedContext, Alloc, Caller>
+where
+    Alloc: ScopedAlloc,
+    Caller: fmt::Debug + QCMemory,
+    <Caller as QCMemory>::Scalar: Into<Option<VmScalar>>,
+{
     pub(crate) fn enter_builtin(
         &mut self,
         name: &CStr,
@@ -201,7 +206,12 @@ impl ExecutionCtx<'_> {
 
         Ok(vm_value.into())
     }
+}
 
+impl<Alloc> ExecutionCtx<'_, dyn ErasedContext, Alloc>
+where
+    Alloc: ScopedAlloc,
+{
     pub(crate) fn execute_statement(&mut self, statement: Statement) -> anyhow::Result<OpResult> {
         use Opcode as O;
 
