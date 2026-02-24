@@ -3,20 +3,14 @@ pub mod globals;
 
 use std::{cmp::Ordering, ffi::CStr, fmt, ops::Deref, sync::Arc};
 
-use crate::{
-    HashMap,
-    userdata::{DynEq as _, EntityHandle},
-};
+use crate::{HashMap, userdata::DynEq as _};
 #[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
 use glam::Vec3;
 use num::FromPrimitive;
 use num_derive::FromPrimitive;
 
-use crate::{
-    entity::ScalarFieldDef,
-    userdata::{ErasedEntityHandle, ErasedFunction},
-};
+use crate::{ErasedEntityHandle, entity::ScalarFieldDef, userdata::ErasedFunction};
 
 #[derive(Clone, Debug)]
 pub struct StringTable {
@@ -347,48 +341,8 @@ impl fmt::Display for FieldDef {
     }
 }
 
-/// Abstraction around `bevy_ecs::entity::Entity` that allows us to impl `Default` without
-/// world access.
-#[derive(Debug, Default, Clone)]
-pub enum EntityRef {
-    /// The zero value for an entity reference - it is invalid to read or write fields on
-    /// this type (TODO: is this true?), but it can be useful to pass it as an argument to builtins.
-    #[default]
-    Worldspawn,
-    /// We use `Entity` rather than an index here so entities that aren't managed by the VM
-    /// can still be passed to QuakeC functions.
-    Entity(ErasedEntityHandle),
-}
-
-impl EntityRef {
-    /// Create an `EntityRef` from a `T: EntityHandle`.
-    pub fn new<T: EntityHandle>(value: T) -> Self {
-        Self::Entity(ErasedEntityHandle(value.to_erased()))
-    }
-
-    /// If the entity reference is not `Worldspawn`, return the inner entity.
-    pub fn non_null(self) -> anyhow::Result<ErasedEntityHandle> {
-        match self {
-            Self::Worldspawn => anyhow::bail!("Tried to access fields on worldspawn entity"),
-            Self::Entity(ent) => Ok(ent),
-        }
-    }
-
-    /// If the reference is `Worldspawn`, then `true`. Otherwise false.
-    pub fn is_null(&self) -> bool {
-        matches!(self, Self::Worldspawn)
-    }
-}
-
-impl PartialEq for EntityRef {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Worldspawn, Self::Worldspawn) => true,
-            (Self::Entity(lhs), Self::Entity(rhs)) => lhs.dyn_eq(rhs),
-            _ => false,
-        }
-    }
-}
+/// An optional reference to an entity. `None` represents worldspawn.
+pub type EntityRef = Option<ErasedEntityHandle>;
 
 #[derive(Debug, Clone)]
 pub enum VmFunctionRef {
@@ -701,12 +655,13 @@ impl VmScalar {
         match self {
             VmScalar::Void => true,
             VmScalar::Float(f) => *f != 0.,
-            VmScalar::Entity(entity_ref) => entity_ref.is_null(),
+            VmScalar::Entity(entity_ref) => entity_ref.is_none(),
             VmScalar::String(string_ref) => string_ref.is_null(),
             VmScalar::Function(function_ref) => function_ref.is_null(),
             VmScalar::Global(ptr) => ptr.is_null(),
             VmScalar::Field(ptr) => ptr.is_null(),
-            VmScalar::EntityField(ent, fld) => ent.is_null() && fld.is_null(),
+            // 0 field is valid
+            VmScalar::EntityField(ent, _) => ent.is_none(),
         }
     }
 
@@ -736,7 +691,7 @@ impl VmScalar {
             VmScalarType::String => Ok(VmScalar::String(StringRef::Id(i32::from_le_bytes(bytes)))),
             VmScalarType::Entity => {
                 if bytes == [0; 4] {
-                    Ok(VmScalar::Entity(EntityRef::Worldspawn))
+                    Ok(VmScalar::Entity(None))
                 } else {
                     Err(anyhow::Error::msg(
                         "Cannot literally initialise an entity to any value other than worldspawn (no entities have been spawned at load-time)",

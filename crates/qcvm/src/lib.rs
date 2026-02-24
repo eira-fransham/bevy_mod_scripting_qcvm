@@ -6,7 +6,7 @@ use std::{
     collections::VecDeque,
     ffi::{CStr, CString},
     fmt,
-    num::NonZeroIsize,
+    num::{NonZeroIsize, NonZeroU64},
     ops::{ControlFlow, Range},
     str::FromStr,
     sync::Arc,
@@ -27,7 +27,7 @@ use crate::{
         functions::{ArgSize, FunctionExecutionCtx, QCFunctionDef, Statement},
         globals::GlobalRegistry,
     },
-    userdata::{AddrError, ErasedContext, ErasedEntityHandle, ErasedFunction, FnCall, QCType},
+    userdata::{AddrError, ErasedContext, ErasedFunction, FnCall, QCType},
 };
 
 mod entity;
@@ -47,6 +47,9 @@ pub use crate::progs::{
 
 #[cfg(feature = "quake1")]
 pub mod quake1;
+
+/// A type-erased entity handle.
+pub type ErasedEntityHandle = NonZeroU64;
 
 /// Trait for global or field addresses
 pub trait Address: strum::VariantArray + Clone + Send + Sync + Sized + 'static {
@@ -317,7 +320,7 @@ impl TryFrom<Value> for ErasedEntityHandle {
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            Value::Entity(EntityRef::Entity(ent)) => Ok(ent),
+            Value::Entity(Some(ent)) => Ok(ent),
             _ => anyhow::bail!("Expected entity, found {}", value.type_()),
         }
     }
@@ -337,7 +340,7 @@ impl From<EntityRef> for Value {
 
 impl From<ErasedEntityHandle> for Value {
     fn from(value: ErasedEntityHandle) -> Self {
-        Self::Entity(EntityRef::Entity(value))
+        Self::Entity(Some(value))
     }
 }
 

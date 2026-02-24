@@ -358,9 +358,9 @@ where
         let ent: EntityRef = self.get_scalar(entity)?;
         let FieldPtr(ptr) = self.get_scalar(field)?;
 
-        let value =
-            self.context
-                .dyn_entity_get(ent.non_null()?.0, ptr.0.try_into()?, Type::AnyScalar)?;
+        let value = self
+            .context
+            .dyn_entity_get(ent, ptr.0.try_into()?, Type::AnyScalar)?;
 
         self.set(out_ptr, value)
     }
@@ -372,7 +372,7 @@ where
 
         let value: Vec3 = self
             .context
-            .dyn_entity_get(ent.non_null()?.0, ptr.0.try_into()?, Type::Vector)?
+            .dyn_entity_get(ent, ptr.0.try_into()?, Type::Vector)?
             .try_into()?;
 
         self.set_vector(out_ptr, value.into())
@@ -402,7 +402,7 @@ where
         let EntityField { entity, field } = self.get_scalar(out_ptr)?;
 
         self.context
-            .dyn_entity_set(entity.non_null()?.0, field.0.try_into()?, value)?;
+            .dyn_entity_set(entity, field.0.try_into()?, value)?;
 
         Ok(())
     }
@@ -416,7 +416,7 @@ where
         let EntityField { entity, field } = self.get_scalar(out_ptr)?;
 
         self.context
-            .dyn_entity_set(entity.non_null()?.0, field.0.try_into()?, f.into())?;
+            .dyn_entity_set(entity, field.0.try_into()?, f.into())?;
 
         Ok(())
     }
@@ -755,11 +755,10 @@ where
 // Need `quake1` feature for tests.
 #[cfg(test)]
 mod test {
-    use std::{ffi::CString, fmt, ops::Range, sync::Arc};
+    use std::{ffi::CString, fmt, num::NonZero, ops::Range, sync::Arc};
 
     use crate::{
-        Address, EmptyAddress, HashMap, VectorField,
-        userdata::{AddrError, ErasedEntityHandle},
+        Address, EmptyAddress, ErasedEntityHandle, HashMap, VectorField, userdata::AddrError,
     };
     use itertools::Itertools;
     use strum::VariantArray;
@@ -1265,7 +1264,7 @@ mod test {
         ("float_field", Value::Float(100.)),
         ("vector_field", Value::Vector(glam::Vec3::new(0., 0., 0.))),
     ];
-    const ENTITIES: &[usize] = &[0, 1, 2];
+    const ENTITIES: &[usize] = &[1, 2, 3];
 
     impl Default for TestContext {
         fn default() -> Self {
@@ -1339,15 +1338,17 @@ mod test {
             Ok(())
         }
 
-        fn from_erased_mut<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
+        fn from_erased_mut<F, O>(erased: EntityRef, callback: F) -> Result<O, Self::Error>
         where
             F: FnOnce(&mut Self) -> O,
         {
-            Ok(callback(&mut Self { id: erased as _ }))
+            Ok(callback(&mut Self {
+                id: erased.map(NonZero::get).unwrap_or_default() as _,
+            }))
         }
 
-        fn to_erased(&self) -> u64 {
-            self.id as _
+        fn to_erased(&self) -> EntityRef {
+            ErasedEntityHandle::new(self.id as _)
         }
     }
 
@@ -1584,19 +1585,19 @@ mod test {
             .globals
             .get_mut(ent_global_0.0.0)
             .unwrap()
-            .value = EntityRef::Entity(ErasedEntityHandle(0)).into();
+            .value = NonZero::new(1).into();
         executor
             .progs
             .globals
             .get_mut(ent_global_1.0.0)
             .unwrap()
-            .value = EntityRef::Entity(ErasedEntityHandle(1)).into();
+            .value = NonZero::new(2).into();
         executor
             .progs
             .globals
             .get_mut(ent_global_2.0.0)
             .unwrap()
-            .value = EntityRef::Entity(ErasedEntityHandle(2)).into();
+            .value = NonZero::new(3).into();
 
         let out: f32 = executor
             .run(&mut TestContext::default(), c"mul_three_from_fields", ())

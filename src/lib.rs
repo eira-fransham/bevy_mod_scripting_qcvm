@@ -27,7 +27,7 @@ use bevy_mod_scripting_asset::Language;
 use bevy_mod_scripting_bindings::{
     DynamicScriptFunction, ExternalError, FunctionCallContext, InteropError, IntoNamespace,
     ReflectAccessId, ReflectBase, ReflectBaseType, ReflectReference, ScriptValue,
-    ThreadScriptContext, ThreadWorldContainer, WorldAccessGuard,
+    ThreadScriptContext, ThreadWorldContainer,
 };
 use bevy_mod_scripting_core::{
     IntoScriptPluginParams, ScriptingPlugin, config::GetPluginThreadConfig, event::CallbackLabel,
@@ -35,9 +35,9 @@ use bevy_mod_scripting_core::{
 use bevy_mod_scripting_script::ScriptAttachment;
 use bevy_reflect::PartialReflect;
 use qcvm::{
-    Address, ArgError, EmptyAddress, QCParams, anyhow,
+    Address, ArgError, EmptyAddress, EntityRef, ErasedEntityHandle, QCParams, anyhow,
     arrayvec::ArrayVec,
-    userdata::{AddrError, ErasedEntityHandle, QCType},
+    userdata::{AddrError, EntityHandle, QCType},
 };
 
 pub use qcvm;
@@ -70,6 +70,8 @@ struct BevyScriptContext<GlobalAddr, FieldAddr> {
 #[derive(PartialEq, Eq)]
 struct BevyEntityHandle<GlobalAddr, FieldAddr> {
     id: bevy_ecs::entity::Entity,
+    /// Used to sanity check check that the ID bits are not all-zero when converting back to u64
+    is_worldspawn: bool,
     _phantom: PhantomData<(GlobalAddr, FieldAddr)>,
 }
 
@@ -114,7 +116,8 @@ where
         field: Self::FieldAddr,
     ) -> Result<qcvm::Value, AddrError<Self::Error>> {
         // TODO: We could do this just once when initialising the context, which may be more efficient
-        let world = ThreadWorldContainer.try_get_context()?.world;
+        let world_ctx = ThreadWorldContainer.try_get_context()?;
+        let world = &world_ctx.world;
 
         let function_registry = world.script_function_registry();
         let get = function_registry.read().magic_functions.get;
@@ -139,7 +142,7 @@ where
             .and_then(|v| {
                 bms_script_value_to_qcvm_script_value::<GlobalAddr, FieldAddr>(
                     &v,
-                    &world,
+                    &world_ctx,
                     &ctx.context,
                 )
             })
@@ -182,20 +185,45 @@ where
             .map_err(|()| InteropError::MissingWorld)?
     }
 
-    fn from_erased_mut<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
+    fn from_erased_mut<F, O>(erased: EntityRef, callback: F) -> Result<O, Self::Error>
     where
         F: FnOnce(&mut Self) -> O,
     {
-        let id = bevy_ecs::entity::Entity::from_bits(erased);
+        match erased {
+            Some(erased) => {
+                let id = bevy_ecs::entity::Entity::from_bits(erased.get());
 
-        Ok(callback(&mut Self {
-            id,
-            _phantom: PhantomData,
-        }))
+                Ok(callback(&mut Self {
+                    id,
+                    is_worldspawn: false,
+                    _phantom: PhantomData,
+                }))
+            }
+            None => {
+                let worldspawn = ThreadWorldContainer
+                    .try_get_context()?
+                    .attachment
+                    .entity()
+                    .ok_or(InteropError::MissingWorld)?;
+
+                Ok(callback(&mut Self {
+                    id: worldspawn,
+                    is_worldspawn: true,
+                    _phantom: PhantomData,
+                }))
+            }
+        }
     }
 
-    fn to_erased(&self) -> u64 {
-        self.id.to_bits()
+    fn to_erased(&self) -> EntityRef {
+        if self.is_worldspawn {
+            None
+        } else {
+            Some(ErasedEntityHandle::new(self.id.to_bits()).expect(
+                "Sanity check failed: entity references with all-zero bits \
+                 are unsupported as this is used a sentinel for worldspawn",
+            ))
+        }
     }
 }
 
@@ -291,7 +319,7 @@ where
                 interop_error_to_addr_error(bms_script_value_to_qcvm_script_value::<
                     GlobalAddr,
                     FieldAddr,
-                >(&v, &world_ctx.world, &self.context))
+                >(&v, &world_ctx, &self.context))
             })
     }
 
@@ -361,7 +389,6 @@ struct BevyScriptArgs<'a, A, GlobalAddr, FieldAddr>
 where
     A: ?Sized,
 {
-    guard: WorldAccessGuard<'a>,
     args: &'a A,
     context: QCVmContext,
     _phantom: PhantomData<(GlobalAddr, FieldAddr)>,
@@ -373,7 +400,6 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BevyScriptArgs")
-            .field("guard", &self.guard)
             .field("args", &self.args)
             .finish()
     }
@@ -387,6 +413,8 @@ where
     type Error = InteropError;
 
     fn nth(&self, index: usize) -> Result<qcvm::Value, ArgError<Self::Error>> {
+        let world_ctx = ThreadWorldContainer.try_get_context()?;
+
         let arg = self
             .args
             .get(index)
@@ -397,7 +425,7 @@ where
 
         Ok(bms_script_value_to_qcvm_script_value::<G, F>(
             arg,
-            &self.guard,
+            &world_ctx,
             &self.context,
         )?)
     }
@@ -415,6 +443,8 @@ where
     type Error = InteropError;
 
     fn nth(&self, index: usize) -> Result<qcvm::Value, ArgError<Self::Error>> {
+        let world_ctx = ThreadWorldContainer.try_get_context()?;
+
         let arg = self
             .args
             .get(index)
@@ -425,7 +455,7 @@ where
 
         Ok(bms_script_value_to_qcvm_script_value::<G, F>(
             arg,
-            &self.guard,
+            &world_ctx,
             &self.context,
         )?)
     }
@@ -514,7 +544,7 @@ where
             let world = ThreadWorldContainer.try_get_context()?;
             bms_script_value_to_qcvm_script_value::<GlobalAddr, FieldAddr>(
                 &val,
-                &world.world,
+                &world,
                 &context.context,
             )
         })
@@ -523,13 +553,18 @@ where
 
 fn bms_script_value_to_qcvm_script_value<G, F>(
     bms_value: &ScriptValue,
-    world: &WorldAccessGuard<'_>,
+    world_ctx: &ThreadScriptContext<'_>,
     context: &QCVmContext,
 ) -> Result<qcvm::Value, InteropError>
 where
     G: Address,
     F: Address,
 {
+    let world = &world_ctx.world;
+    let worldspawn = world_ctx
+        .attachment
+        .entity()
+        .ok_or(InteropError::MissingWorld)?;
     let qc_entity_id = world.get_component_id(TypeId::of::<QCEntity>())?;
     let qc_worldspawn_id = world.get_component_id(TypeId::of::<QCWorldspawn>())?;
 
@@ -551,33 +586,38 @@ where
         ScriptValue::Reference(ReflectReference {
             base:
                 ReflectBaseType {
-                    // TODO: We should be using a specific marker component ID
                     base_id: ReflectBase::Component(ent, component_id),
                     ..
                 },
             ..
         }) if Some(component_id) == qc_entity_id.as_ref() => {
-            Ok(qcvm::Value::Entity(qcvm::EntityRef::new(
+            Ok(qcvm::Value::Entity(
                 // The addresses do not matter for this usecase.
                 //
                 // TODO: Maybe we can make this more ergonomic somehow? Maybe remove the `EntityHandle`
                 //       trait entirely?
                 BevyEntityHandle::<EmptyAddress, EmptyAddress> {
                     id: *ent,
+                    is_worldspawn: *ent == worldspawn,
                     _phantom: PhantomData,
-                },
-            )))
+                }
+                .to_erased(),
+            ))
         }
         ScriptValue::Reference(ReflectReference {
             base:
                 ReflectBaseType {
-                    // TODO: We should be using a specific marker component ID
                     base_id: ReflectBase::Component(_, component_id),
                     ..
                 },
             ..
         }) if Some(component_id) == qc_worldspawn_id.as_ref() => {
-            Ok(qcvm::Value::Entity(qcvm::EntityRef::Worldspawn))
+            return Err(InteropError::external_boxed(
+                "Tried to convert a `QCWorldspawn` reference to a qcvm entity. If this is what \
+                you intended, add a `QCEntity` component to the worldspawn entity and pass a \
+                `ReflectReference` to that component instead"
+                    .into(),
+            ));
         }
         ScriptValue::Reference(val) => val.with_reflect(world.clone(), context.reflect_to_value)?,
         ScriptValue::FunctionMut(_) => todo!(),
@@ -600,22 +640,27 @@ where
     G: Address,
     F: Address,
 {
-    let worldspawn = world_ctx
-        .attachment
-        .entity()
-        .ok_or(InteropError::MissingWorld)?;
-
     match qcvm_value {
         qcvm::Value::Void => Ok(ScriptValue::Unit),
-        qcvm::Value::Entity(qcvm::EntityRef::Entity(ErasedEntityHandle(entity_bits))) => Ok(
-            ScriptValue::Reference(ReflectReference::new_component_ref::<QCEntity>(
-                Entity::from_bits(*entity_bits),
+        qcvm::Value::Entity(Some(bits)) => Ok(ScriptValue::Reference(
+            ReflectReference::new_component_ref::<QCEntity>(
+                Entity::from_bits(bits.get()),
                 world_ctx.world.clone(),
-            )?),
-        ),
-        qcvm::Value::Entity(qcvm::EntityRef::Worldspawn) => Ok(ScriptValue::Reference(
-            ReflectReference::new_component_ref::<QCEntity>(worldspawn, world_ctx.world.clone())?,
+            )?,
         )),
+        qcvm::Value::Entity(None) => {
+            let worldspawn = world_ctx
+                .attachment
+                .entity()
+                .ok_or(InteropError::MissingWorld)?;
+
+            Ok(ScriptValue::Reference(
+                ReflectReference::new_component_ref::<QCEntity>(
+                    worldspawn,
+                    world_ctx.world.clone(),
+                )?,
+            ))
+        }
         qcvm::Value::Function(function) => {
             if let Some(builtin) = (&**function as &dyn Any).downcast_ref::<BevyBuiltin<G, F>>() {
                 Ok(ScriptValue::Function(builtin.func.clone()))
@@ -636,7 +681,6 @@ where
                                     },
                                     &*func,
                                     BevyScriptArgs::<VecDeque<ScriptValue>, G, F> {
-                                        guard: world_ctx.world.clone(),
                                         context: root_ctx.clone(),
                                         args: &args,
                                         _phantom: PhantomData,
@@ -722,9 +766,7 @@ where
                     map.drain()
                         .map(|(k, v)| {
                             let value = bms_script_value_to_qcvm_script_value::<G, F>(
-                                &v,
-                                &world_ctx.world,
-                                context,
+                                &v, &world_ctx, context,
                             )?;
                             let key = G::from_name(&k).ok_or_else(|| {
                                 let reason = format!("No global with name {k}");
@@ -760,7 +802,6 @@ where
                     },
                     callback_cstr,
                     BevyScriptArgs::<[ScriptValue], G, F> {
-                        guard: world_ctx.world.clone(),
                         context: context.clone(),
                         args: args_ref,
                         _phantom: PhantomData,

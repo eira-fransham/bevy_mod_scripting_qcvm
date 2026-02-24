@@ -13,15 +13,10 @@ use bump_scope::BumpScope;
 use snafu::Snafu;
 
 use crate::{
-    Address, AsErasedContext, BuiltinDef, CallArgs, ExecutionCtx, FunctionRef, MAX_ARGS, QCMemory,
-    QCParams, Type, Value, function_args,
+    Address, AsErasedContext, BuiltinDef, CallArgs, EntityRef, ErasedEntityHandle, ExecutionCtx,
+    FunctionRef, MAX_ARGS, QCMemory, QCParams, Type, Value, function_args,
     progs::{VmScalar, VmValue},
 };
-
-/// A type-erased entity handle.
-#[repr(transparent)]
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-pub struct ErasedEntityHandle(pub u64);
 
 type ErasedAddr = u16;
 
@@ -111,7 +106,7 @@ pub trait ErasedContext: Any {
     /// Dynamic version of `<Context::Entity as EntityHandle>::get`.
     fn dyn_entity_get(
         &self,
-        erased_ent: u64,
+        erased_ent: EntityRef,
         field: ErasedAddr,
         ty: Type,
     ) -> anyhow::Result<Value, AddrError<anyhow::Error>>;
@@ -119,7 +114,7 @@ pub trait ErasedContext: Any {
     /// Dynamic version of `<Context::Entity as EntityHandle>::set`.
     fn dyn_entity_set(
         &mut self,
-        erased_ent: u64,
+        erased_ent: EntityRef,
         field: ErasedAddr,
         value: Value,
     ) -> anyhow::Result<(), AddrError<anyhow::Error>>;
@@ -158,7 +153,7 @@ where
 
     fn dyn_entity_get(
         &self,
-        erased_ent: u64,
+        erased_ent: EntityRef,
         field: ErasedAddr,
         ty: Type,
     ) -> anyhow::Result<Value, AddrError<anyhow::Error>> {
@@ -174,7 +169,7 @@ where
 
     fn dyn_entity_set(
         &mut self,
-        erased_ent: u64,
+        erased_ent: EntityRef,
         field: ErasedAddr,
         value: Value,
     ) -> Result<(), AddrError<anyhow::Error>> {
@@ -257,7 +252,7 @@ pub trait EntityHandle: QCType {
     type FieldAddr: Address;
 
     /// Convert from an opaque handle to a reference to this type (must be a reference in order to allow unsized handles)
-    fn from_erased<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
+    fn from_erased<F, O>(erased: EntityRef, callback: F) -> Result<O, Self::Error>
     where
         F: FnOnce(&Self) -> O,
     {
@@ -265,12 +260,12 @@ pub trait EntityHandle: QCType {
     }
 
     /// Convert from an opaque handle to a mutable reference to this type (must be a reference in order to allow unsized handles)
-    fn from_erased_mut<F, O>(erased: u64, callback: F) -> Result<O, Self::Error>
+    fn from_erased_mut<F, O>(erased: EntityRef, callback: F) -> Result<O, Self::Error>
     where
         F: FnOnce(&mut Self) -> O;
 
     /// Convert this type to an opaque handle
-    fn to_erased(&self) -> u64;
+    fn to_erased(&self) -> EntityRef;
 
     /// Get a field given this handle and reference to the context.
     fn get(
