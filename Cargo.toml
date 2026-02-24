@@ -1,6 +1,6 @@
 [package]
 name = "bevy_mod_scripting_qcvm"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "A QuakeC runtime for scripting Bevy games"
 readme = "README.md"

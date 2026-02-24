@@ -696,7 +696,7 @@ where
     fn build_runtime() -> Self::R {}
 
     fn handler() -> bevy_mod_scripting_core::handler::HandlerFn<Self> {
-        fn qc_callback_handler<GlobalAddr, FieldAddr>(
+        fn qc_callback_handler<G, F>(
             mut args: Vec<ScriptValue>,
             context_key: &ScriptAttachment,
             callback: &CallbackLabel,
@@ -704,10 +704,11 @@ where
             world_id: WorldId,
         ) -> Result<ScriptValue, InteropError>
         where
-            GlobalAddr: Address,
-            FieldAddr: Address,
+            G: Address,
+            F: Address,
+            QCScriptingPlugin<G, F>: GetPluginThreadConfig<QCScriptingPlugin<G, F>>,
         {
-            let config = QCScriptingPlugin::readonly_configuration(world_id);
+            let config = QCScriptingPlugin::<G, F>::readonly_configuration(world_id);
             for callback in config.pre_handling_callbacks {
                 callback(context_key, context)?;
             }
@@ -720,13 +721,12 @@ where
                 Some(ScriptValue::Map(map)) => (
                     map.drain()
                         .map(|(k, v)| {
-                            let value = bms_script_value_to_qcvm_script_value::<
-                                GlobalAddr,
-                                FieldAddr,
-                            >(
-                                &v, &world_ctx.world, context
+                            let value = bms_script_value_to_qcvm_script_value::<G, F>(
+                                &v,
+                                &world_ctx.world,
+                                context,
                             )?;
-                            let key = GlobalAddr::from_name(&k).ok_or_else(|| {
+                            let key = G::from_name(&k).ok_or_else(|| {
                                 let reason = format!("No global with name {k}");
                                 InteropError::InvalidIndex {
                                     index: Box::new(k.into()),
@@ -753,13 +753,13 @@ where
                 .vm
                 .run(
                     // TODO: Implement special args (should not be part of callargs)
-                    &mut BevyScriptContext::<GlobalAddr, FieldAddr> {
+                    &mut BevyScriptContext::<G, F> {
                         special_args,
                         context: context.clone(),
                         _phantom: PhantomData,
                     },
                     callback_cstr,
-                    BevyScriptArgs::<[ScriptValue], GlobalAddr, FieldAddr> {
+                    BevyScriptArgs::<[ScriptValue], G, F> {
                         guard: world_ctx.world.clone(),
                         context: context.clone(),
                         args: args_ref,
@@ -768,9 +768,7 @@ where
                 )
                 .map_err(qc_interop_error)?;
 
-            qcvm_script_value_to_bms_script_value::<GlobalAddr, FieldAddr>(
-                &val, &world_ctx, context,
-            )
+            qcvm_script_value_to_bms_script_value::<G, F>(&val, &world_ctx, context)
         }
 
         qc_callback_handler::<GlobalAddr, FieldAddr>
@@ -778,12 +776,17 @@ where
 
     fn context_loader() -> bevy_mod_scripting_core::context::ContextLoadFn<Self> {
         // TODO: We should set all globals on the script attachment when loading.
-        fn qc_context_loader(
+        fn qc_context_loader<G, F>(
             context_key: &ScriptAttachment,
             content: &[u8],
             world_id: WorldId,
-        ) -> Result<QCVmContext, InteropError> {
-            let config = QCScriptingPlugin::readonly_configuration(world_id);
+        ) -> Result<QCVmContext, InteropError>
+        where
+            G: Address + 'static,
+            F: Address + 'static,
+            QCScriptingPlugin<G, F>: GetPluginThreadConfig<QCScriptingPlugin<G, F>>,
+        {
+            let config = QCScriptingPlugin::<G, F>::readonly_configuration(world_id);
             let mut out = QCVmContext {
                 vm: qcvm::QCVm::load(std::io::Cursor::new(content))
                     .map_err(qc_interop_error)?
@@ -798,7 +801,7 @@ where
             Ok(out)
         }
 
-        qc_context_loader
+        qc_context_loader::<GlobalAddr, FieldAddr>
     }
 
     fn context_reloader() -> bevy_mod_scripting_core::context::ContextReloadFn<Self> {
