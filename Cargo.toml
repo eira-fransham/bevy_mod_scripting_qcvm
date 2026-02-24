@@ -1,6 +1,6 @@
 [package]
 name = "bevy_mod_scripting_qcvm"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "A QuakeC runtime for scripting Bevy games"
 readme = "README.md"
@@ -48,7 +48,7 @@ hashbrown.workspace = true
 itertools.workspace = true
 num.workspace = true
 bevy_reflect.workspace = true
-qcvm = { version = "0.2", path = "crates/qcvm" }
+qcvm = { version = "0.3", path = "crates/qcvm" }
 
 bevy_ecs = "0.18"
 bevy_asset = "0.18"

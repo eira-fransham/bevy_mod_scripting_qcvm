@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_mod_scripting_qcvm"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bevy_app",
  "bevy_asset",
@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "qcvm"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arc-slice",
