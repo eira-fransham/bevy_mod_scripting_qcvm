@@ -1,6 +1,6 @@
 [package]
 name = "bevy_mod_scripting_qcvm"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A QuakeC runtime for scripting Bevy games"
 readme = "README.md"
@@ -31,7 +31,7 @@ byteorder = "1.5"
 hash32 = "1.0"
 hashbrown = "0.16"
 gxhash = "3.5"
-glam = "^0.30"
+glam = "0.33"
 indexmap = "2.11"
 itertools = "0.14"
 num = "0.4"
@@ -41,27 +41,28 @@ snafu = "0.8"
 strum = "0.27" 
 tracing = "^0.1"
 
-bevy_reflect = "0.18"
+bevy_reflect = "0.20"
 
 [dependencies]
 hashbrown.workspace = true
 itertools.workspace = true
 num.workspace = true
 bevy_reflect.workspace = true
-qcvm = { version = "0.3", path = "crates/qcvm" }
+qcvm = { version = "0.4", path = "crates/qcvm" }
 
-bevy_ecs = "0.18"
-bevy_asset = "0.18"
-bevy_app = "0.18"
-bevy_log = "0.18"
-bevy_math = "0.18"
-bevy_platform = "0.18"
+bevy_ecs = "0.20"
+bevy_asset = "0.20"
+bevy_app = "0.20"
+bevy_log = "0.20"
+bevy_math = "0.20"
+bevy_platform = "0.20"
 
-bevy_mod_scripting_core = "0.19"
-bevy_mod_scripting_script = "0.19"
-bevy_mod_scripting_display = "0.19"
-bevy_mod_scripting_bindings = "0.19"
-bevy_mod_scripting_asset = "0.19"
+bevy_mod_scripting_core = "0.24"
+bevy_mod_scripting_script = "0.24"
+bevy_mod_scripting_display = "0.24"
+bevy_mod_scripting_bindings = "0.24"
+bevy_mod_scripting_asset = "0.24"
+bevy_mod_scripting_world = "0.24"
 
 [features]
 default = []
