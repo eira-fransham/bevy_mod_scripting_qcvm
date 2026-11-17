@@ -1,7 +1,13 @@
 pub mod functions;
 pub mod globals;
 
-use std::{cmp::Ordering, ffi::CStr, fmt, ops::Deref, sync::Arc};
+use std::{
+    cmp::Ordering,
+    ffi::CStr,
+    fmt,
+    ops::Deref,
+    sync::{Arc, LazyLock},
+};
 
 use crate::{HashMap, userdata::DynEq as _};
 #[cfg(feature = "reflect")]
@@ -10,31 +16,59 @@ use glam::Vec3;
 use num::FromPrimitive;
 use num_derive::FromPrimitive;
 
-use crate::{ErasedEntityHandle, entity::ScalarFieldDef, userdata::ErasedFunction};
+use crate::{ErasedEntityHandle, FunctionIndex, entity::ScalarFieldDef, userdata::ErasedFunction};
+
+static NULL_STRING: LazyLock<Arc<CStr>> = LazyLock::new(|| Arc::from(c""));
+
+/// The null string.
+///
+/// QuakeC distinguishes the null string (string ID 0, which is what unset fields and globals hold)
+/// from other empty strings: `if (s)` is false for the former but true for the latter. This crate
+/// represents strings as `Arc<CStr>`, so the null string is a specific, shared allocation. Hosts
+/// should use this value (rather than any empty string) for unset string fields, and compare with
+/// [`is_null_string`].
+pub fn null_string() -> Arc<CStr> {
+    NULL_STRING.clone()
+}
+
+/// Returns `true` if `s` is the [`null_string`].
+pub fn is_null_string(s: &Arc<CStr>) -> bool {
+    Arc::ptr_eq(s, &NULL_STRING)
+}
 
 #[derive(Clone, Debug)]
 pub struct StringTable {
-    /// Interned string data. In the `progs.dat` all the strings are concatenated together,
-    /// delineated by `\0`, but since we handle strings using `Arc` we still need to map
-    /// the raw byte offset in the lump to something we can cheaply clone.
-    strings: HashMap<i32, Arc<CStr>>,
+    /// The string lump: strings concatenated together, each terminated by `\0`.
+    ///
+    /// A string ID is a byte offset into this, which doesn't have to be at the start of one of the
+    /// strings: `qcc` can share the suffix of a string.
+    data: Arc<[u8]>,
+    /// The strings that start directly after a `\0`, so that common lookups don't allocate.
+    starts: HashMap<i32, Arc<CStr>>,
 }
 
 impl StringTable {
     pub fn new<D: AsRef<[u8]>>(data: D) -> anyhow::Result<StringTable> {
-        let data = data.as_ref();
-        let mut offset = 0;
-        let mut strings = HashMap::default();
-
-        while !data.is_empty() {
-            // TODO: Error handling.
-            let next = CStr::from_bytes_until_nul(&data[offset..])?;
-            let next_len = next.count_bytes();
-            strings.insert(offset.try_into()?, next.into());
-            offset += next_len;
+        let mut data = data.as_ref().to_vec();
+        if data.last() != Some(&0) {
+            data.push(0);
         }
 
-        Ok(Self { strings })
+        let mut starts = HashMap::default();
+        let mut offset = 0;
+        while offset < data.len() {
+            let next = CStr::from_bytes_until_nul(&data[offset..])?;
+            // ID 0 is the null string, which is handled separately.
+            if offset != 0 {
+                starts.insert(i32::try_from(offset)?, Arc::from(next));
+            }
+            offset += next.count_bytes() + 1;
+        }
+
+        Ok(Self {
+            data: data.into(),
+            starts,
+        })
     }
 
     pub fn get<I>(&self, id: I) -> anyhow::Result<Arc<CStr>>
@@ -42,12 +76,20 @@ impl StringTable {
         I: Into<StringRef>,
     {
         match id.into() {
-            StringRef::Id(id) => self
-                .strings
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| anyhow::Error::msg(format!("No string with id {id}"))),
-            StringRef::Temp(lit) => Ok(lit.clone()),
+            StringRef::Id(0) => Ok(null_string()),
+            StringRef::Id(id) => {
+                if let Some(s) = self.starts.get(&id) {
+                    return Ok(s.clone());
+                }
+
+                let bytes = usize::try_from(id)
+                    .ok()
+                    .and_then(|id| self.data.get(id..))
+                    .ok_or_else(|| anyhow::format_err!("No string with id {id}"))?;
+
+                Ok(CStr::from_bytes_until_nul(bytes)?.into())
+            }
+            StringRef::Temp(lit) => Ok(lit),
         }
     }
 }
@@ -90,18 +132,26 @@ impl From<i16> for Ptr {
     }
 }
 
+/// The type of a single (scalar) value in QuakeC memory, as specified in `progs.dat` definitions.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "reflect", derive(Reflect))]
 #[repr(u8)]
 pub enum VmScalarType {
+    /// `void`
     Void = 0,
+    /// `string`
     String = 1,
+    /// `float`
     Float = 2,
     // Vector = 3, see `Type`.
+    /// `entity`
     Entity = 4,
 
+    /// A field reference, e.g. `.float`
     FieldRef = 5,
+    /// A function
     Function = 6,
+    /// A pointer to a global
     GlobalRef = 7,
 
     /// Fake type, only used internally
@@ -142,11 +192,14 @@ impl FromPrimitive for VmScalarType {
 
 const VECTOR_TAG: u8 = 3;
 
+/// The type of a value in QuakeC memory, as specified in `progs.dat` definitions.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "reflect", derive(Reflect))]
 #[repr(u8)]
 pub enum VmType {
+    /// A single scalar.
     Scalar(VmScalarType),
+    /// A vector, which takes up three scalars.
     Vector = VECTOR_TAG,
 }
 
@@ -157,6 +210,7 @@ impl From<VmScalarType> for VmType {
 }
 
 impl VmType {
+    /// The number of scalars a value of this type takes up.
     pub fn num_elements(&self) -> usize {
         match self {
             Self::Scalar(_) => 1,
@@ -249,12 +303,8 @@ impl VectorField {
 #[derive(Debug, Clone)]
 pub struct GlobalDef {
     /// Whether the global should be saved in a savegame
-    // TODO: Implement this (should we conflate "save" with "persists between frames"?)
-    #[expect(dead_code, reason = "TODO: Implement save")]
     pub save: bool,
     /// The type of the global
-    ///
-    /// > TODO: This should not be exposed in this form, `VmType` shouldn't be externally visible
     pub type_: VmType,
     /// The offset of the global
     pub offset: u16,
@@ -366,7 +416,24 @@ impl PartialEq for VmFunctionRef {
 
 impl VmFunctionRef {
     pub fn is_null(&self) -> bool {
-        matches!(self, Self::Ptr(Ptr::NULL))
+        match self {
+            Self::Ptr(ptr) => ptr.is_null(),
+            Self::Extern(func) => func.is_null(),
+        }
+    }
+
+    /// Converts external references to QuakeC functions back to pointers, so that they compare
+    /// equal to other pointers to the same function.
+    pub fn normalize(self) -> Self {
+        match self {
+            Self::Extern(func) => {
+                match (&*func as &dyn std::any::Any).downcast_ref::<FunctionIndex>() {
+                    Some(index) => Self::Ptr(Ptr(index.0)),
+                    None => Self::Extern(func),
+                }
+            }
+            ptr @ Self::Ptr(_) => ptr,
+        }
     }
 }
 
@@ -404,7 +471,10 @@ impl Default for StringRef {
 
 impl StringRef {
     pub fn is_null(&self) -> bool {
-        matches!(self, Self::Id(0))
+        match self {
+            Self::Id(id) => *id == 0,
+            Self::Temp(s) => is_null_string(s),
+        }
     }
 }
 
@@ -579,7 +649,7 @@ impl TryFrom<VmScalar> for VmFunctionRef {
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
             VmScalar::Void => Ok(Default::default()),
-            VmScalar::Function(f) => Ok(f),
+            VmScalar::Function(f) => Ok(f.normalize()),
             _ => Err(ScalarCastError {
                 expected: VmScalarType::Function,
                 found: value.type_(),
@@ -651,10 +721,13 @@ impl TryFrom<VmScalar> for FieldPtr {
 const _: [(); 24] = [(); std::mem::size_of::<VmScalar>()];
 
 impl VmScalar {
+    /// Whether this value is all zero bits, which is what `OP_IF`/`OP_IFNOT` test.
+    ///
+    /// Note that this means that `-0.0` is _not_ null, as in Quake.
     pub fn is_null(&self) -> bool {
         match self {
             VmScalar::Void => true,
-            VmScalar::Float(f) => *f != 0.,
+            VmScalar::Float(f) => f.to_bits() == 0,
             VmScalar::Entity(entity_ref) => entity_ref.is_none(),
             VmScalar::String(string_ref) => string_ref.is_null(),
             VmScalar::Function(function_ref) => function_ref.is_null(),
@@ -662,6 +735,15 @@ impl VmScalar {
             VmScalar::Field(ptr) => ptr.is_null(),
             // 0 field is valid
             VmScalar::EntityField(ent, _) => ent.is_none(),
+        }
+    }
+
+    /// Whether this value is false, as tested by `OP_NOT_*`, `OP_AND` and `OP_OR`. Unlike
+    /// [`VmScalar::is_null`], these compare floats by value, so `-0.0` is false.
+    pub fn is_false(&self) -> bool {
+        match self {
+            VmScalar::Float(f) => *f == 0.,
+            other => other.is_null(),
         }
     }
 
@@ -751,14 +833,19 @@ impl From<Vec3> for VmValue {
 impl TryFrom<[VmScalar; 3]> for VmValue {
     type Error = ScalarCastError;
 
+    /// Interprets a function's return value. `OP_RETURN` always copies three scalars, but QuakeC
+    /// doesn't record functions' return types, so if the second and third scalars aren't both
+    /// floats we assume that this is a scalar.
     fn try_from(value: [VmScalar; 3]) -> Result<Self, Self::Error> {
+        let is_float = |s: &VmScalar| matches!(s, VmScalar::Float(_) | VmScalar::Void);
         match value {
             [scalar, VmScalar::Void, VmScalar::Void] => Ok(VmValue::Scalar(scalar)),
-            [x, y, z] => Ok(VmValue::Vector([
+            [x, y, z] if is_float(&x) && is_float(&y) && is_float(&z) => Ok(VmValue::Vector([
                 x.try_into()?,
                 y.try_into()?,
                 z.try_into()?,
             ])),
+            [scalar, _, _] => Ok(VmValue::Scalar(scalar)),
         }
     }
 }

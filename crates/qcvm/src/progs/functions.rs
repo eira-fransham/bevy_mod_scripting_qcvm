@@ -1,20 +1,19 @@
 use std::ffi::CStr;
 use std::{fmt, ops::Range, sync::Arc};
 
-use crate::{FunctionRef, HashMap, Type, VectorField, function_args};
+use crate::{FunctionRef, HashMap, Type};
 use arc_slice::ArcSlice;
 use arrayvec::ArrayVec;
 #[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
 use bump_scope::{BumpAllocatorScopeExt, FixedBumpVec};
-use itertools::Itertools;
 use num::FromPrimitive as _;
 use num_derive::FromPrimitive;
 
 use crate::QCMemory;
 use crate::load::LoadFn;
 use crate::ops::Opcode;
-use crate::progs::{VmScalar, VmScalarType};
+use crate::progs::VmScalar;
 
 /// The maximum number of arguments supported by the runtime.
 pub const MAX_ARGS: usize = 8;
@@ -68,9 +67,13 @@ impl std::fmt::Display for ArgSize {
     }
 }
 
+/// A QuakeC function's call frame.
+///
+/// Only the function's locals are stored per frame. Everything else, including the parameter slots
+/// that arguments are passed in, is global memory, as in Quake: some functions are called with
+/// fewer arguments than they take, and rely on the stale values left in the parameter slots.
 #[derive(Debug)]
 pub(crate) struct FunctionExecutionCtx<'a> {
-    params: FixedBumpVec<'a, VmScalar>,
     local_storage: FixedBumpVec<'a, VmScalar>,
     /// If the progs try to access a value within this range, it will access `local_storage` instead of globals.
     ///
@@ -105,54 +108,29 @@ impl QCMemory for FunctionExecutionCtx<'_> {
                     .clone(),
             ))
         } else {
-            let Ok(index) = u16::try_from(index) else {
-                return Ok(None);
-            };
-
-            match function_args().find_map(|arg| arg.try_match_scalar(index)) {
-                Some((arg_index, ofs)) => {
-                    Ok(self.params.get(arg_index * 3 + ofs as usize).cloned())
-                }
-                _ => Ok(None),
-            }
+            Ok(None)
         }
     }
 }
 
 impl FunctionExecutionCtx<'_> {
-    pub fn set(&mut self, index: usize, value: VmScalar) -> anyhow::Result<()> {
-        if value.type_() == VmScalarType::Void {
-            return Ok(());
-        }
-
+    /// Stores `value` if `index` is one of this frame's locals. Otherwise, gives the value back so
+    /// that the caller can store it in global memory.
+    ///
+    /// Storing `Void` is a real store (of zero), as in Quake: e.g. assigning an uninitialised
+    /// temporary to a local must clear the local.
+    pub fn try_set(&mut self, index: usize, value: VmScalar) -> Result<(), VmScalar> {
         if self.local_range.contains(&index) {
             let index = index - self.local_range.start;
 
             let local = self.local_storage.get_mut(index).expect(LOCAL_STORAGE_ERR);
 
             *local = value;
+
+            Ok(())
         } else {
-            let out_of_range = || anyhow::bail!("Global {index} is out of range");
-
-            let Ok(index) = u16::try_from(index) else {
-                return out_of_range();
-            };
-
-            match function_args().find_map(|arg| arg.try_match_scalar(index)) {
-                Some((arg_index, ofs)) => {
-                    if let Some(param) = self.params.get_mut(arg_index * 3 + ofs as usize) {
-                        *param = value;
-                    } else {
-                        return out_of_range();
-                    }
-                }
-                _ => {
-                    return out_of_range();
-                }
-            }
+            Err(value)
         }
-
-        Ok(())
     }
 }
 
@@ -184,6 +162,9 @@ pub type QCFunctionDef = FunctionDef<QCFunctionBody>;
 /// Definition for a QuakeC function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionDef<T = FunctionBody> {
+    /// The index of this function in the `progs.dat` function table. This is the value that
+    /// QuakeC uses to refer to the function (e.g. in `self.think`), and index 0 is the null function.
+    pub index: i32,
     /// The offset to the start of this function's statements for QuakeC
     /// functions, the negative index of a builtin for functions provided
     /// by the host.
@@ -198,6 +179,13 @@ pub struct FunctionDef<T = FunctionBody> {
     pub body: T,
 }
 
+impl<T> FunctionDef<T> {
+    /// Whether this function is provided by the host.
+    pub fn is_builtin(&self) -> bool {
+        self.offset < 0
+    }
+}
+
 /// No body as the function is provided by the host.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Builtin;
@@ -209,6 +197,7 @@ impl FunctionDef {
     pub(crate) fn try_into_qc(self) -> Result<QCFunctionDef, FunctionDef<Builtin>> {
         match self.body.try_into_qc() {
             Ok(quakec) => Ok(QCFunctionDef {
+                index: self.index,
                 offset: self.offset,
                 name: self.name,
                 source: self.source,
@@ -216,6 +205,7 @@ impl FunctionDef {
                 body: quakec,
             }),
             Err(builtin) => Err(FunctionDef {
+                index: self.index,
                 offset: self.offset,
                 name: self.name,
                 source: self.source,
@@ -227,20 +217,16 @@ impl FunctionDef {
 }
 
 impl QCFunctionDef {
+    /// Creates the call frame for this function. Locals start with their values from the
+    /// `progs.dat` (`initial_locals`), which is what Quake's save/restore of locals amounts to.
     pub(crate) fn ctx<'scope>(
         &self,
         mut alloc: impl BumpAllocatorScopeExt<'scope>,
+        initial_locals: &[VmScalar],
     ) -> FunctionExecutionCtx<'scope> {
         FunctionExecutionCtx {
-            params: FixedBumpVec::from_iter_exact_in(
-                std::iter::repeat_n(
-                    VmScalar::Void,
-                    function_args().len() * VectorField::FIELDS.len(),
-                ),
-                &mut alloc,
-            ),
             local_storage: FixedBumpVec::from_iter_exact_in(
-                std::iter::repeat_n(VmScalar::Void, self.body.locals.len()),
+                initial_locals.iter().cloned(),
                 &mut alloc,
             ),
             local_range: self.body.locals.clone(),
@@ -252,52 +238,70 @@ impl QCFunctionDef {
 /// The registry of functions known to the `progs.dat`.
 #[derive(Debug, Clone)]
 pub struct FunctionRegistry {
-    by_index: HashMap<i32, FunctionDef>,
-    by_name: HashMap<Arc<CStr>, FunctionDef>,
+    /// Functions in `progs.dat` order, so that function pointers index into this.
+    by_index: Box<[FunctionDef]>,
+    by_name: HashMap<Arc<CStr>, i32>,
 }
 
 impl FunctionRegistry {
+    /// `definitions` must be in `progs.dat` order, as function pointers are indices into it.
     pub(crate) fn new(
         statements: ArcSlice<[Statement]>,
         definitions: &[LoadFn],
     ) -> anyhow::Result<Self> {
-        let (by_index, by_name) = definitions
+        // A function's body runs until the next function's first statement.
+        let mut entry_points = definitions
             .iter()
-            .map(Some)
-            .chain(std::iter::once(None))
-            .tuple_windows()
-            .map(|(cur, next)| -> anyhow::Result<_> {
-                match (cur, next) {
-                    (Some(cur), next) => {
-                        let func_def = FunctionDef {
-                            name: cur.name.clone(),
-                            source: cur.source.clone(),
-                            args: cur.args.iter().copied().map(Into::into).collect(),
-                            offset: cur.offset,
-                            body: if cur.offset < 0 {
-                                debug_assert_eq!(cur.locals.len(), 0);
+            .map(|def| def.offset)
+            .filter(|offset| *offset >= 0)
+            .collect::<Vec<_>>();
+        entry_points.sort_unstable();
+        entry_points.dedup();
 
-                                FunctionBody::Builtin
-                            } else {
-                                let cur_offset = usize::try_from(cur.offset)?;
-                                let next_offset = next
-                                    .as_ref()
-                                    .map(|n| usize::try_from(n.offset))
-                                    .unwrap_or(Ok(statements.len()))?;
+        let by_index = definitions
+            .iter()
+            .enumerate()
+            .map(|(index, def)| -> anyhow::Result<FunctionDef> {
+                let body = if def.offset < 0 {
+                    FunctionBody::Builtin
+                } else {
+                    let start = usize::try_from(def.offset)?;
+                    let end = entry_points
+                        .iter()
+                        .find(|offset| **offset > def.offset)
+                        .map(|offset| usize::try_from(*offset))
+                        .transpose()?
+                        .unwrap_or(statements.len());
 
-                                FunctionBody::Progs(QCFunctionBody {
-                                    locals: cur.locals.clone(),
-                                    statements: statements.subslice(cur_offset..next_offset),
-                                })
-                            },
-                        };
-
-                        Ok(((cur.offset, func_def.clone()), (cur.name.clone(), func_def)))
+                    if start > end || end > statements.len() {
+                        anyhow::bail!(
+                            "Function {:?} has an invalid body ({start}..{end})",
+                            def.name
+                        );
                     }
-                    (None, _) => unreachable!(),
-                }
+
+                    FunctionBody::Progs(QCFunctionBody {
+                        locals: def.locals.clone(),
+                        statements: statements.subslice(start..end),
+                    })
+                };
+
+                Ok(FunctionDef {
+                    index: index.try_into()?,
+                    offset: def.offset,
+                    name: def.name.clone(),
+                    source: def.source.clone(),
+                    args: def.args.iter().copied().map(Into::into).collect(),
+                    body,
+                })
             })
-            .collect::<anyhow::Result<(_, _)>>()?;
+            .collect::<anyhow::Result<Box<[_]>>>()?;
+
+        // If names are duplicated, the first definition wins.
+        let mut by_name = HashMap::default();
+        for def in by_index.iter() {
+            by_name.entry(def.name.clone()).or_insert(def.index);
+        }
 
         Ok(Self { by_index, by_name })
     }
@@ -308,7 +312,7 @@ impl FunctionRegistry {
         F: Into<FunctionRef>,
     {
         match func.into() {
-            FunctionRef::Offset(i) => self.get_by_index(i),
+            FunctionRef::Index(i) => self.get_by_index(i),
             FunctionRef::Name(name) => self.get_by_name(name),
         }
     }
@@ -321,8 +325,9 @@ impl FunctionRegistry {
     {
         let func = func.try_into()?;
 
-        self.by_index
-            .get(&func)
+        usize::try_from(func)
+            .ok()
+            .and_then(|index| self.by_index.get(index))
             .ok_or_else(|| anyhow::format_err!("Function {func} does not exist"))
     }
 
@@ -335,6 +340,12 @@ impl FunctionRegistry {
 
         self.by_name
             .get(func)
+            .and_then(|index| self.by_index.get(*index as usize))
             .ok_or_else(|| anyhow::format_err!("Function {func:?} does not exist"))
+    }
+
+    /// All functions, in `progs.dat` order.
+    pub fn iter(&self) -> impl Iterator<Item = &FunctionDef> {
+        self.by_index.iter()
     }
 }
