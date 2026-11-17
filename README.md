@@ -31,7 +31,8 @@ Values cross into and out of QuakeC as follows:
   necessarily UTF-8) and distinguishes the null string from other empty strings.
 - Functions defined by the `progs.dat` are references to a `QCFunction`, i.e. their index in the
   function table.
-- Field references (e.g. the field argument of Quake's `find`) are passed as their offset.
+- Field references (e.g. the field argument of Quake's `find`) are references to a `QCField`,
+  i.e. their offset.
 
 `OP_STATE` is implemented in terms of the `self` and `time` globals and the `nextthink`,
 `frame` and `think` fields.

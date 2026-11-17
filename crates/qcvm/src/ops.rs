@@ -211,6 +211,7 @@ where
                 Type::Function => Ok(self.get_scalar::<_, VmFunctionRef>(addr)?.into()),
                 Type::Float => Ok(self.get_scalar::<_, f32>(addr)?.into()),
                 Type::String => Ok(self.get_scalar::<_, StringRef>(addr)?.into()),
+                Type::Field => Ok(self.get_scalar::<_, FieldPtr>(addr)?.into()),
                 Type::Void => Ok(Default::default()),
             })
             .map(|value| match value {

@@ -16,6 +16,7 @@
 //! - Strings are references to a [`QCString`], which keeps QuakeC's (not necessarily UTF-8) bytes
 //!   and distinguishes the null string from other empty strings.
 //! - Functions defined by the `progs.dat` are references to a [`QCFunction`].
+//! - Field references are references to a [`QCField`].
 
 #![deny(missing_docs)]
 
@@ -167,6 +168,24 @@ impl QCFunction {
     /// Whether this is the null function.
     pub fn is_null(&self) -> bool {
         self.0 == 0
+    }
+}
+
+/// A reference to an entity field (QuakeC's `.float` etc.), by its offset (see
+/// [`qcvm::FieldRef`]). This is e.g. the field argument of Quake's `find`.
+#[derive(Reflect, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[reflect(Clone, Debug, PartialEq, Hash, Default)]
+pub struct QCField(pub u16);
+
+impl From<QCField> for qcvm::FieldRef {
+    fn from(value: QCField) -> Self {
+        Self { offset: value.0 }
+    }
+}
+
+impl From<qcvm::FieldRef> for QCField {
+    fn from(value: qcvm::FieldRef) -> Self {
+        Self(value.offset)
     }
 }
 
@@ -644,13 +663,15 @@ where
     }
 }
 
-/// The default [`ReflectToValue`], which handles [`QCString`], [`QCFunction`], [`Vec3`], `[f32; 3]`,
-/// `f32`, `f64` and `bool`.
+/// The default [`ReflectToValue`], which handles [`QCString`], [`QCFunction`], [`QCField`],
+/// [`Vec3`], `[f32; 3]`, `f32`, `f64` and `bool`.
 pub fn default_reflect_to_value(value: &dyn PartialReflect) -> Result<qcvm::Value, InteropError> {
     if let Some(s) = value.try_downcast_ref::<QCString>() {
         Ok(qcvm::Value::String(s.0.clone()))
     } else if let Some(f) = value.try_downcast_ref::<QCFunction>() {
         Ok(FunctionIndex(f.0).to_value())
+    } else if let Some(f) = value.try_downcast_ref::<QCField>() {
+        Ok(qcvm::Value::Field((*f).into()))
     } else if let Some(v) = value.try_downcast_ref::<Vec3>() {
         Ok(qcvm::Value::Vector(v.to_array().into()))
     } else if let Some(v) = value.try_downcast_ref::<[f32; 3]>() {
@@ -791,6 +812,9 @@ where
         ]))),
         qcvm::Value::String(cstr) => Ok(ScriptValue::Reference(ReflectReference::new_allocated(
             QCString(cstr.clone()),
+        ))),
+        qcvm::Value::Field(field) => Ok(ScriptValue::Reference(ReflectReference::new_allocated(
+            QCField::from(*field),
         ))),
     }
 }

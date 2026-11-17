@@ -188,6 +188,46 @@ pub enum Value {
     /// A refcounted string pointer. Quake strings are not strictly ascii, but cannot have internal
     /// `NUL`, so `CStr` is used.
     String(Arc<CStr>),
+    /// A reference to an entity field, e.g. the field argument of Quake's `find`.
+    Field(FieldRef),
+}
+
+/// A reference to an entity field (QuakeC's `.float` etc.), by its offset. The offset is the same
+/// as [`FieldDef::offset`], and the components of vector fields have their own offsets.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+pub struct FieldRef {
+    /// The offset of the field.
+    pub offset: u16,
+}
+
+impl FieldRef {
+    fn from_ptr(ptr: progs::Ptr) -> anyhow::Result<Self> {
+        Ok(Self {
+            offset: u16::try_from(ptr.0)
+                .map_err(|_| anyhow::format_err!("Invalid field reference {}", ptr.0))?,
+        })
+    }
+
+    fn to_ptr(self) -> progs::Ptr {
+        progs::Ptr(self.offset.into())
+    }
+}
+
+impl From<FieldRef> for Value {
+    fn from(value: FieldRef) -> Self {
+        Self::Field(value)
+    }
+}
+
+impl TryFrom<Value> for FieldRef {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Field(field) => Ok(field),
+            _ => anyhow::bail!("Expected {}, found {}", Type::Field, value.type_()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +282,7 @@ impl Value {
             Type::Vector => Value::Vector(Vec3::ZERO),
             Type::Float => Value::Float(0.),
             Type::String => Value::String(null_string()),
+            Type::Field => Value::Field(FieldRef::default()),
         }
     }
 
@@ -262,6 +303,7 @@ impl Value {
             Value::Float(_) => Type::Float,
             Value::Vector(_) => Type::Vector,
             Value::String(_) => Type::String,
+            Value::Field(_) => Type::Field,
         }
     }
 
@@ -420,6 +462,7 @@ impl TryFrom<Value> for VmScalar {
             // TODO: Just read x value?
             Value::Vector(_) => return Err(NotScalarError),
             Value::String(cstr) => VmScalar::String(StringRef::Temp(cstr)),
+            Value::Field(field) => VmScalar::Field(field.to_ptr()),
         })
     }
 }
@@ -490,6 +533,7 @@ impl From<Value> for VmValue {
             Value::Float(f) => f.into(),
             Value::Vector(vec3) => vec3.into(),
             Value::String(cstr) => VmValue::Scalar(VmScalar::String(StringRef::Temp(cstr))),
+            Value::Field(field) => VmValue::Scalar(VmScalar::Field(field.to_ptr())),
         }
     }
 }
@@ -797,6 +841,8 @@ pub enum Type {
     /// A refcounted string pointer. Quake strings are not strictly ascii, but cannot have internal
     /// `NUL`, so `CStr` is used.
     String,
+    /// A reference to an entity field, see [`FieldRef`].
+    Field,
 }
 
 impl Type {
@@ -813,7 +859,8 @@ impl Type {
                 | Type::Entity
                 | Type::Function
                 | Type::Float
-                | Type::String,
+                | Type::String
+                | Type::Field,
                 Type::AnyScalar,
             ) => true,
             (Type::Void, Type::Void) => true,
@@ -822,6 +869,7 @@ impl Type {
             (Type::Vector, Type::Vector) => true,
             (Type::Float, Type::Float) => true,
             (Type::String, Type::String) => true,
+            (Type::Field, Type::Field) => true,
             _ => false,
         }
     }
@@ -848,7 +896,8 @@ impl TryFrom<VmScalarType> for Type {
             VmScalarType::Float => Type::Float,
             VmScalarType::Entity => Type::Entity,
             VmScalarType::Function => Type::Function,
-            VmScalarType::FieldRef | VmScalarType::GlobalRef | VmScalarType::EntityFieldRef => {
+            VmScalarType::FieldRef => Type::Field,
+            VmScalarType::GlobalRef | VmScalarType::EntityFieldRef => {
                 anyhow::bail!("We don't support `{value}` in host bindings")
             }
         })
@@ -874,6 +923,7 @@ impl fmt::Display for Type {
             Type::Float => write!(f, "float"),
             Type::Vector => write!(f, "vector"),
             Type::String => write!(f, "string"),
+            Type::Field => write!(f, "field"),
         }
     }
 }
@@ -1172,7 +1222,7 @@ impl QCVm {
             VmScalar::String(s) => Value::String(self.progs.string_table.get(s)?),
             VmScalar::Function(VmFunctionRef::Ptr(ptr)) => FunctionIndex(ptr.0).to_value(),
             VmScalar::Function(VmFunctionRef::Extern(func)) => Value::Function(func),
-            VmScalar::Field(ptr) => Value::Float(ptr.0 as f32),
+            VmScalar::Field(ptr) => Value::Field(FieldRef::from_ptr(ptr)?),
             other @ (VmScalar::Global(_) | VmScalar::EntityField(..)) => {
                 anyhow::bail!(
                     "Values of type {} can't be passed to the host",
@@ -1642,9 +1692,7 @@ where
             VmValue::Scalar(VmScalar::Function(VmFunctionRef::Extern(func))) => {
                 Ok(Value::Function(func))
             }
-            // Field references are passed to the host as their offset, as Quake treats them as
-            // integers. This is how e.g. `find` gets the field to search.
-            VmValue::Scalar(VmScalar::Field(ptr)) => Ok(Value::Float(ptr.0 as f32)),
+            VmValue::Scalar(VmScalar::Field(ptr)) => Ok(Value::Field(FieldRef::from_ptr(ptr)?)),
             VmValue::Scalar(VmScalar::EntityField(..) | VmScalar::Global(_)) => anyhow::bail!(
                 "Values of type {} are unsupported as arguments to builtins",
                 vm_value.type_()
@@ -1837,11 +1885,8 @@ where
         let index = index.try_into()?;
         let value = value.into();
 
-        // Field references and pointers only exist inside the VM, so they can't be host globals.
-        if !matches!(
-            value,
-            VmScalar::Field(_) | VmScalar::Global(_) | VmScalar::EntityField(..)
-        ) {
+        // Pointers only exist inside the VM, so they can't be host globals.
+        if !matches!(value, VmScalar::Global(_) | VmScalar::EntityField(..)) {
             let host_value = self.to_value(value.clone().into())?;
             match self.context.dyn_set_global(index.try_into()?, host_value) {
                 Ok(()) => return Ok(()),

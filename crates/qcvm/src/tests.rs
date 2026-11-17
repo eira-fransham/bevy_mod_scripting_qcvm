@@ -11,8 +11,8 @@ use arrayvec::ArrayVec;
 use strum::VariantArray;
 
 use crate::{
-    Address, EmptyAddress, EntityRef, EntityTypeDef, FieldDef, FunctionIndex, GlobalDef, MAX_ARGS,
-    MissingArguments, QCVm, Type, Value, VectorField, VmOptions,
+    Address, EmptyAddress, EntityRef, EntityTypeDef, FieldDef, FieldRef, FunctionIndex, GlobalDef,
+    MAX_ARGS, MissingArguments, QCVm, Type, Value, VectorField, VmOptions,
     load::{LoadFn, Progs},
     ops::Opcode,
     progs::{
@@ -558,6 +558,11 @@ impl Context for TestContext {
             b"record" => builtin(&[Type::AnyScalar], |ctx, mut args| {
                 ctx.recorded.push(args.remove(0));
                 Value::Void
+            }),
+            // Records its argument, and returns it.
+            b"identity" => builtin(&[Type::AnyScalar], |ctx, args| {
+                ctx.recorded.push(args[0].clone());
+                args[0].clone()
             }),
             // Calls its argument from inside a builtin, as e.g. `walkmove` runs touch functions.
             b"callback" => builtin(&[Type::Function, Type::Float], |ctx, args| {
@@ -1202,8 +1207,42 @@ fn store_field_refs_and_pointers() {
     let mut ctx = TestContext::default();
     run(&vm, &mut ctx, main).unwrap();
     assert_eq!(ctx.fields[&(1, "float_field".into())], Value::Float(4.));
-    // Field references are passed to the host as their offset.
-    assert_eq!(ctx.recorded, [Value::Float(0.)]);
+    assert_eq!(ctx.recorded, [Value::Field(FieldRef { offset: 0 })]);
+}
+
+/// Field references can go to the host and back without losing their type.
+#[test]
+fn field_refs_round_trip_through_the_host() {
+    let mut p = Program::new();
+    let ent = p.entity("ent");
+    // Fill in the host's fields first, so that `speed` comes after them.
+    let _float_field = p.field("float_field", VmScalarType::Float);
+    let _vector_field = p.field("vector_field", VmType::Vector);
+    let speed = p.field("speed", VmScalarType::Float);
+    let identity = p.builtin("identity", &[ArgSize::Scalar]);
+    let identity_ptr = p.function_ptr(identity);
+    let field_global = p.global("field_global", VmScalarType::FieldRef, &[[0; 4]]);
+    let loaded = p.float("loaded", 0.);
+    let main = p.function("main", &[], 0, |_| {
+        vec![
+            stmt(O::StoreFld, speed, 4, 0),
+            stmt(O::Call1, identity_ptr, 0, 0),
+            stmt(O::StoreFld, 1, field_global, 0),
+            stmt(O::LoadF, ent, field_global, loaded),
+            stmt(O::Done, 0, 0, 0),
+        ]
+    });
+    let vm = p.build();
+    set_entity(&vm, ent, 1);
+
+    let mut ctx = TestContext::default();
+    ctx.dynamic.insert((1, "speed".into()), Value::Float(320.));
+    run(&vm, &mut ctx, main).unwrap();
+
+    let speed_ref = Value::Field(FieldRef { offset: 4 });
+    assert_eq!(ctx.recorded, [speed_ref.clone()]);
+    assert_eq!(vm.global(field_global).unwrap(), speed_ref);
+    assert_eq!(read_float(&vm, loaded), 320.);
 }
 
 /// QuakeC can be re-entered from inside a builtin, and the caller carries on afterwards.
