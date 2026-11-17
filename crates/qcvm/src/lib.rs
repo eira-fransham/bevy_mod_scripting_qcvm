@@ -28,7 +28,7 @@ use crate::{
         functions::{ArgSize, FunctionExecutionCtx, QCFunctionDef, Statement},
         globals::GlobalRegistry,
     },
-    userdata::{AddrError, ErasedContext, ErasedFunction, FnCall, QCType},
+    userdata::{AddrError, ErasedContext, ErasedFunction, QCType},
 };
 
 mod entity;
@@ -179,8 +179,8 @@ pub enum Value {
     Void,
     /// An entity reference. See documentation for `EntityRef` for more details.
     Entity(EntityRef),
-    /// A function pointer. This requires some context to call, see [`userdata::Function`].
-    Function(Arc<dyn ErasedFunction>),
+    /// A function pointer, see [`Function`].
+    Function(Function),
     /// A single scalar float.
     Float(f32),
     /// An `{x, y, z}` vector value.
@@ -190,6 +190,88 @@ pub enum Value {
     String(Arc<CStr>),
     /// A reference to an entity field, e.g. the field argument of Quake's `find`.
     Field(FieldRef),
+}
+
+/// A function value, as passed between QuakeC and the host.
+#[derive(Debug, Clone)]
+pub enum Function {
+    /// A function defined by the `progs.dat` (a QuakeC function or a builtin), by its index in the
+    /// function table. This is what QuakeC itself uses for function pointers, so these compare
+    /// equal to each other exactly when QuakeC's `==` would.
+    Index(FunctionIndex),
+    /// A function provided by the host that isn't in the `progs.dat`'s function table, which
+    /// QuakeC can store and call like any other function.
+    ///
+    /// These compare equal to each other according to the [`PartialEq`] implementation of the
+    /// host's function type (see [`userdata::DynEq`]), and never compare equal to
+    /// [`Function::Index`].
+    Host(Arc<dyn ErasedFunction>),
+}
+
+impl Function {
+    /// The null function.
+    pub const NULL: Self = Self::Index(FunctionIndex::NULL);
+
+    /// Whether this is the null function.
+    pub fn is_null(&self) -> bool {
+        match self {
+            Self::Index(index) => index.is_null(),
+            Self::Host(func) => func.is_null(),
+        }
+    }
+}
+
+impl PartialEq for Function {
+    fn eq(&self, other: &Self) -> bool {
+        VmFunctionRef::from(self.clone()) == VmFunctionRef::from(other.clone())
+    }
+}
+
+impl From<Function> for VmFunctionRef {
+    fn from(value: Function) -> Self {
+        match value {
+            Function::Index(index) => VmFunctionRef::Ptr(progs::Ptr(index.0)),
+            Function::Host(func) => VmFunctionRef::Extern(func),
+        }
+    }
+}
+
+impl From<VmFunctionRef> for Function {
+    fn from(value: VmFunctionRef) -> Self {
+        match value {
+            VmFunctionRef::Ptr(ptr) => Function::Index(FunctionIndex(ptr.0)),
+            VmFunctionRef::Extern(func) => Function::Host(func),
+        }
+    }
+}
+
+impl From<FunctionIndex> for Function {
+    fn from(value: FunctionIndex) -> Self {
+        Self::Index(value)
+    }
+}
+
+impl From<Arc<dyn ErasedFunction>> for Function {
+    fn from(value: Arc<dyn ErasedFunction>) -> Self {
+        Self::Host(value)
+    }
+}
+
+impl From<Function> for Value {
+    fn from(value: Function) -> Self {
+        Self::Function(value)
+    }
+}
+
+impl TryFrom<Value> for Function {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Function(func) => Ok(func),
+            _ => anyhow::bail!("Expected {}, found {}", Type::Function, value.type_()),
+        }
+    }
 }
 
 /// A reference to an entity field (QuakeC's `.float` etc.), by its offset. The offset is the same
@@ -278,7 +360,7 @@ impl Value {
         match ty {
             Type::AnyScalar | Type::Void => Value::Void,
             Type::Entity => Value::Entity(None),
-            Type::Function => FunctionIndex::NULL.to_value(),
+            Type::Function => Value::Function(Function::NULL),
             Type::Vector => Value::Vector(Vec3::ZERO),
             Type::Float => Value::Float(0.),
             Type::String => Value::String(null_string()),
@@ -400,7 +482,13 @@ impl TryFrom<Value> for ErasedEntityHandle {
 
 impl From<Arc<dyn ErasedFunction>> for Value {
     fn from(value: Arc<dyn ErasedFunction>) -> Self {
-        Self::Function(value)
+        Self::Function(Function::Host(value))
+    }
+}
+
+impl From<FunctionIndex> for Value {
+    fn from(value: FunctionIndex) -> Self {
+        Self::Function(Function::Index(value))
     }
 }
 
@@ -455,9 +543,7 @@ impl TryFrom<Value> for VmScalar {
         Ok(match value {
             Value::Void => VmScalar::Void,
             Value::Entity(entity_ref) => VmScalar::Entity(entity_ref),
-            Value::Function(erased_function) => {
-                VmScalar::Function(VmFunctionRef::Extern(erased_function).normalize())
-            }
+            Value::Function(func) => VmScalar::Function(func.into()),
             Value::Float(float) => VmScalar::Float(float),
             // TODO: Just read x value?
             Value::Vector(_) => return Err(NotScalarError),
@@ -483,8 +569,19 @@ impl TryFrom<Value> for Arc<dyn ErasedFunction> {
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            Value::Function(func) => Ok(func),
-            _ => anyhow::bail!("Expected {}, found {}", Type::Function, value.type_()),
+            Value::Function(Function::Host(func)) => Ok(func),
+            _ => anyhow::bail!("Expected a host function, found {value:?}"),
+        }
+    }
+}
+
+impl TryFrom<Value> for FunctionIndex {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Function(Function::Index(index)) => Ok(index),
+            _ => anyhow::bail!("Expected a function from the progs, found {value:?}"),
         }
     }
 }
@@ -527,9 +624,7 @@ impl From<Value> for VmValue {
         match value {
             Value::Void => VmValue::Scalar(VmScalar::Void),
             Value::Entity(entity_ref) => entity_ref.into(),
-            Value::Function(erased_function) => VmValue::Scalar(VmScalar::Function(
-                VmFunctionRef::Extern(erased_function).normalize(),
-            )),
+            Value::Function(func) => VmValue::Scalar(VmScalar::Function(func.into())),
             Value::Float(f) => f.into(),
             Value::Vector(vec3) => vec3.into(),
             Value::String(cstr) => VmValue::Scalar(VmScalar::String(StringRef::Temp(cstr))),
@@ -932,8 +1027,8 @@ impl fmt::Display for Type {
 /// function.
 ///
 /// This is how functions defined by the `progs.dat` (both QuakeC functions and builtins) are passed
-/// to the host, e.g. when QuakeC sets an entity's `think`. Calling it from the host runs the
-/// function it refers to.
+/// to the host (as [`Function::Index`]), e.g. when QuakeC sets an entity's `think`. To call it from
+/// the host, pass it to [`QCVm::run`] or [`userdata::FnCall::call`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct FunctionIndex(pub i32);
 
@@ -943,7 +1038,7 @@ impl FunctionIndex {
 
     /// Wraps this as a [`Value`].
     pub fn to_value(self) -> Value {
-        Value::Function(Arc::new(self))
+        Value::Function(Function::Index(self))
     }
 }
 
@@ -954,40 +1049,6 @@ impl QCType for FunctionIndex {
 
     fn is_null(&self) -> bool {
         self.0 == 0
-    }
-}
-
-impl ErasedFunction for FunctionIndex {
-    fn dyn_signature(&self) -> anyhow::Result<ArrayVec<Type, MAX_ARGS>> {
-        anyhow::bail!(
-            "The signature of function {} is only known to the VM",
-            self.0
-        )
-    }
-
-    fn dyn_call(&self, mut context: FnCall) -> anyhow::Result<Value> {
-        let def = context.execution.functions.get_by_index(self.0)?.clone();
-        let num_args = def.args.len();
-        let vm_value = match def.try_into_qc() {
-            Ok(quakec) => {
-                if let Some(passed) = context.execution.memory.local.num_args() {
-                    context.execution.check_num_args(
-                        &quakec,
-                        passed,
-                        CallSite::Host(quakec.index),
-                    )?;
-                }
-                context.execution.execute_def(&quakec)?
-            }
-            Err(builtin) => {
-                let func = context.execution.context.dyn_builtin(&builtin)?;
-                context
-                    .execution
-                    .enter_builtin(&builtin.name, &*func, num_args)?
-            }
-        };
-
-        context.execution.to_value(vm_value.try_into()?)
     }
 }
 
@@ -1220,8 +1281,7 @@ impl QCVm {
             VmScalar::Float(f) => Value::Float(f),
             VmScalar::Entity(ent) => Value::Entity(ent),
             VmScalar::String(s) => Value::String(self.progs.string_table.get(s)?),
-            VmScalar::Function(VmFunctionRef::Ptr(ptr)) => FunctionIndex(ptr.0).to_value(),
-            VmScalar::Function(VmFunctionRef::Extern(func)) => Value::Function(func),
+            VmScalar::Function(func) => Value::Function(func.into()),
             VmScalar::Field(ptr) => Value::Field(FieldRef::from_ptr(ptr)?),
             other @ (VmScalar::Global(_) | VmScalar::EntityField(..)) => {
                 anyhow::bail!(
@@ -1686,12 +1746,7 @@ where
             VmValue::Scalar(VmScalar::String(str)) => {
                 Ok(Value::String(self.string_table.get(str)?))
             }
-            VmValue::Scalar(VmScalar::Function(VmFunctionRef::Ptr(ptr))) => {
-                Ok(FunctionIndex(ptr.0).to_value())
-            }
-            VmValue::Scalar(VmScalar::Function(VmFunctionRef::Extern(func))) => {
-                Ok(Value::Function(func))
-            }
+            VmValue::Scalar(VmScalar::Function(func)) => Ok(Value::Function(func.into())),
             VmValue::Scalar(VmScalar::Field(ptr)) => Ok(Value::Field(FieldRef::from_ptr(ptr)?)),
             VmValue::Scalar(VmScalar::EntityField(..) | VmScalar::Global(_)) => anyhow::bail!(
                 "Values of type {} are unsupported as arguments to builtins",

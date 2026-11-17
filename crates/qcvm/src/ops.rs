@@ -268,7 +268,7 @@ where
 
                 let num_args = op as usize - O::Call0 as usize;
 
-                let result = match func_ref.normalize() {
+                let result = match func_ref {
                     VmFunctionRef::Ptr(p) => {
                         if p.is_null() {
                             anyhow::bail!("NULL function");

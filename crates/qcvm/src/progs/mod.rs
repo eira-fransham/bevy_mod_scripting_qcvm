@@ -16,7 +16,7 @@ use glam::Vec3;
 use num::FromPrimitive;
 use num_derive::FromPrimitive;
 
-use crate::{ErasedEntityHandle, FunctionIndex, entity::ScalarFieldDef, userdata::ErasedFunction};
+use crate::{ErasedEntityHandle, entity::ScalarFieldDef, userdata::ErasedFunction};
 
 static NULL_STRING: LazyLock<Arc<CStr>> = LazyLock::new(|| Arc::from(c""));
 
@@ -421,20 +421,6 @@ impl VmFunctionRef {
             Self::Extern(func) => func.is_null(),
         }
     }
-
-    /// Converts external references to QuakeC functions back to pointers, so that they compare
-    /// equal to other pointers to the same function.
-    pub fn normalize(self) -> Self {
-        match self {
-            Self::Extern(func) => {
-                match (&*func as &dyn std::any::Any).downcast_ref::<FunctionIndex>() {
-                    Some(index) => Self::Ptr(Ptr(index.0)),
-                    None => Self::Extern(func),
-                }
-            }
-            ptr @ Self::Ptr(_) => ptr,
-        }
-    }
 }
 
 impl Default for VmFunctionRef {
@@ -649,7 +635,7 @@ impl TryFrom<VmScalar> for VmFunctionRef {
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
             VmScalar::Void => Ok(Default::default()),
-            VmScalar::Function(f) => Ok(f.normalize()),
+            VmScalar::Function(f) => Ok(f),
             _ => Err(ScalarCastError {
                 expected: VmScalarType::Function,
                 found: value.type_(),

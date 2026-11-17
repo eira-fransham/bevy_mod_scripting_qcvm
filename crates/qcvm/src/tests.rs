@@ -566,13 +566,9 @@ impl Context for TestContext {
             }),
             // Calls its argument from inside a builtin, as e.g. `walkmove` runs touch functions.
             b"callback" => builtin(&[Type::Function, Type::Float], |ctx, args| {
-                let Value::Function(func) = &args[0] else {
-                    panic!("Expected a function, found {:?}", args[0]);
-                };
-                let index = (&**func as &dyn std::any::Any)
-                    .downcast_ref::<FunctionIndex>()
-                    .expect("QuakeC functions should be passed as `FunctionIndex`");
-                ctx.call(*index, (args[1].clone(),)).unwrap()
+                let index = FunctionIndex::try_from(args[0].clone())
+                    .expect("QuakeC functions should be passed as `Function::Index`");
+                ctx.call(index, (args[1].clone(),)).unwrap()
             }),
             b"hello" => builtin(&[], |_, _| Value::try_from("hello").unwrap()),
             // Accepts anything, for running real `progs.dat`s.
@@ -616,13 +612,7 @@ fn run_main(
 }
 
 fn function_index(value: &Value) -> i32 {
-    let Value::Function(func) = value else {
-        panic!("Expected a function, found {value:?}");
-    };
-    (&**func as &dyn std::any::Any)
-        .downcast_ref::<FunctionIndex>()
-        .expect("Expected a `FunctionIndex`")
-        .0
+    FunctionIndex::try_from(value.clone()).unwrap().0
 }
 
 // Tests ===========================================================================================
@@ -1010,6 +1000,34 @@ fn function_pointers_are_indices() {
         function_index(&vm.initial_global(double_ptr).unwrap()),
         double
     );
+}
+
+/// Functions passed through the host still compare equal to the same function in QuakeC (e.g.
+/// `self.think == SUB_Null` after the host has stored `think`).
+#[test]
+fn function_identity_survives_the_host() {
+    let mut p = Program::new();
+    let identity = p.builtin("identity", &[ArgSize::Scalar]);
+    let identity_ptr = p.function_ptr(identity);
+    let target = p.function("target", &[], 0, |_| vec![stmt(O::Done, 0, 0, 0)]);
+    let target_ptr = p.function_ptr(target);
+    let stored = p.global("stored", VmScalarType::Function, &[[0; 4]]);
+    let eq = p.float("eq", -1.);
+    let main = p.function("main", &[], 0, |_| {
+        vec![
+            stmt(O::StoreFnc, target_ptr, 4, 0),
+            stmt(O::Call1, identity_ptr, 0, 0),
+            stmt(O::StoreFnc, 1, stored, 0),
+            stmt(O::EqFnc, stored, target_ptr, eq),
+            stmt(O::Done, 0, 0, 0),
+        ]
+    });
+    let vm = p.build();
+
+    let mut ctx = TestContext::default();
+    run(&vm, &mut ctx, main).unwrap();
+    assert_eq!(ctx.recorded, [FunctionIndex(target).to_value()]);
+    assert_eq!(read_float(&vm, eq), 1.);
 }
 
 #[test]

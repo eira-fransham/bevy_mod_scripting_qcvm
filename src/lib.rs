@@ -759,10 +759,12 @@ where
             let world = thread_context()?.world;
             val.with_reflect(world, context.reflect_to_value)?
         }
-        ScriptValue::Function(func) => Ok(qcvm::Value::Function(Arc::new(BevyBuiltin::<G, F> {
-            func: func.clone(),
-            _phantom: PhantomData,
-        }))),
+        ScriptValue::Function(func) => Ok(qcvm::Value::Function(qcvm::Function::Host(Arc::new(
+            BevyBuiltin::<G, F> {
+                func: func.clone(),
+                _phantom: PhantomData,
+            },
+        )))),
         ScriptValue::Error(e) => Err(e.clone()),
         _ => Err(InteropError::NotImplemented),
     }
@@ -788,13 +790,12 @@ where
                 ReflectReference::new_component_ref::<QCEntity>(entity, world)?,
             ))
         }
-        qcvm::Value::Function(function) => {
+        qcvm::Value::Function(qcvm::Function::Index(index)) => Ok(ScriptValue::Reference(
+            ReflectReference::new_allocated(QCFunction(index.0)),
+        )),
+        qcvm::Value::Function(qcvm::Function::Host(function)) => {
             let function: &dyn Any = &**function;
-            if let Some(index) = function.downcast_ref::<FunctionIndex>() {
-                Ok(ScriptValue::Reference(ReflectReference::new_allocated(
-                    QCFunction(index.0),
-                )))
-            } else if let Some(builtin) = function.downcast_ref::<BevyBuiltin<G, F>>() {
+            if let Some(builtin) = function.downcast_ref::<BevyBuiltin<G, F>>() {
                 Ok(ScriptValue::Function(builtin.func.clone()))
             } else {
                 Err(InteropError::external_boxed(
