@@ -71,7 +71,7 @@ impl std::fmt::Display for ArgSize {
 ///
 /// Only the function's locals (including its arguments, see [`QCFunctionDef::frame_range`]) are
 /// stored per frame. Everything else, including the parameter slots that arguments are passed in,
-/// is global memory, as in Quake.
+/// is global memory.
 #[derive(Debug)]
 pub(crate) struct FunctionExecutionCtx<'a> {
     local_storage: FixedBumpVec<'a, VmScalar>,
@@ -125,7 +125,7 @@ impl FunctionExecutionCtx<'_> {
     /// Stores `value` if `index` is one of this frame's locals. Otherwise, gives the value back so
     /// that the caller can store it in global memory.
     ///
-    /// Storing `Void` is a real store (of zero), as in Quake: e.g. assigning an uninitialised
+    /// Storing `Void` is a real store (of zero), as in Quake: e.g. assigning an uninitialized
     /// temporary to a local must clear the local.
     pub fn try_set(&mut self, index: usize, value: VmScalar) -> Result<(), VmScalar> {
         if self.local_range.contains(&index) {
@@ -225,14 +225,7 @@ impl FunctionDef {
 }
 
 impl QCFunctionDef {
-    /// The addresses stored in this function's call frame: its locals, which start with its
-    /// arguments.
-    ///
-    /// `qcc` only counts locals up to the last `local` declaration, so functions that take
-    /// arguments but don't declare any locals (e.g. `ai_charge` in Quake) say that they have no
-    /// locals, even though their arguments are at the start of the locals. Quake copies arguments
-    /// there anyway, which puts them in global memory where a recursive call would overwrite them.
-    /// The frame covers them instead.
+    /// The addresses stored in this function's call frame.
     pub(crate) fn frame_range(&self) -> Range<usize> {
         let locals = &self.body.locals;
         let args_size = self
@@ -241,11 +234,13 @@ impl QCFunctionDef {
             .map(|arg| arg.arg_size() as usize)
             .sum::<usize>();
 
+        // `qcc` only counts locals up to the last `local` declaration, so functions that take
+        // arguments but don't declare any locals say that they have no locals. To handle this,
+        // we reserve at least enough space for the number of arguments.
         locals.start..locals.end.max(locals.start + args_size)
     }
 
-    /// Creates the call frame for this function. Locals start with their values from the
-    /// `progs.dat` (`initial_locals`), which is what Quake's save/restore of locals amounts to.
+    /// Creates the call frame for this function.
     pub(crate) fn ctx<'scope>(
         &self,
         mut alloc: impl BumpAllocatorScopeExt<'scope>,

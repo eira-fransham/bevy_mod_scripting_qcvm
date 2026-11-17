@@ -13,7 +13,7 @@ use crate::progs::{GlobalDef, VmScalar, VmScalarType, VmType};
 #[derive(Debug)]
 pub struct GlobalRegistry {
     defs: Box<[GlobalDef]>,
-    /// The values from the `progs.dat`, used to reset the globals and to initialise locals.
+    /// The values from the `progs.dat`, used to reset the globals and to initialize locals.
     initial: Box<[VmScalar]>,
     values: RwLock<Box<[VmScalar]>>,
 }
@@ -71,7 +71,7 @@ impl GlobalRegistry {
             .ok_or_else(|| anyhow::format_err!("Global {index} is out of range"))
     }
 
-    /// The initial values of a range of globals, used to initialise locals.
+    /// The initial values of a range of globals, used to initialize locals.
     pub fn initial_range(&self, range: std::ops::Range<usize>) -> anyhow::Result<&[VmScalar]> {
         self.initial.get(range.clone()).ok_or_else(|| {
             anyhow::format_err!("Globals {}..{} are out of range", range.start, range.end)

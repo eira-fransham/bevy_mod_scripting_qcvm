@@ -23,15 +23,14 @@ static NULL_STRING: LazyLock<Arc<CStr>> = LazyLock::new(|| Arc::from(c""));
 /// The null string.
 ///
 /// QuakeC distinguishes the null string (string ID 0, which is what unset fields and globals hold)
-/// from other empty strings: `if (s)` is false for the former but true for the latter. This crate
-/// represents strings as `Arc<CStr>`, so the null string is a specific, shared allocation. Hosts
-/// should use this value (rather than any empty string) for unset string fields, and compare with
-/// [`is_null_string`].
+/// from other empty strings: a string is only "truthy" (to borrow a JavaScript term) if it is the
+/// null string, _not_ if it is simply empty. Hosts should use this value (rather than any empty
+/// string) for unset string fields.
 pub fn null_string() -> Arc<CStr> {
     NULL_STRING.clone()
 }
 
-/// Returns `true` if `s` is the [`null_string`].
+/// Returns `true` if `s` is equal to [`null_string`].
 pub fn is_null_string(s: &Arc<CStr>) -> bool {
     Arc::ptr_eq(s, &NULL_STRING)
 }
@@ -154,7 +153,8 @@ pub enum VmScalarType {
     /// A pointer to a global
     GlobalRef = 7,
 
-    /// Fake type, only used internally
+    /// An entity field reference (field reference + the entity that it refers to)
+    // TODO: Only used in the address operation, is that even correct?
     EntityFieldRef = 255,
 }
 
@@ -709,7 +709,8 @@ const _: [(); 24] = [(); std::mem::size_of::<VmScalar>()];
 impl VmScalar {
     /// Whether this value is all zero bits, which is what `OP_IF`/`OP_IFNOT` test.
     ///
-    /// Note that this means that `-0.0` is _not_ null, as in Quake.
+    /// Note that this means that `-0.0` is _not_ null. This is unintuitive but
+    /// matches Quake's behavior.
     pub fn is_null(&self) -> bool {
         match self {
             VmScalar::Void => true,

@@ -773,7 +773,7 @@ fn entity_comparisons() {
     assert_eq!(read_float(&vm, not_e1), 0.);
 }
 
-/// `IF`/`IFNOT` test the raw bits of their argument, as in Quake.
+/// `IF`/`IFNOT` test the raw bits of their argument.
 #[test]
 fn truthiness() {
     let mut p = Program::new();
@@ -1079,7 +1079,7 @@ fn mutable_mod_globals() {
     assert_eq!(read_float(&vm, counter), 10.);
 }
 
-/// Storing `void` (e.g. an uninitialised temporary) is a store of zero.
+/// Storing `void` (e.g. an uninitialized temporary) is a store of zero.
 #[test]
 fn void_stores() {
     let mut p = Program::new();
@@ -1559,7 +1559,7 @@ fn missing_arguments_error_by_default() {
 }
 
 /// With [`MissingArguments::Stale`], parameter slots are global memory, so a function called with
-/// fewer arguments than it takes gets the values left by the previous call, as in Quake.
+/// fewer arguments than it takes gets the values left by the previous call.
 #[test]
 fn missing_arguments_use_stale_parameters_in_compat() {
     let (vm, [set_param, call_without_args], out) = missing_arguments_program(VmOptions {

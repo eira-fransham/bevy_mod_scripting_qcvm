@@ -69,8 +69,7 @@ where
     /// The inner config for the plugin
     pub scripting_plugin: ScriptingPlugin<QCScriptingPlugin<GlobalAddr, FieldAddr>>,
     /// The options that `progs.dat`s are loaded with (and reloaded with). The defaults are
-    /// strict; see [`qcvm::VmOptions`] for the Quake behaviours that can be enabled to run buggy
-    /// QuakeC.
+    /// strict; see [`qcvm::VmOptions`].
     pub vm_options: qcvm::VmOptions,
 }
 

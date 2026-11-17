@@ -294,11 +294,8 @@ fn scalar_to_value(scalar: VmScalar, strings: &StringTable) -> anyhow::Result<Va
 
 /// The value returned by a function, e.g. from [`QCVm::run`].
 ///
-/// `OP_RETURN` always copies three scalars to the return slots, and the `progs.dat` doesn't record
-/// what type functions return. So, as in Quake (where the engine reads `OFS_RETURN` as whatever type
-/// it expects), the caller says how to read the value, using the typed accessors or
-/// [`ReturnValue::get`]. Functions that don't return anything return `void`, which reads as the
-/// zero value of any type.
+/// QuakeC always returns 3 values, but those values are untyped and aren't
+/// even guaranteed to be valid.
 #[derive(Debug, Clone)]
 pub struct ReturnValue<'a> {
     scalars: [VmScalar; 3],
@@ -352,27 +349,28 @@ impl<'a> ReturnValue<'a> {
         FieldRef::from_ptr(ptr)
     }
 
-    /// Reads the return value as a scalar of whatever type it is, i.e. ignores the second and third
-    /// scalars.
+    /// Reads the first component of the return value as a simple scalar.
     pub fn scalar(&self) -> anyhow::Result<Value> {
         scalar_to_value(self.first(), self.strings)
     }
 }
 
 /// Types that a [`ReturnValue`] can be read as, see [`ReturnValue::get`].
+///
+/// Basically just an alias for [`TryFrom`] to make the lifetimes less hairy
+/// to annotate.
 pub trait FromReturnValue: Sized {
     /// Reads `value` as this type.
     fn from_return_value(value: &ReturnValue<'_>) -> anyhow::Result<Self>;
 }
 
-/// Ignores the return value, so this never fails.
 impl FromReturnValue for () {
     fn from_return_value(_: &ReturnValue<'_>) -> anyhow::Result<Self> {
+        // For void returns, the return value can be ignored entirely.
         Ok(())
     }
 }
 
-/// See [`ReturnValue::scalar`].
 impl FromReturnValue for Value {
     fn from_return_value(value: &ReturnValue<'_>) -> anyhow::Result<Self> {
         value.scalar()
@@ -400,8 +398,9 @@ impl_from_return_value!(
     FieldRef => field,
 );
 
-/// A reference to an entity field (QuakeC's `.float` etc.), by its offset. The offset is the same
-/// as [`FieldDef::offset`], and the components of vector fields have their own offsets.
+/// A reference to an entity field, without the entity that it references.
+///
+/// For a reference to a field on a specific entity, see [`progs::EntityField`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct FieldRef {
     /// The offset of the field.
@@ -452,7 +451,7 @@ mod test_value {
 pub enum TryScalarError {
     /// Tried to get a field of a scalar (other than `.x`)
     FieldOfScalar {
-        /// The field that we attempted to get (see documentation for [`VectorField`]).
+        /// The field that we attempted to get (see [`VectorField`]).
         field: VectorField,
     },
     /// Tried to get an entire vector as a scalar
@@ -466,7 +465,7 @@ pub enum TryScalarError {
 pub enum SetValueError {
     /// Tried to set a vector field, but the value was not a vector.
     NoSuchField {
-        /// The field that we attempted to set (see documentation for [`VectorField`]).
+        /// The field that we attempted to set (see [`VectorField`]).
         field: VectorField,
     },
     /// Tried to set a vector field to a value other than float.
@@ -480,8 +479,7 @@ pub enum SetValueError {
 }
 
 impl Value {
-    /// The zero value of a type, which is what QuakeC's `void` (e.g. an uninitialised value)
-    /// means when stored somewhere of that type.
+    /// The zero/default value for a given type.
     pub fn zero(ty: Type) -> Self {
         match ty {
             Type::AnyScalar | Type::Void => Value::Void,
@@ -515,9 +513,9 @@ impl Value {
         }
     }
 
-    /// Get a field of the value, if it's a vector. Passing `None` will just clone the value
-    /// (this is useful for generic code using `VectorField` to optionally convert a type into
-    /// a scalar).
+    /// Get a field of the value, if it's a vector.
+    // TODO: This is basically the same as `field` but for internal use only, and the
+    // implementations overlap. We can probably do this better.
     pub(crate) fn try_scalar(&self, field: VectorField) -> Result<VmScalar, TryScalarError> {
         self.field(field)?
             .try_into()
@@ -539,9 +537,8 @@ impl Value {
         })
     }
 
-    /// Clone the source value to this value, with an optional field reference. Useful to implement
-    /// [`userdata::EntityHandle::set`], as sometimes QuakeC only wants to set a single field of a
-    /// vector.
+    /// Set a field of this type, if possible. If this value is a scalar and `field` is
+    /// not `XOrScalar`, return an error.
     pub fn set(&mut self, field: VectorField, value: Value) -> Result<(), SetValueError> {
         match (self, field.into(), value) {
             (this, VectorField::XOrScalar, value) => *this = value,
@@ -999,8 +996,9 @@ impl QCMemory for RawArgs {
             return Ok(None);
         };
 
-        // Parameters that weren't passed (e.g. the unused arguments of variadic builtins) are
-        // `void`, rather than whatever was left in the parameter slots.
+        // We are stricter than vanilla Quake here and try not to leave parameters
+        // lying around, but because of a bug in the vanilla `progs.dat` we need
+        // to optionally support the non-strict behaviour.
         Ok(function_args()
             .find_map(|arg| arg.try_match_scalar(index))
             .map(|(arg_index, ofs)| {
@@ -1174,14 +1172,16 @@ pub const MAX_OPS_SINGLE_CALL: u32 = 100_000;
 /// The maximum depth of nested QuakeC function calls (see `MAX_STACK_DEPTH` in Quake).
 pub const MAX_CALL_DEPTH: usize = 32;
 
-/// Options chosen when the VM is initialised, see [`QCVm::load_with_options`].
-///
-/// The defaults are strict, so that bugs in QuakeC are errors. Some of the original QuakeC
-/// (e.g. Quake's `id1/progs.dat`) is buggy and only works because of quirks of Quake's VM, so
-/// hosts that need to run it unmodified can opt into those quirks here.
+/// Options chosen when the VM is initialized, see [`QCVm::load_with_options`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VmOptions {
     /// What happens when a QuakeC function is called with fewer arguments than it takes.
+    ///
+    /// Vanilla Quake's QuakeC relies on the buggy behavior of the vanilla VM, where subsequent
+    /// function calls may reuse arguments from previous calls if called with fewer arguments
+    /// than expected. By default, passing too few arguments is an error, but for compatibility
+    /// reasons setting this to [`MissingArguments::Stale`] will emulate the buggy vanilla
+    /// behavior
     pub missing_arguments: MissingArguments,
 }
 
@@ -1193,14 +1193,11 @@ pub struct VmOptions {
 /// allowed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MissingArguments {
-    /// Calling a QuakeC function with fewer arguments than it takes is an error.
+    /// Calling a function with fewer arguments than it takes is an error.
     #[default]
     Error,
-    /// Quake's behaviour: missing arguments are whatever was left in the parameter slots.
-    ///
-    /// Parameter slots are global memory, so this is the value of that argument in the last call
-    /// (to any function) that passed it. For example, `ogre_smash12` in Quake calls `ai_charge()`
-    /// without its argument. A warning is logged the first time each call site does this.
+    /// Vanilla Quake's behavior: missing arguments are whatever was left in the parameter slots
+    /// from previous calls.
     Stale,
 }
 
@@ -1359,7 +1356,7 @@ impl QCVm {
     }
 
     /// The value of the global at `addr` as specified in the `progs.dat`. Hosts that store globals
-    /// themselves (i.e. those defined by `progdefs.h`, such as `StartFrame`) should initialise them
+    /// themselves (i.e. those defined by `progdefs.h`, such as `StartFrame`) should initialize them
     /// with this.
     pub fn initial_global(&self, addr: u16) -> anyhow::Result<Value> {
         let scalar = self.progs.globals.initial(addr.into())?.clone();
@@ -1852,7 +1849,7 @@ where
     Alloc: ScopedAlloc,
     Caller: fmt::Debug + QCMemory<Scalar = Option<VmScalar>>,
 {
-    /// Runs a function from the host, returning the scalars in the return slots.
+    /// Run a function.
     pub fn execute<F>(&mut self, function: F) -> anyhow::Result<[VmScalar; 3]>
     where
         F: Into<FunctionRef>,
@@ -1877,8 +1874,7 @@ where
         Ok(out)
     }
 
-    /// Runs a QuakeC function. Its arguments are copied from the current frame's parameters, as the
-    /// `OP_CALL*` opcodes do.
+    /// Run a QuakeC function.
     // TODO: We can use the unsafe checkpoint API if just recursing becomes too slow.
     pub fn execute_def(&mut self, function: &QCFunctionDef) -> anyhow::Result<[VmScalar; 3]> {
         let Self {
@@ -2048,7 +2044,7 @@ where
     /// at a given time.
     ///
     /// This can't be done with the regular `set` as this shouldn't be accessible by regular
-    /// QuakeC code, only from the engine.
+    /// QuakeC code, only from the VM.
     pub fn set_return(&mut self, values: [VmScalar; 3]) {
         self.memory.last_ret = Some(values);
     }
