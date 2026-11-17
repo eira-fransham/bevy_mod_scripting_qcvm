@@ -14,39 +14,19 @@ for basic usage of that library.
 
 The namespaces used are:
 
-- `QCWorldspawn` - builtin functions are registered in this namespace, and are looked up
-  using the name defined in the loaded `progs.dat`. Globals are accessed through the `get` and
-  `set` magic functions on a reference to the `QCWorldspawn` component, by name. The intention
-  is that the world is an entity with the script attached, rather than a resource.
-- `QCEntity` - fields are accessed through the `get` and `set` magic functions on a reference
-  to the `QCEntity` component, by name. Fields defined by the `progs.dat` rather than the field
-  address type (e.g. `pos1` in Quake) use their name from the `progs.dat`, and the components of
-  vector fields are `{name}_x` etc.
+- `QCBuiltin` - builtin functions will be looked up here, using the name defined
+  in the loaded `progs.dat`.
+- `QCWorldspawn` - globals will be looked up here using the `get` and `set` magic
+  functions, by name. The intention is that the world is an entity with the script
+  attached, rather than a resource, although this may change in the future.
+- `QCEntity` - globals will be looked up here using the `get` and `set` magic
+  functions, by name. The intention is that different fields will access different
+  components, for example the `origin` field can access the [`Transform`](https://docs.rs/bevy/latest/bevy/transform/components/struct.Transform.html)
+  component.
 
-Values cross into and out of QuakeC as follows:
-
-- Floats are `ScriptValue::Float` and vectors are a `ScriptValue::List` of three floats.
-- Entities are references to their `QCEntity` component (worldspawn included).
-- Strings are references to a `QCString`, which keeps the raw bytes (Quake strings aren't
-  necessarily UTF-8) and distinguishes the null string from other empty strings.
-- Functions defined by the `progs.dat` are references to a `QCFunction`, i.e. their index in the
-  function table.
-- Field references (e.g. the field argument of Quake's `find`) are references to a `QCField`,
-  i.e. their offset.
-
-`OP_STATE` is implemented in terms of the `self` and `time` globals and the `nextthink`,
-`frame` and `think` fields.
-
-To call QuakeC from Rust, including from inside a builtin, use `QCVmContext::call_with_world`.
-The `progs.dat` doesn't say what type functions return, so the caller chooses what to read the
-return value as (`()` to ignore it). For the same reason, callbacks run through
-`bevy_mod_scripting` always return `ScriptValue::Unit`.
-
-`progs.dat`s are loaded with `QCScriptingPlugin::vm_options` (a `qcvm::VmOptions`, also available
-as the `QCVmOptions` resource), and reloaded with the options they were loaded with. The defaults
-are strict, so that bugs in QuakeC are errors. Some of the original Quake QuakeC is buggy and relies
-on quirks of Quake's VM, so to run it unmodified, opt into those quirks, e.g.
-`MissingArguments::Stale` for functions called with fewer arguments than they take.
+`qcvm` uses a separate mechanism for `OP_STATE`, intended to be implemented by the
+host. At this time, `bevy_mod_scripting_qcvm` does not provide any way to configure
+this implementation, so any use of that opcode will simply cause an error.
 
 ## Sources
 
