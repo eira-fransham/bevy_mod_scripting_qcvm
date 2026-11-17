@@ -876,15 +876,19 @@ impl QCVmContext {
     /// functions from a movement builtin), as it doesn't go through `bevy_mod_scripting`'s context
     /// handling: it creates a fresh world access guard for `world`, which is used by field and
     /// global accessors and builtins until this returns.
-    pub fn call_with_world<G, F>(
+    ///
+    /// The progs don't say what type functions return, so the return value is read as `R` (see
+    /// [`qcvm::ReturnValue`]). Use `()` to ignore it, which never fails.
+    pub fn call_with_world<G, F, R>(
         &self,
         world: &mut World,
         function: impl Into<FunctionRef>,
         args: impl QCParams,
-    ) -> Result<qcvm::Value, InteropError>
+    ) -> Result<R, InteropError>
     where
         G: Address,
         F: Address,
+        R: qcvm::FromReturnValue,
     {
         let cache = <WorldGuard<'_> as WorldExtensions>::setup_cache(
             world,
@@ -894,6 +898,7 @@ impl QCVmContext {
             let mut context = BevyScriptContext::<G, F>::new(self.clone());
             self.vm
                 .run(&mut context, function, args)
+                .and_then(|ret| ret.get())
                 .map_err(qc_interop_error)
         })
     }
@@ -988,7 +993,8 @@ where
             let mut script_context = BevyScriptContext::<G, F>::new(context.clone());
             script_context.special_args = special_args;
 
-            let val = context
+            // The progs don't say what type callbacks return, so their return values are ignored.
+            context
                 .vm
                 .run(
                     &mut script_context,
@@ -1001,7 +1007,7 @@ where
                 )
                 .map_err(qc_interop_error)?;
 
-            qcvm_to_bms::<G, F>(&val, context)
+            Ok(ScriptValue::Unit)
         }
 
         qc_callback_handler::<GlobalAddr, FieldAddr>

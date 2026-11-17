@@ -14,8 +14,8 @@ use snafu::Snafu;
 
 use crate::{
     Address, AsErasedContext, BuiltinDef, EntityRef, EntityTypeDef, ErasedEntityHandle,
-    ExecutionCtx, FieldDef, FunctionRef, MAX_ARGS, QCMemory, QCParams, Type, Value, VectorField,
-    VmType, function_args, progs::VmValue,
+    ExecutionCtx, FieldDef, FunctionRef, MAX_ARGS, QCMemory, QCParams, ReturnValue, Type, Value,
+    VectorField, VmType, function_args, progs::VmValue,
 };
 
 type ErasedAddr = u16;
@@ -469,7 +469,7 @@ where
     T: ErasedContext,
 {
     /// Call a QuakeC function by index or name.
-    pub fn call<A, F>(&mut self, function_ref: F, args: A) -> anyhow::Result<Value>
+    pub fn call<A, F>(&mut self, function_ref: F, args: A) -> anyhow::Result<ReturnValue<'a>>
     where
         F: Into<FunctionRef>,
         A: QCParams,
@@ -484,11 +484,14 @@ where
                 anyhow::format_err!("Function {:?} is not a QuakeC function", def.name)
             })?;
 
-        self.execution
+        let strings = self.execution.string_table;
+        let scalars = self
+            .execution
             .with_args(&function_def.name, args, |mut exec| {
-                let ret = exec.execute_def(&function_def)?.try_into()?;
-                exec.to_value(ret)
-            })
+                exec.execute_def(&function_def)
+            })?;
+
+        Ok(ReturnValue::new(scalars, strings))
     }
 }
 

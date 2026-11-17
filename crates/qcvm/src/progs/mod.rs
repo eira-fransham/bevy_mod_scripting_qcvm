@@ -816,41 +816,12 @@ impl From<Vec3> for VmValue {
     }
 }
 
-impl TryFrom<[VmScalar; 3]> for VmValue {
-    type Error = ScalarCastError;
-
-    /// Interprets a function's return value. `OP_RETURN` always copies three scalars, but QuakeC
-    /// doesn't record functions' return types, so if the second and third scalars aren't both
-    /// floats we assume that this is a scalar.
-    fn try_from(value: [VmScalar; 3]) -> Result<Self, Self::Error> {
-        let is_float = |s: &VmScalar| matches!(s, VmScalar::Float(_) | VmScalar::Void);
-        match value {
-            [scalar, VmScalar::Void, VmScalar::Void] => Ok(VmValue::Scalar(scalar)),
-            [x, y, z] if is_float(&x) && is_float(&y) && is_float(&z) => Ok(VmValue::Vector([
-                x.try_into()?,
-                y.try_into()?,
-                z.try_into()?,
-            ])),
-            [scalar, _, _] => Ok(VmValue::Scalar(scalar)),
-        }
-    }
-}
-
 impl<T> From<T> for VmValue
 where
     T: Into<VmScalar>,
 {
     fn from(value: T) -> Self {
         Self::Scalar(value.into())
-    }
-}
-
-impl VmValue {
-    pub fn type_(&self) -> VmType {
-        match self {
-            Self::Scalar(scalar) => VmType::Scalar(scalar.type_()),
-            Self::Vector(_) => VmType::Vector,
-        }
     }
 }
 

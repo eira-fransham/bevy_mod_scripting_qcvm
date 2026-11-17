@@ -38,6 +38,9 @@ Values cross into and out of QuakeC as follows:
 `frame` and `think` fields.
 
 To call QuakeC from Rust, including from inside a builtin, use `QCVmContext::call_with_world`.
+The `progs.dat` doesn't say what type functions return, so the caller chooses what to read the
+return value as (`()` to ignore it). For the same reason, callbacks run through
+`bevy_mod_scripting` always return `ScriptValue::Unit`.
 
 `progs.dat`s are loaded with `QCScriptingPlugin::vm_options` (a `qcvm::VmOptions`, also available
 as the `QCVmOptions` resource), and reloaded with the options they were loaded with. The defaults

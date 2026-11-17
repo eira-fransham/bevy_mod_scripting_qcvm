@@ -12,7 +12,7 @@ use strum::VariantArray;
 
 use crate::{
     Address, EmptyAddress, EntityRef, EntityTypeDef, FieldDef, FieldRef, FunctionIndex, GlobalDef,
-    MAX_ARGS, MissingArguments, QCVm, Type, Value, VectorField, VmOptions,
+    MAX_ARGS, MissingArguments, QCVm, ReturnValue, Type, Value, VectorField, VmOptions,
     load::{LoadFn, Progs},
     ops::Opcode,
     progs::{
@@ -568,7 +568,10 @@ impl Context for TestContext {
             b"callback" => builtin(&[Type::Function, Type::Float], |ctx, args| {
                 let index = FunctionIndex::try_from(args[0].clone())
                     .expect("QuakeC functions should be passed as `Function::Index`");
-                ctx.call(index, (args[1].clone(),)).unwrap()
+                ctx.call(index, (args[1].clone(),))
+                    .unwrap()
+                    .scalar()
+                    .unwrap()
             }),
             b"hello" => builtin(&[], |_, _| Value::try_from("hello").unwrap()),
             // Accepts anything, for running real `progs.dat`s.
@@ -594,7 +597,11 @@ impl Context for TestContext {
     }
 }
 
-fn run(vm: &QCVm, ctx: &mut TestContext, function: i32) -> anyhow::Result<Value> {
+fn run<'vm>(
+    vm: &'vm QCVm,
+    ctx: &mut TestContext,
+    function: i32,
+) -> anyhow::Result<ReturnValue<'vm>> {
     vm.run(ctx, function, ())
 }
 
@@ -603,11 +610,11 @@ fn run_main(
     program: Program,
     body: Vec<Statement>,
     ctx: &mut TestContext,
-) -> (QCVm, anyhow::Result<Value>) {
+) -> (QCVm, anyhow::Result<()>) {
     let mut program = program;
     let main = program.function("main", &[], 0, |_| body);
     let vm = program.build();
-    let result = run(&vm, ctx, main);
+    let result = run(&vm, ctx, main).map(|_| ());
     (vm, result)
 }
 
@@ -989,11 +996,11 @@ fn function_pointers_are_indices() {
     let value = vm
         .run(&mut TestContext::default(), double, (4f32,))
         .unwrap();
-    assert_eq!(value, Value::Float(8.));
+    assert_eq!(value.float().unwrap(), 8.);
     let value = vm
         .run(&mut TestContext::default(), c"double", (5f32,))
         .unwrap();
-    assert_eq!(value, Value::Float(10.));
+    assert_eq!(value.get::<f32>().unwrap(), 10.);
 
     // The initial values of function globals are exposed as indices.
     assert_eq!(
@@ -1258,7 +1265,7 @@ fn field_refs_round_trip_through_the_host() {
     run(&vm, &mut ctx, main).unwrap();
 
     let speed_ref = Value::Field(FieldRef { offset: 4 });
-    assert_eq!(ctx.recorded, [speed_ref.clone()]);
+    assert_eq!(ctx.recorded, std::slice::from_ref(&speed_ref));
     assert_eq!(vm.global(field_global).unwrap(), speed_ref);
     assert_eq!(read_float(&vm, loaded), 320.);
 }
@@ -1369,10 +1376,39 @@ fn scalar_return_values() {
     let vm = p.build();
 
     let value = run(&vm, &mut TestContext::default(), get_text).unwrap();
-    assert_eq!(value, Value::try_from("foo").unwrap());
+    assert_eq!(&*value.string().unwrap(), c"foo");
+    assert_eq!(value.scalar().unwrap(), Value::try_from("foo").unwrap());
     // Builtins can be run directly too.
     let value = run(&vm, &mut TestContext::default(), hello).unwrap();
-    assert_eq!(value, Value::try_from("hello").unwrap());
+    assert_eq!(&*value.string().unwrap(), c"hello");
+    // Reading the return value as the wrong type is an error, but ignoring it never is.
+    assert!(value.float().is_err());
+    value.get::<()>().unwrap();
+}
+
+/// The caller says how to read a return value, so a float returned from a temporary is read as a
+/// float even when the temporaries after it also hold floats (so all three return scalars do).
+#[test]
+fn float_return_values_next_to_floats() {
+    let mut p = Program::new();
+    let one = p.float("one", 1.);
+    let two = p.float("two", 2.);
+    let (tmp, next, next2) = (900, 901, 902);
+    let get_float = p.function("get_float", &[], 0, |_| {
+        vec![
+            stmt(O::AddF, one, two, tmp),
+            stmt(O::AddF, one, one, next),
+            stmt(O::AddF, two, two, next2),
+            stmt(O::Return, tmp, 0, 0),
+        ]
+    });
+    let vm = p.build();
+
+    let value = run(&vm, &mut TestContext::default(), get_float).unwrap();
+    assert_eq!(value.float().unwrap(), 3.);
+    assert_eq!(value.scalar().unwrap(), Value::Float(3.));
+    // Read as a vector, it's the return slots as Quake would see them.
+    assert_eq!(value.vector().unwrap(), glam::Vec3::new(3., 2., 4.));
 }
 
 /// Loads the real `progs.dat` from the path in `QCVM_PROGS`. If it isn't set, the test is skipped.

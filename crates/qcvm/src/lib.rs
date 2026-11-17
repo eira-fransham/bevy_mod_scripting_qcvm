@@ -274,6 +274,132 @@ impl TryFrom<Value> for Function {
     }
 }
 
+/// Converts a scalar from the VM to a host value.
+fn scalar_to_value(scalar: VmScalar, strings: &StringTable) -> anyhow::Result<Value> {
+    Ok(match scalar {
+        VmScalar::Void => Value::Void,
+        VmScalar::Float(f) => Value::Float(f),
+        VmScalar::Entity(ent) => Value::Entity(ent),
+        VmScalar::String(s) => Value::String(strings.get(s)?),
+        VmScalar::Function(func) => Value::Function(func.into()),
+        VmScalar::Field(ptr) => Value::Field(FieldRef::from_ptr(ptr)?),
+        other @ (VmScalar::Global(_) | VmScalar::EntityField(..)) => {
+            anyhow::bail!(
+                "Values of type {} can't be passed to the host",
+                other.type_()
+            )
+        }
+    })
+}
+
+/// The value returned by a function, e.g. from [`QCVm::run`].
+///
+/// `OP_RETURN` always copies three scalars to the return slots, and the `progs.dat` doesn't record
+/// what type functions return. So, as in Quake (where the engine reads `OFS_RETURN` as whatever type
+/// it expects), the caller says how to read the value, using the typed accessors or
+/// [`ReturnValue::get`]. Functions that don't return anything return `void`, which reads as the
+/// zero value of any type.
+#[derive(Debug, Clone)]
+pub struct ReturnValue<'a> {
+    scalars: [VmScalar; 3],
+    strings: &'a StringTable,
+}
+
+impl<'a> ReturnValue<'a> {
+    fn new(scalars: [VmScalar; 3], strings: &'a StringTable) -> Self {
+        Self { scalars, strings }
+    }
+
+    fn first(&self) -> VmScalar {
+        self.scalars[0].clone()
+    }
+
+    /// Reads the return value as `R`.
+    pub fn get<R: FromReturnValue>(&self) -> anyhow::Result<R> {
+        R::from_return_value(self)
+    }
+
+    /// Reads the return value as a float.
+    pub fn float(&self) -> anyhow::Result<f32> {
+        Ok(self.first().try_into()?)
+    }
+
+    /// Reads the return value as a vector.
+    pub fn vector(&self) -> anyhow::Result<Vec3> {
+        let [x, y, z] = self.scalars.clone().map(f32::try_from);
+        Ok(Vec3::new(x?, y?, z?))
+    }
+
+    /// Reads the return value as an entity.
+    pub fn entity(&self) -> anyhow::Result<EntityRef> {
+        Ok(self.first().try_into()?)
+    }
+
+    /// Reads the return value as a string.
+    pub fn string(&self) -> anyhow::Result<Arc<CStr>> {
+        let string: StringRef = self.first().try_into()?;
+        self.strings.get(string)
+    }
+
+    /// Reads the return value as a function.
+    pub fn function(&self) -> anyhow::Result<Function> {
+        Ok(VmFunctionRef::try_from(self.first())?.into())
+    }
+
+    /// Reads the return value as a field reference.
+    pub fn field(&self) -> anyhow::Result<FieldRef> {
+        let progs::FieldPtr(ptr) = self.first().try_into()?;
+        FieldRef::from_ptr(ptr)
+    }
+
+    /// Reads the return value as a scalar of whatever type it is, i.e. ignores the second and third
+    /// scalars.
+    pub fn scalar(&self) -> anyhow::Result<Value> {
+        scalar_to_value(self.first(), self.strings)
+    }
+}
+
+/// Types that a [`ReturnValue`] can be read as, see [`ReturnValue::get`].
+pub trait FromReturnValue: Sized {
+    /// Reads `value` as this type.
+    fn from_return_value(value: &ReturnValue<'_>) -> anyhow::Result<Self>;
+}
+
+/// Ignores the return value, so this never fails.
+impl FromReturnValue for () {
+    fn from_return_value(_: &ReturnValue<'_>) -> anyhow::Result<Self> {
+        Ok(())
+    }
+}
+
+/// See [`ReturnValue::scalar`].
+impl FromReturnValue for Value {
+    fn from_return_value(value: &ReturnValue<'_>) -> anyhow::Result<Self> {
+        value.scalar()
+    }
+}
+
+macro_rules! impl_from_return_value {
+    ($($t:ty => $method:ident),* $(,)?) => {
+        $(
+            impl FromReturnValue for $t {
+                fn from_return_value(value: &ReturnValue<'_>) -> anyhow::Result<Self> {
+                    value.$method()
+                }
+            }
+        )*
+    };
+}
+
+impl_from_return_value!(
+    f32 => float,
+    Vec3 => vector,
+    EntityRef => entity,
+    Arc<CStr> => string,
+    Function => function,
+    FieldRef => field,
+);
+
 /// A reference to an entity field (QuakeC's `.float` etc.), by its offset. The offset is the same
 /// as [`FieldDef::offset`], and the components of vector fields have their own offsets.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
@@ -519,17 +645,6 @@ impl From<[f32; 3]> for Value {
 impl From<Arc<CStr>> for Value {
     fn from(value: Arc<CStr>) -> Self {
         Self::String(value)
-    }
-}
-
-impl TryFrom<[VmScalar; 3]> for Value {
-    type Error = <VmScalar as TryInto<f32>>::Error;
-
-    fn try_from(value: [VmScalar; 3]) -> Result<Self, Self::Error> {
-        let [x, y, z]: [Result<f32, _>; 3] = value.map(TryInto::try_into);
-        let floats = [x?, y?, z?];
-
-        Ok(floats.into())
     }
 }
 
@@ -1276,20 +1391,7 @@ impl QCVm {
     }
 
     fn scalar_to_value(&self, scalar: VmScalar) -> anyhow::Result<Value> {
-        Ok(match scalar {
-            VmScalar::Void => Value::Void,
-            VmScalar::Float(f) => Value::Float(f),
-            VmScalar::Entity(ent) => Value::Entity(ent),
-            VmScalar::String(s) => Value::String(self.progs.string_table.get(s)?),
-            VmScalar::Function(func) => Value::Function(func.into()),
-            VmScalar::Field(ptr) => Value::Field(FieldRef::from_ptr(ptr)?),
-            other @ (VmScalar::Global(_) | VmScalar::EntityField(..)) => {
-                anyhow::bail!(
-                    "Values of type {} can't be passed to the host",
-                    other.type_()
-                )
-            }
-        })
+        scalar_to_value(scalar, &self.progs.string_table)
     }
 
     fn execution_ctx<'a, T>(
@@ -1320,12 +1422,12 @@ impl QCVm {
     /// Each call gets its own limits on the number of statements executed and the call depth, so
     /// hosts that call QuakeC from inside a builtin should call this again rather than nesting
     /// through [`userdata::FnCall`].
-    pub fn run<'a, T, C, F>(
-        &'a self,
-        context: &'a mut C,
+    pub fn run<T, C, F>(
+        &self,
+        context: &mut C,
         function: F,
         params: T,
-    ) -> anyhow::Result<Value>
+    ) -> anyhow::Result<ReturnValue<'_>>
     where
         F: Into<FunctionRef>,
         T: QCParams,
@@ -1334,16 +1436,17 @@ impl QCVm {
         let limits = Limits::default();
         let mut ctx = self.execution_ctx(context, &limits, params);
 
-        ctx.execute(function)
+        let scalars = ctx.execute(function)?;
+        Ok(ReturnValue::new(scalars, &self.progs.string_table))
     }
 
     /// Run a dynamic function
-    pub fn run_dynamic<'a, T, C>(
-        &'a self,
-        context: &'a mut C,
-        function: &'a dyn ErasedFunction,
+    pub fn run_dynamic<T, C>(
+        &self,
+        context: &mut C,
+        function: &dyn ErasedFunction,
         params: T,
-    ) -> anyhow::Result<Value>
+    ) -> anyhow::Result<ReturnValue<'_>>
     where
         T: QCParams,
         C: ErasedContext,
@@ -1352,9 +1455,8 @@ impl QCVm {
         let limits = Limits::default();
         let mut ctx = self.execution_ctx(context, &limits, params);
 
-        ctx.enter_builtin(c"{anonymous}", function, num_params)
-            .and_then(|vals| vals.try_into().map_err(anyhow::Error::new))
-            .and_then(|vals| ctx.to_value(vals))
+        let scalars = ctx.enter_builtin(c"{anonymous}", function, num_params)?;
+        Ok(ReturnValue::new(scalars, &self.progs.string_table))
     }
 }
 
@@ -1740,18 +1842,7 @@ where
     fn to_value(&self, vm_value: VmValue) -> anyhow::Result<Value> {
         match vm_value {
             VmValue::Vector(vec) => Ok(Value::Vector(vec.into())),
-            VmValue::Scalar(VmScalar::Float(f)) => Ok(Value::Float(f)),
-            VmValue::Scalar(VmScalar::Void) => Ok(Value::Void),
-            VmValue::Scalar(VmScalar::Entity(ent)) => Ok(Value::Entity(ent)),
-            VmValue::Scalar(VmScalar::String(str)) => {
-                Ok(Value::String(self.string_table.get(str)?))
-            }
-            VmValue::Scalar(VmScalar::Function(func)) => Ok(Value::Function(func.into())),
-            VmValue::Scalar(VmScalar::Field(ptr)) => Ok(Value::Field(FieldRef::from_ptr(ptr)?)),
-            VmValue::Scalar(VmScalar::EntityField(..) | VmScalar::Global(_)) => anyhow::bail!(
-                "Values of type {} are unsupported as arguments to builtins",
-                vm_value.type_()
-            ),
+            VmValue::Scalar(scalar) => scalar_to_value(scalar, self.string_table),
         }
     }
 }
@@ -1761,7 +1852,8 @@ where
     Alloc: ScopedAlloc,
     Caller: fmt::Debug + QCMemory<Scalar = Option<VmScalar>>,
 {
-    pub fn execute<F>(&mut self, function: F) -> anyhow::Result<Value>
+    /// Runs a function from the host, returning the scalars in the return slots.
+    pub fn execute<F>(&mut self, function: F) -> anyhow::Result<[VmScalar; 3]>
     where
         F: Into<FunctionRef>,
     {
@@ -1781,9 +1873,8 @@ where
                 self.enter_builtin(&builtin.name, &*func, num_args)?
             }
         };
-        let value = VmValue::try_from(out)?;
 
-        self.to_value(value)
+        Ok(out)
     }
 
     /// Runs a QuakeC function. Its arguments are copied from the current frame's parameters, as the
