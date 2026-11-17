@@ -9,6 +9,44 @@
 
 pub use self::{fields::FieldAddr, globals::GlobalAddr};
 
+use crate::{Address, Type};
+
+/// For each offset, the scalar and vector addresses at that offset (if any).
+///
+/// [`Address::from_u16_typed`] is called for every operand of every instruction, so this replaces
+/// a linear search of [`strum::VariantArray::VARIANTS`] with an index.
+struct AddrTable<A: 'static> {
+    by_offset: Box<[[Option<A>; 2]]>,
+}
+
+impl<A: Address + Copy> AddrTable<A> {
+    fn new() -> Self {
+        let len = A::VARIANTS
+            .iter()
+            .map(|addr| addr.to_u16() as usize + 1)
+            .max()
+            .unwrap_or_default();
+        let mut by_offset = vec![[None, None]; len];
+        for addr in A::VARIANTS.iter().copied() {
+            let slot = usize::from(addr.type_() == Type::Vector);
+            by_offset[addr.to_u16() as usize][slot] = Some(addr);
+        }
+
+        Self {
+            by_offset: by_offset.into(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, offset: u16, ty: Type) -> Option<A> {
+        let [scalar, vector] = self.by_offset.get(offset as usize)?;
+        match ty {
+            Type::Vector => *vector,
+            _ => scalar.filter(|addr| addr.type_().typeck(&ty)),
+        }
+    }
+}
+
 /// Global definitions for `progdefs.q1`, see [the Quake GPL release](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 pub mod globals {
     use std::fmt;
@@ -239,7 +277,15 @@ pub mod globals {
         }
     }
 
+    static TABLE: std::sync::LazyLock<super::AddrTable<GlobalAddr>> =
+        std::sync::LazyLock::new(super::AddrTable::new);
+
     impl Address for GlobalAddr {
+        #[inline]
+        fn from_u16_typed(val: u16, ty: Type) -> Option<Self> {
+            TABLE.get(val, ty)
+        }
+
         fn vector_field_or_scalar(&self) -> (Self, VectorField) {
             match self {
                 GlobalAddr::VForwardX => (GlobalAddr::VForward, VectorField::XOrScalar),
@@ -938,7 +984,15 @@ pub mod fields {
         }
     }
 
+    static TABLE: std::sync::LazyLock<super::AddrTable<FieldAddr>> =
+        std::sync::LazyLock::new(super::AddrTable::new);
+
     impl Address for FieldAddr {
+        #[inline]
+        fn from_u16_typed(val: u16, ty: Type) -> Option<Self> {
+            TABLE.get(val, ty)
+        }
+
         fn vector_field_or_scalar(&self) -> (Self, VectorField) {
             match self {
                 Self::AbsMinX => (Self::AbsMin, VectorField::XOrScalar),

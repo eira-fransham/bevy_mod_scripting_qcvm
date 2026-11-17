@@ -3,6 +3,7 @@
 
 use std::{
     any::Any,
+    cell::Cell,
     collections::VecDeque,
     ffi::{CStr, CString},
     fmt,
@@ -12,6 +13,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::Context as _;
 use arrayvec::ArrayVec;
 use bump_scope::{Bump, BumpScope};
 use glam::Vec3;
@@ -20,14 +22,13 @@ use snafu::Snafu;
 use strum::VariantArray;
 
 use crate::{
-    entity::EntityTypeDef,
     load::Progs,
     progs::{
-        StringRef, StringTable, VmFunctionRef, VmScalar, VmScalarType, VmValue,
+        StringRef, StringTable, VmFunctionRef, VmScalar, VmValue,
         functions::{ArgSize, FunctionExecutionCtx, QCFunctionDef, Statement},
         globals::GlobalRegistry,
     },
-    userdata::{AddrError, ErasedContext, ErasedFunction, FnCall, QCType},
+    userdata::{AddrError, ErasedContext, ErasedFunction, QCType},
 };
 
 mod entity;
@@ -36,13 +37,21 @@ mod ops;
 mod progs;
 pub mod userdata;
 
+#[cfg(test)]
+mod tests;
+
 pub use arrayvec;
+pub use strum;
 
 pub use anyhow::{self, Error};
 
-pub use crate::progs::{
-    EntityRef, FieldDef, VectorField,
-    functions::{Builtin, BuiltinDef, FunctionDef, FunctionRegistry, MAX_ARGS},
+pub use crate::{
+    entity::{EntityTypeDef, ScalarFieldDef},
+    progs::{
+        EntityRef, FieldDef, GlobalDef, VectorField, VmScalarType, VmType,
+        functions::{Builtin, BuiltinDef, FunctionDef, FunctionRegistry, MAX_ARGS},
+        is_null_string, null_string,
+    },
 };
 
 #[cfg(feature = "quake1")]
@@ -170,8 +179,8 @@ pub enum Value {
     Void,
     /// An entity reference. See documentation for `EntityRef` for more details.
     Entity(EntityRef),
-    /// A function pointer. This requires some context to call, see [`userdata::Function`].
-    Function(Arc<dyn ErasedFunction>),
+    /// A function pointer, see [`Function`].
+    Function(Function),
     /// A single scalar float.
     Float(f32),
     /// An `{x, y, z}` vector value.
@@ -179,6 +188,253 @@ pub enum Value {
     /// A refcounted string pointer. Quake strings are not strictly ascii, but cannot have internal
     /// `NUL`, so `CStr` is used.
     String(Arc<CStr>),
+    /// A reference to an entity field, e.g. the field argument of Quake's `find`.
+    Field(FieldRef),
+}
+
+/// A function value, as passed between QuakeC and the host.
+#[derive(Debug, Clone)]
+pub enum Function {
+    /// A function defined by the `progs.dat` (a QuakeC function or a builtin), by its index in the
+    /// function table. This is what QuakeC itself uses for function pointers, so these compare
+    /// equal to each other exactly when QuakeC's `==` would.
+    Index(FunctionIndex),
+    /// A function provided by the host that isn't in the `progs.dat`'s function table, which
+    /// QuakeC can store and call like any other function.
+    ///
+    /// These compare equal to each other according to the [`PartialEq`] implementation of the
+    /// host's function type (see [`userdata::DynEq`]), and never compare equal to
+    /// [`Function::Index`].
+    Host(Arc<dyn ErasedFunction>),
+}
+
+impl Function {
+    /// The null function.
+    pub const NULL: Self = Self::Index(FunctionIndex::NULL);
+
+    /// Whether this is the null function.
+    pub fn is_null(&self) -> bool {
+        match self {
+            Self::Index(index) => index.is_null(),
+            Self::Host(func) => func.is_null(),
+        }
+    }
+}
+
+impl PartialEq for Function {
+    fn eq(&self, other: &Self) -> bool {
+        VmFunctionRef::from(self.clone()) == VmFunctionRef::from(other.clone())
+    }
+}
+
+impl From<Function> for VmFunctionRef {
+    fn from(value: Function) -> Self {
+        match value {
+            Function::Index(index) => VmFunctionRef::Ptr(progs::Ptr(index.0)),
+            Function::Host(func) => VmFunctionRef::Extern(func),
+        }
+    }
+}
+
+impl From<VmFunctionRef> for Function {
+    fn from(value: VmFunctionRef) -> Self {
+        match value {
+            VmFunctionRef::Ptr(ptr) => Function::Index(FunctionIndex(ptr.0)),
+            VmFunctionRef::Extern(func) => Function::Host(func),
+        }
+    }
+}
+
+impl From<FunctionIndex> for Function {
+    fn from(value: FunctionIndex) -> Self {
+        Self::Index(value)
+    }
+}
+
+impl From<Arc<dyn ErasedFunction>> for Function {
+    fn from(value: Arc<dyn ErasedFunction>) -> Self {
+        Self::Host(value)
+    }
+}
+
+impl From<Function> for Value {
+    fn from(value: Function) -> Self {
+        Self::Function(value)
+    }
+}
+
+impl TryFrom<Value> for Function {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Function(func) => Ok(func),
+            _ => anyhow::bail!("Expected {}, found {}", Type::Function, value.type_()),
+        }
+    }
+}
+
+/// Converts a scalar from the VM to a host value.
+fn scalar_to_value(scalar: VmScalar, strings: &StringTable) -> anyhow::Result<Value> {
+    Ok(match scalar {
+        VmScalar::Void => Value::Void,
+        VmScalar::Float(f) => Value::Float(f),
+        VmScalar::Entity(ent) => Value::Entity(ent),
+        VmScalar::String(s) => Value::String(strings.get(s)?),
+        VmScalar::Function(func) => Value::Function(func.into()),
+        VmScalar::Field(ptr) => Value::Field(FieldRef::from_ptr(ptr)?),
+        other @ (VmScalar::Global(_) | VmScalar::EntityField(..)) => {
+            anyhow::bail!(
+                "Values of type {} can't be passed to the host",
+                other.type_()
+            )
+        }
+    })
+}
+
+/// The value returned by a function, e.g. from [`QCVm::run`].
+///
+/// QuakeC always returns 3 values, but those values are untyped and aren't
+/// even guaranteed to be valid.
+#[derive(Debug, Clone)]
+pub struct ReturnValue<'a> {
+    scalars: [VmScalar; 3],
+    strings: &'a StringTable,
+}
+
+impl<'a> ReturnValue<'a> {
+    fn new(scalars: [VmScalar; 3], strings: &'a StringTable) -> Self {
+        Self { scalars, strings }
+    }
+
+    fn first(&self) -> VmScalar {
+        self.scalars[0].clone()
+    }
+
+    /// Reads the return value as `R`.
+    pub fn get<R: FromReturnValue>(&self) -> anyhow::Result<R> {
+        R::from_return_value(self)
+    }
+
+    /// Reads the return value as a float.
+    pub fn float(&self) -> anyhow::Result<f32> {
+        Ok(self.first().try_into()?)
+    }
+
+    /// Reads the return value as a vector.
+    pub fn vector(&self) -> anyhow::Result<Vec3> {
+        let [x, y, z] = self.scalars.clone().map(f32::try_from);
+        Ok(Vec3::new(x?, y?, z?))
+    }
+
+    /// Reads the return value as an entity.
+    pub fn entity(&self) -> anyhow::Result<EntityRef> {
+        Ok(self.first().try_into()?)
+    }
+
+    /// Reads the return value as a string.
+    pub fn string(&self) -> anyhow::Result<Arc<CStr>> {
+        let string: StringRef = self.first().try_into()?;
+        self.strings.get(string)
+    }
+
+    /// Reads the return value as a function.
+    pub fn function(&self) -> anyhow::Result<Function> {
+        Ok(VmFunctionRef::try_from(self.first())?.into())
+    }
+
+    /// Reads the return value as a field reference.
+    pub fn field(&self) -> anyhow::Result<FieldRef> {
+        let progs::FieldPtr(ptr) = self.first().try_into()?;
+        FieldRef::from_ptr(ptr)
+    }
+
+    /// Reads the first component of the return value as a simple scalar.
+    pub fn scalar(&self) -> anyhow::Result<Value> {
+        scalar_to_value(self.first(), self.strings)
+    }
+}
+
+/// Types that a [`ReturnValue`] can be read as, see [`ReturnValue::get`].
+///
+/// Basically just an alias for [`TryFrom`] to make the lifetimes less hairy
+/// to annotate.
+pub trait FromReturnValue: Sized {
+    /// Reads `value` as this type.
+    fn from_return_value(value: &ReturnValue<'_>) -> anyhow::Result<Self>;
+}
+
+impl FromReturnValue for () {
+    fn from_return_value(_: &ReturnValue<'_>) -> anyhow::Result<Self> {
+        // For void returns, the return value can be ignored entirely.
+        Ok(())
+    }
+}
+
+impl FromReturnValue for Value {
+    fn from_return_value(value: &ReturnValue<'_>) -> anyhow::Result<Self> {
+        value.scalar()
+    }
+}
+
+macro_rules! impl_from_return_value {
+    ($($t:ty => $method:ident),* $(,)?) => {
+        $(
+            impl FromReturnValue for $t {
+                fn from_return_value(value: &ReturnValue<'_>) -> anyhow::Result<Self> {
+                    value.$method()
+                }
+            }
+        )*
+    };
+}
+
+impl_from_return_value!(
+    f32 => float,
+    Vec3 => vector,
+    EntityRef => entity,
+    Arc<CStr> => string,
+    Function => function,
+    FieldRef => field,
+);
+
+/// A reference to an entity field, without the entity that it references.
+///
+/// For a reference to a field on a specific entity, see [`progs::EntityField`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+pub struct FieldRef {
+    /// The offset of the field.
+    pub offset: u16,
+}
+
+impl FieldRef {
+    fn from_ptr(ptr: progs::Ptr) -> anyhow::Result<Self> {
+        Ok(Self {
+            offset: u16::try_from(ptr.0)
+                .map_err(|_| anyhow::format_err!("Invalid field reference {}", ptr.0))?,
+        })
+    }
+
+    fn to_ptr(self) -> progs::Ptr {
+        progs::Ptr(self.offset.into())
+    }
+}
+
+impl From<FieldRef> for Value {
+    fn from(value: FieldRef) -> Self {
+        Self::Field(value)
+    }
+}
+
+impl TryFrom<Value> for FieldRef {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Field(field) => Ok(field),
+            _ => anyhow::bail!("Expected {}, found {}", Type::Field, value.type_()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -195,7 +451,7 @@ mod test_value {
 pub enum TryScalarError {
     /// Tried to get a field of a scalar (other than `.x`)
     FieldOfScalar {
-        /// The field that we attempted to get (see documentation for [`VectorField`]).
+        /// The field that we attempted to get (see [`VectorField`]).
         field: VectorField,
     },
     /// Tried to get an entire vector as a scalar
@@ -209,7 +465,7 @@ pub enum TryScalarError {
 pub enum SetValueError {
     /// Tried to set a vector field, but the value was not a vector.
     NoSuchField {
-        /// The field that we attempted to set (see documentation for [`VectorField`]).
+        /// The field that we attempted to set (see [`VectorField`]).
         field: VectorField,
     },
     /// Tried to set a vector field to a value other than float.
@@ -223,6 +479,27 @@ pub enum SetValueError {
 }
 
 impl Value {
+    /// The zero/default value for a given type.
+    pub fn zero(ty: Type) -> Self {
+        match ty {
+            Type::AnyScalar | Type::Void => Value::Void,
+            Type::Entity => Value::Entity(None),
+            Type::Function => Value::Function(Function::NULL),
+            Type::Vector => Value::Vector(Vec3::ZERO),
+            Type::Float => Value::Float(0.),
+            Type::String => Value::String(null_string()),
+            Type::Field => Value::Field(FieldRef::default()),
+        }
+    }
+
+    /// Replaces [`Value::Void`] with the zero value of `ty`.
+    pub fn or_zero(self, ty: Type) -> Self {
+        match self {
+            Value::Void => Self::zero(ty),
+            other => other,
+        }
+    }
+
     /// The [`Type`] of this value.
     pub const fn type_(&self) -> Type {
         match self {
@@ -232,12 +509,13 @@ impl Value {
             Value::Float(_) => Type::Float,
             Value::Vector(_) => Type::Vector,
             Value::String(_) => Type::String,
+            Value::Field(_) => Type::Field,
         }
     }
 
-    /// Get a field of the value, if it's a vector. Passing `None` will just clone the value
-    /// (this is useful for generic code using `VectorField` to optionally convert a type into
-    /// a scalar).
+    /// Get a field of the value, if it's a vector.
+    // TODO: This is basically the same as `field` but for internal use only, and the
+    // implementations overlap. We can probably do this better.
     pub(crate) fn try_scalar(&self, field: VectorField) -> Result<VmScalar, TryScalarError> {
         self.field(field)?
             .try_into()
@@ -259,9 +537,8 @@ impl Value {
         })
     }
 
-    /// Clone the source value to this value, with an optional field reference. Useful to implement
-    /// [`userdata::EntityHandle::set`], as sometimes QuakeC only wants to set a single field of a
-    /// vector.
+    /// Set a field of this type, if possible. If this value is a scalar and `field` is
+    /// not `XOrScalar`, return an error.
     pub fn set(&mut self, field: VectorField, value: Value) -> Result<(), SetValueError> {
         match (self, field.into(), value) {
             (this, VectorField::XOrScalar, value) => *this = value,
@@ -328,7 +605,13 @@ impl TryFrom<Value> for ErasedEntityHandle {
 
 impl From<Arc<dyn ErasedFunction>> for Value {
     fn from(value: Arc<dyn ErasedFunction>) -> Self {
-        Self::Function(value)
+        Self::Function(Function::Host(value))
+    }
+}
+
+impl From<FunctionIndex> for Value {
+    fn from(value: FunctionIndex) -> Self {
+        Self::Function(Function::Index(value))
     }
 }
 
@@ -362,17 +645,6 @@ impl From<Arc<CStr>> for Value {
     }
 }
 
-impl TryFrom<[VmScalar; 3]> for Value {
-    type Error = <VmScalar as TryInto<f32>>::Error;
-
-    fn try_from(value: [VmScalar; 3]) -> Result<Self, Self::Error> {
-        let [x, y, z]: [Result<f32, _>; 3] = value.map(TryInto::try_into);
-        let floats = [x?, y?, z?];
-
-        Ok(floats.into())
-    }
-}
-
 #[derive(Snafu, Debug, Copy, Clone, PartialEq, Eq)]
 struct NotScalarError;
 
@@ -383,13 +655,12 @@ impl TryFrom<Value> for VmScalar {
         Ok(match value {
             Value::Void => VmScalar::Void,
             Value::Entity(entity_ref) => VmScalar::Entity(entity_ref),
-            Value::Function(erased_function) => {
-                VmScalar::Function(VmFunctionRef::Extern(erased_function))
-            }
+            Value::Function(func) => VmScalar::Function(func.into()),
             Value::Float(float) => VmScalar::Float(float),
             // TODO: Just read x value?
             Value::Vector(_) => return Err(NotScalarError),
             Value::String(cstr) => VmScalar::String(StringRef::Temp(cstr)),
+            Value::Field(field) => VmScalar::Field(field.to_ptr()),
         })
     }
 }
@@ -410,8 +681,19 @@ impl TryFrom<Value> for Arc<dyn ErasedFunction> {
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            Value::Function(func) => Ok(func),
-            _ => anyhow::bail!("Expected {}, found {}", Type::Function, value.type_()),
+            Value::Function(Function::Host(func)) => Ok(func),
+            _ => anyhow::bail!("Expected a host function, found {value:?}"),
+        }
+    }
+}
+
+impl TryFrom<Value> for FunctionIndex {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Function(Function::Index(index)) => Ok(index),
+            _ => anyhow::bail!("Expected a function from the progs, found {value:?}"),
         }
     }
 }
@@ -454,12 +736,11 @@ impl From<Value> for VmValue {
         match value {
             Value::Void => VmValue::Scalar(VmScalar::Void),
             Value::Entity(entity_ref) => entity_ref.into(),
-            Value::Function(erased_function) => {
-                VmValue::Scalar(VmScalar::Function(VmFunctionRef::Extern(erased_function)))
-            }
+            Value::Function(func) => VmValue::Scalar(VmScalar::Function(func.into())),
             Value::Float(f) => f.into(),
             Value::Vector(vec3) => vec3.into(),
             Value::String(cstr) => VmValue::Scalar(VmScalar::String(StringRef::Temp(cstr))),
+            Value::Field(field) => VmValue::Scalar(VmScalar::Field(field.to_ptr())),
         }
     }
 }
@@ -679,6 +960,10 @@ where
 {
     type Scalar = Option<VmScalar>;
 
+    fn num_args(&self) -> Option<usize> {
+        Some(self.params.count())
+    }
+
     fn get(&self, index: usize) -> anyhow::Result<Self::Scalar> {
         let Ok(index) = u16::try_from(index) else {
             return Ok(None);
@@ -695,13 +980,43 @@ where
     }
 }
 
+/// The arguments to a builtin, as raw scalars copied from the caller's parameters.
+#[derive(Debug)]
+pub(crate) struct RawArgs(pub ArrayVec<[VmScalar; 3], MAX_ARGS>);
+
+impl QCMemory for RawArgs {
+    type Scalar = Option<VmScalar>;
+
+    fn num_args(&self) -> Option<usize> {
+        Some(self.0.len())
+    }
+
+    fn get(&self, index: usize) -> anyhow::Result<Self::Scalar> {
+        let Ok(index) = u16::try_from(index) else {
+            return Ok(None);
+        };
+
+        // We are stricter than vanilla Quake here and try not to leave parameters
+        // lying around, but because of a bug in the vanilla `progs.dat` we need
+        // to optionally support the non-strict behaviour.
+        Ok(function_args()
+            .find_map(|arg| arg.try_match_scalar(index))
+            .map(|(arg_index, ofs)| {
+                self.0
+                    .get(arg_index)
+                    .map(|arg| arg[ofs as usize].clone())
+                    .unwrap_or_default()
+            }))
+    }
+}
+
 impl QCType for QCFunctionDef {
     fn type_(&self) -> Type {
         Type::Function
     }
 
     fn is_null(&self) -> bool {
-        self.offset == 0
+        self.index == 0
     }
 }
 
@@ -734,6 +1049,8 @@ pub enum Type {
     /// A refcounted string pointer. Quake strings are not strictly ascii, but cannot have internal
     /// `NUL`, so `CStr` is used.
     String,
+    /// A reference to an entity field, see [`FieldRef`].
+    Field,
 }
 
 impl Type {
@@ -750,7 +1067,8 @@ impl Type {
                 | Type::Entity
                 | Type::Function
                 | Type::Float
-                | Type::String,
+                | Type::String
+                | Type::Field,
                 Type::AnyScalar,
             ) => true,
             (Type::Void, Type::Void) => true,
@@ -759,6 +1077,7 @@ impl Type {
             (Type::Vector, Type::Vector) => true,
             (Type::Float, Type::Float) => true,
             (Type::String, Type::String) => true,
+            (Type::Field, Type::Field) => true,
             _ => false,
         }
     }
@@ -785,7 +1104,8 @@ impl TryFrom<VmScalarType> for Type {
             VmScalarType::Float => Type::Float,
             VmScalarType::Entity => Type::Entity,
             VmScalarType::Function => Type::Function,
-            VmScalarType::FieldRef | VmScalarType::GlobalRef | VmScalarType::EntityFieldRef => {
+            VmScalarType::FieldRef => Type::Field,
+            VmScalarType::GlobalRef | VmScalarType::EntityFieldRef => {
                 anyhow::bail!("We don't support `{value}` in host bindings")
             }
         })
@@ -811,26 +1131,112 @@ impl fmt::Display for Type {
             Type::Float => write!(f, "float"),
             Type::Vector => write!(f, "vector"),
             Type::String => write!(f, "string"),
+            Type::Field => write!(f, "field"),
         }
     }
 }
 
-impl ErasedFunction for QCFunctionDef {
-    fn dyn_signature(&self) -> anyhow::Result<ArrayVec<Type, MAX_ARGS>> {
-        Ok(self
-            .args
-            .iter()
-            .map(|size| match size.arg_size() {
-                ArgSize::Scalar => Type::AnyScalar,
-                ArgSize::Vector => Type::Vector,
-            })
-            .collect())
+/// A reference to a function in the `progs.dat` function table, by index. Index 0 is the null
+/// function.
+///
+/// This is how functions defined by the `progs.dat` (both QuakeC functions and builtins) are passed
+/// to the host (as [`Function::Index`]), e.g. when QuakeC sets an entity's `think`. To call it from
+/// the host, pass it to [`QCVm::run`] or [`userdata::FnCall::call`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+pub struct FunctionIndex(pub i32);
+
+impl FunctionIndex {
+    /// The null function.
+    pub const NULL: Self = Self(0);
+
+    /// Wraps this as a [`Value`].
+    pub fn to_value(self) -> Value {
+        Value::Function(Function::Index(self))
+    }
+}
+
+impl QCType for FunctionIndex {
+    fn type_(&self) -> Type {
+        Type::Function
     }
 
-    fn dyn_call(&self, mut context: FnCall) -> anyhow::Result<Value> {
-        let vm_value = context.execution.execute_def(self)?;
+    fn is_null(&self) -> bool {
+        self.0 == 0
+    }
+}
 
-        context.execution.to_value(vm_value.try_into()?)
+/// The maximum number of statements executed by a single call into the VM before it is considered
+/// an infinite loop (see `PR_ExecuteProgram` in Quake).
+pub const MAX_OPS_SINGLE_CALL: u32 = 100_000;
+
+/// The maximum depth of nested QuakeC function calls (see `MAX_STACK_DEPTH` in Quake).
+pub const MAX_CALL_DEPTH: usize = 32;
+
+/// Options chosen when the VM is initialized, see [`QCVm::load_with_options`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VmOptions {
+    /// What happens when a QuakeC function is called with fewer arguments than it takes.
+    ///
+    /// Vanilla Quake's QuakeC relies on the buggy behavior of the vanilla VM, where subsequent
+    /// function calls may reuse arguments from previous calls if called with fewer arguments
+    /// than expected. By default, passing too few arguments is an error, but for compatibility
+    /// reasons setting this to [`MissingArguments::Stale`] will emulate the buggy vanilla
+    /// behavior
+    pub missing_arguments: MissingArguments,
+}
+
+/// What happens when a QuakeC function is called with fewer arguments than it takes. See
+/// [`VmOptions::missing_arguments`].
+///
+/// This doesn't apply to builtins, which (like Quake's `pr_argc`) see how many arguments they were
+/// passed, and get `void` for the rest. Passing more arguments than a function takes is always
+/// allowed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MissingArguments {
+    /// Calling a function with fewer arguments than it takes is an error.
+    #[default]
+    Error,
+    /// Vanilla Quake's behavior: missing arguments are whatever was left in the parameter slots
+    /// from previous calls.
+    Stale,
+}
+
+/// Where a function was called from, used to only warn once about each call with missing
+/// arguments.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+enum CallSite {
+    /// A call statement, by its index in the `progs.dat`.
+    Statement(usize),
+    /// A call from the host, by the index of the function called.
+    Host(i32),
+}
+
+/// [`VmOptions`], and the state needed to implement them.
+#[derive(Debug, Default)]
+struct Compat {
+    options: VmOptions,
+    /// The call sites that have already been warned about missing arguments.
+    warned_missing_arguments: parking_lot::Mutex<hashbrown::HashSet<CallSite>>,
+}
+
+/// Per-call (rather than per-frame) execution state.
+#[derive(Debug)]
+struct Limits {
+    /// How many more statements may be executed before the call is considered a runaway loop.
+    ops_left: Cell<u32>,
+    /// The current depth of nested QuakeC calls.
+    depth: Cell<usize>,
+    /// Whether the QuakeC backtrace has been printed for the current error.
+    printed_backtrace: Cell<bool>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            ops_left: Cell::new(MAX_OPS_SINGLE_CALL),
+            depth: Cell::new(0),
+            printed_backtrace: Cell::new(false),
+        }
     }
 }
 
@@ -838,21 +1244,28 @@ impl ErasedFunction for QCFunctionDef {
 #[derive(Debug)]
 pub struct QCVm {
     progs: Progs,
+    compat: Compat,
 }
 
 /// A reference to a function stored in a `QuakeCVm`.
 #[derive(Clone, PartialEq, Debug)]
 pub enum FunctionRef {
-    /// A function specified by index. This can be useful for interacting with code
-    /// that is ABI-compatible with your environment but not API-compatible.
-    Offset(i32),
+    /// A function specified by its index in the function table. This is the value QuakeC uses for
+    /// function pointers.
+    Index(i32),
     /// A function specified by name.
     Name(Arc<CStr>),
 }
 
 impl From<i32> for FunctionRef {
     fn from(value: i32) -> Self {
-        Self::Offset(value)
+        Self::Index(value)
+    }
+}
+
+impl From<FunctionIndex> for FunctionRef {
+    fn from(value: FunctionIndex) -> Self {
+        Self::Index(value.0)
     }
 }
 
@@ -891,75 +1304,156 @@ impl TryFrom<&str> for FunctionRef {
 }
 
 impl QCVm {
-    /// Load the runtime from a `progs.dat` file.
+    /// Load the runtime from a `progs.dat` file, with the default (strict) [`VmOptions`].
     pub fn load<R>(bytes: R) -> anyhow::Result<Self>
     where
         R: std::io::Read + std::io::Seek,
     {
-        // TODO: Take a context argument so we can typeck the globals/fields, check names, and set
-        //       globals to the defaults specified in the progs.dat
-        Ok(Self {
-            progs: Progs::load(bytes)?,
-        })
+        Self::load_with_options(bytes, VmOptions::default())
+    }
+
+    /// Load the runtime from a `progs.dat` file, with the given options.
+    pub fn load_with_options<R>(bytes: R, options: VmOptions) -> anyhow::Result<Self>
+    where
+        R: std::io::Read + std::io::Seek,
+    {
+        Ok(Self::from_progs(Progs::load(bytes)?, options))
+    }
+
+    fn from_progs(progs: Progs, options: VmOptions) -> Self {
+        Self {
+            progs,
+            compat: Compat {
+                options,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The options that the VM was loaded with.
+    pub fn options(&self) -> &VmOptions {
+        &self.compat.options
+    }
+
+    /// The global definitions in the `progs.dat`, sorted by offset.
+    pub fn global_defs(&self) -> &[GlobalDef] {
+        self.progs.globals.defs()
+    }
+
+    /// The entity field definitions in the `progs.dat`.
+    pub fn field_defs(&self) -> &[FieldDef] {
+        self.progs.entity_def.field_defs()
+    }
+
+    /// The entity field layout defined by the `progs.dat`.
+    pub fn entity_def(&self) -> &EntityTypeDef {
+        &self.progs.entity_def
+    }
+
+    /// The functions defined in the `progs.dat`.
+    pub fn functions(&self) -> &FunctionRegistry {
+        &self.progs.functions
+    }
+
+    /// The value of the global at `addr` as specified in the `progs.dat`. Hosts that store globals
+    /// themselves (i.e. those defined by `progdefs.h`, such as `StartFrame`) should initialize them
+    /// with this.
+    pub fn initial_global(&self, addr: u16) -> anyhow::Result<Value> {
+        let scalar = self.progs.globals.initial(addr.into())?.clone();
+        self.scalar_to_value(scalar)
+    }
+
+    /// The initial value of a vector global (see [`QCVm::initial_global`]).
+    pub fn initial_global_vector(&self, addr: u16) -> anyhow::Result<Vec3> {
+        let addr = usize::from(addr);
+        let [x, y, z] = [addr, addr + 1, addr + 2].map(|addr| {
+            self.progs
+                .globals
+                .initial(addr)
+                .and_then(|scalar| Ok(f32::try_from(scalar.clone())?))
+        });
+
+        Ok(Vec3::new(x?, y?, z?))
+    }
+
+    /// Resets the globals that are stored in the VM to their values from the `progs.dat`.
+    pub fn reset_globals(&self) {
+        self.progs.globals.reset();
+    }
+
+    /// The value of a global stored in the VM (i.e. not provided by the host).
+    pub fn global(&self, addr: u16) -> anyhow::Result<Value> {
+        let scalar = self.progs.globals.get_value(addr.into())?;
+        self.scalar_to_value(scalar)
+    }
+
+    fn scalar_to_value(&self, scalar: VmScalar) -> anyhow::Result<Value> {
+        scalar_to_value(scalar, &self.progs.string_table)
+    }
+
+    fn execution_ctx<'a, T>(
+        &'a self,
+        context: &'a mut dyn ErasedContext,
+        limits: &'a Limits,
+        params: T,
+    ) -> ExecutionCtx<'a, dyn ErasedContext, Bump, CallArgs<T>> {
+        ExecutionCtx {
+            alloc: Bump::new(),
+            memory: ExecutionMemory {
+                local: CallArgs { params },
+                global: &self.progs.globals,
+                last_ret: None,
+            },
+            backtrace: Default::default(),
+            context,
+            limits,
+            compat: &self.compat,
+            entity_def: &self.progs.entity_def,
+            string_table: &self.progs.string_table,
+            functions: &self.progs.functions,
+        }
     }
 
     /// Run the specified function with the specified context and arguments.
-    pub fn run<'a, T, C, F>(
-        &'a self,
-        context: &'a mut C,
+    ///
+    /// Each call gets its own limits on the number of statements executed and the call depth, so
+    /// hosts that call QuakeC from inside a builtin should call this again rather than nesting
+    /// through [`userdata::FnCall`].
+    pub fn run<T, C, F>(
+        &self,
+        context: &mut C,
         function: F,
         params: T,
-    ) -> anyhow::Result<Value>
+    ) -> anyhow::Result<ReturnValue<'_>>
     where
         F: Into<FunctionRef>,
         T: QCParams,
         C: ErasedContext,
     {
-        let mut ctx: ExecutionCtx<'_, dyn ErasedContext, _, CallArgs<T>> = ExecutionCtx {
-            alloc: Bump::new(),
-            memory: ExecutionMemory {
-                local: CallArgs { params },
-                global: &self.progs.globals,
-                last_ret: None,
-            },
-            backtrace: Default::default(),
-            context,
-            entity_def: &self.progs.entity_def,
-            string_table: &self.progs.string_table,
-            functions: &self.progs.functions,
-        };
+        let limits = Limits::default();
+        let mut ctx = self.execution_ctx(context, &limits, params);
 
-        ctx.execute(function)
+        let scalars = ctx.execute(function)?;
+        Ok(ReturnValue::new(scalars, &self.progs.string_table))
     }
 
     /// Run a dynamic function
-    pub fn run_dynamic<'a, T, C>(
-        &'a self,
-        context: &'a mut C,
-        function: &'a dyn ErasedFunction,
+    pub fn run_dynamic<T, C>(
+        &self,
+        context: &mut C,
+        function: &dyn ErasedFunction,
         params: T,
-    ) -> anyhow::Result<Value>
+    ) -> anyhow::Result<ReturnValue<'_>>
     where
         T: QCParams,
         C: ErasedContext,
     {
         let num_params = params.count();
-        let mut ctx: ExecutionCtx<'_, dyn ErasedContext, _, CallArgs<T>> = ExecutionCtx {
-            alloc: Bump::new(),
-            memory: ExecutionMemory {
-                local: CallArgs { params },
-                global: &self.progs.globals,
-                last_ret: None,
-            },
-            backtrace: Default::default(),
-            context,
-            entity_def: &self.progs.entity_def,
-            string_table: &self.progs.string_table,
-            functions: &self.progs.functions,
-        };
+        let limits = Limits::default();
+        let mut ctx = self.execution_ctx(context, &limits, params);
 
-        ctx.enter_builtin(c"{anonymous}", function, num_params)
-            .and_then(|vals| vals.try_into().map_err(anyhow::Error::new))
+        let scalars = ctx.enter_builtin(c"{anonymous}", function, num_params)?;
+        Ok(ReturnValue::new(scalars, &self.progs.string_table))
     }
 }
 
@@ -999,6 +1493,11 @@ trait QCMemory {
 
     fn get(&self, index: usize) -> anyhow::Result<Self::Scalar>;
 
+    /// If this is the arguments to a call from the host, the number of arguments passed.
+    fn num_args(&self) -> Option<usize> {
+        None
+    }
+
     fn get_vector(&self, index: usize) -> anyhow::Result<[Self::Scalar; 3]> {
         Ok([self.get(index)?, self.get(index + 1)?, self.get(index + 2)?])
     }
@@ -1017,18 +1516,16 @@ where
 
     fn get(&self, index: usize) -> anyhow::Result<VmScalar> {
         if RETURN_ADDRS.contains(&index) {
-            return self
+            // Like Quake, reading the return value before anything has been returned gives zero.
+            return Ok(self
                 .last_ret
                 .as_ref()
                 .and_then(|val| val.get(index.checked_sub(RETURN_ADDRS.start)?).cloned())
-                .ok_or_else(|| {
-                    anyhow::format_err!("Tried to read return values before calling a function")
-                });
+                .unwrap_or_default());
         }
 
         match self.local.get(index)?.into() {
             Some(val) => Ok(val),
-            // TODO: Should we make this solely host-controlled?
             None => self.global.get_value(index),
         }
     }
@@ -1036,7 +1533,10 @@ where
 
 impl QCMemoryMut for ExecutionMemory<'_> {
     fn set(&mut self, index: usize, value: VmScalar) -> anyhow::Result<()> {
-        self.local.set(index, value)
+        match self.local.try_set(index, value) {
+            Ok(()) => Ok(()),
+            Err(value) => self.global.set_value(index, value),
+        }
     }
 }
 
@@ -1053,6 +1553,8 @@ struct ExecutionCtx<
     memory: ExecutionMemory<'a, Caller>,
     backtrace: BacktraceFrame<'a>,
     context: &'a mut Ctx,
+    limits: &'a Limits,
+    compat: &'a Compat,
     entity_def: &'a EntityTypeDef,
 
     string_table: &'a StringTable,
@@ -1060,8 +1562,6 @@ struct ExecutionCtx<
     /// Function definitions and bodies.
     functions: &'a FunctionRegistry,
 }
-
-impl<Ctx, Alloc, Caller> ExecutionCtx<'_, Ctx, Alloc, Caller> {}
 
 enum OpResult {
     Jump(NonZeroIsize),
@@ -1127,16 +1627,6 @@ pub(crate) fn function_args() -> impl ExactSizeIterator<Item = ArgAddr> {
         ArgAddr { addr: 19, index: 5 },
         ArgAddr { addr: 22, index: 6 },
         ArgAddr { addr: 25, index: 7 },
-        ArgAddr { addr: 25, index: 8 },
-        ArgAddr { addr: 25, index: 9 },
-        ArgAddr {
-            addr: 25,
-            index: 10,
-        },
-        ArgAddr {
-            addr: 25,
-            index: 11,
-        },
     ]
     .into_iter()
 }
@@ -1197,11 +1687,21 @@ where
         F: FnOnce(ExecutionCtx<'_, dyn ErasedContext, BumpScope<'_>, CallArgs<A>>) -> O,
         A: QCParams,
     {
+        self.with_memory(name, CallArgs { params }, func)
+    }
+
+    /// Runs `func` in a new frame (named `name`) whose memory is `local`.
+    fn with_memory<F, M, O>(&mut self, name: &CStr, local: M, func: F) -> O
+    where
+        F: FnOnce(ExecutionCtx<'_, dyn ErasedContext, BumpScope<'_>, M>) -> O,
+    {
         let ExecutionCtx {
             alloc,
             memory: ExecutionMemory { global, .. },
             backtrace,
             context,
+            limits,
+            compat,
             entity_def,
             string_table,
             functions,
@@ -1211,12 +1711,14 @@ where
             func(ExecutionCtx {
                 alloc,
                 memory: ExecutionMemory {
-                    local: CallArgs { params },
+                    local,
                     global,
                     last_ret: None,
                 },
                 backtrace: BacktraceFrame(Some((name, backtrace))),
                 context: context.as_erased_mut(),
+                limits,
+                compat,
                 entity_def,
                 string_table,
                 functions,
@@ -1235,6 +1737,8 @@ impl<'a, Alloc, Caller> ExecutionCtx<'a, dyn ErasedContext, Alloc, Caller> {
             memory,
             backtrace,
             context,
+            limits,
+            compat,
             entity_def,
             string_table,
             functions,
@@ -1245,6 +1749,8 @@ impl<'a, Alloc, Caller> ExecutionCtx<'a, dyn ErasedContext, Alloc, Caller> {
             memory,
             backtrace,
             context: (context as &mut dyn Any).downcast_mut()?,
+            limits,
+            compat,
             entity_def,
             string_table,
             functions,
@@ -1287,6 +1793,45 @@ impl AsErasedContext for dyn ErasedContext {
     }
 }
 
+impl<Ctx, Alloc, Caller> ExecutionCtx<'_, Ctx, Alloc, Caller>
+where
+    Ctx: ?Sized,
+{
+    /// Checks the number of arguments that a QuakeC function was called with, see
+    /// [`VmOptions::missing_arguments`].
+    fn check_num_args(
+        &self,
+        function: &QCFunctionDef,
+        num_args: usize,
+        site: CallSite,
+    ) -> anyhow::Result<()> {
+        let takes = function.args.len();
+        let name = function.name.to_string_lossy();
+
+        match num_args.cmp(&takes) {
+            std::cmp::Ordering::Equal => {}
+            std::cmp::Ordering::Greater => {
+                tracing::debug!("{name} called with {num_args} args, but it takes {takes}");
+            }
+            std::cmp::Ordering::Less => match self.compat.options.missing_arguments {
+                MissingArguments::Error => {
+                    anyhow::bail!("{name} called with {num_args} args, but it takes {takes}")
+                }
+                MissingArguments::Stale => {
+                    if self.compat.warned_missing_arguments.lock().insert(site) {
+                        tracing::warn!(
+                            "{name} called with {num_args} args, but it takes {takes}: using the \
+                             values left in the parameter slots ({site:?})"
+                        );
+                    }
+                }
+            },
+        }
+
+        Ok(())
+    }
+}
+
 impl<'a, Ctx, Alloc, Caller> ExecutionCtx<'a, Ctx, Alloc, Caller>
 where
     Ctx: ?Sized + AsErasedContext,
@@ -1294,32 +1839,7 @@ where
     fn to_value(&self, vm_value: VmValue) -> anyhow::Result<Value> {
         match vm_value {
             VmValue::Vector(vec) => Ok(Value::Vector(vec.into())),
-            VmValue::Scalar(VmScalar::Float(f)) => Ok(Value::Float(f)),
-            VmValue::Scalar(VmScalar::Void) => Ok(Value::Void),
-            VmValue::Scalar(VmScalar::Entity(ent)) => Ok(Value::Entity(ent)),
-            VmValue::Scalar(VmScalar::String(str)) => {
-                Ok(Value::String(self.string_table.get(str)?))
-            }
-            VmValue::Scalar(VmScalar::Function(VmFunctionRef::Ptr(ptr))) => {
-                let arg_func = self.functions.get_by_index(ptr.0)?.clone();
-
-                match arg_func.try_into_qc() {
-                    // TODO: We shouldn't need to allocate a new arc here
-                    Ok(quakec) => Ok(Value::Function(Arc::new(quakec))),
-                    Err(builtin) => Ok(Value::Function(
-                        self.context.as_erased().dyn_builtin(&builtin)?,
-                    )),
-                }
-            }
-            VmValue::Scalar(VmScalar::Function(VmFunctionRef::Extern(func))) => {
-                Ok(Value::Function(func))
-            }
-            VmValue::Scalar(
-                VmScalar::EntityField(..) | VmScalar::Field(_) | VmScalar::Global(_),
-            ) => anyhow::bail!(
-                "Values of type {} are unsupported as arguments to builtins",
-                vm_value.type_()
-            ),
+            VmValue::Scalar(scalar) => scalar_to_value(scalar, self.string_table),
         }
     }
 }
@@ -1329,47 +1849,32 @@ where
     Alloc: ScopedAlloc,
     Caller: fmt::Debug + QCMemory<Scalar = Option<VmScalar>>,
 {
-    pub fn execute<F>(&mut self, function: F) -> anyhow::Result<Value>
+    /// Run a function.
+    pub fn execute<F>(&mut self, function: F) -> anyhow::Result<[VmScalar; 3]>
     where
         F: Into<FunctionRef>,
     {
-        match function.into() {
-            FunctionRef::Offset(idx) => self.execute_by_index(idx),
-            FunctionRef::Name(name) => self.execute_by_name(name),
-        }
+        let def = self.functions.get(function)?.clone();
+        let num_args = def.args.len();
+
+        let out = match def.try_into_qc() {
+            Ok(quakec) => {
+                if let Some(passed) = self.memory.local.num_args() {
+                    self.check_num_args(&quakec, passed, CallSite::Host(quakec.index))?;
+                }
+                self.execute_def(&quakec)?
+            }
+            // Running a builtin directly is allowed, it just runs the host's function.
+            Err(builtin) => {
+                let func = self.context.dyn_builtin(&builtin)?;
+                self.enter_builtin(&builtin.name, &*func, num_args)?
+            }
+        };
+
+        Ok(out)
     }
 
-    pub fn execute_by_index(&mut self, function: i32) -> anyhow::Result<Value> {
-        let quakec_func = self
-            .functions
-            .get_by_index(function)?
-            .clone()
-            .try_into_qc()
-            .map_err(|_| anyhow::format_err!("Not a quakec function (TODO)"))?;
-
-        let out = self.execute_def(&quakec_func)?;
-        let value = VmValue::try_from(out)?;
-
-        self.to_value(value)
-    }
-
-    pub fn execute_by_name<F>(&mut self, function: F) -> anyhow::Result<Value>
-    where
-        F: AsRef<CStr>,
-    {
-        let quakec_func = self
-            .functions
-            .get_by_name(function)?
-            .clone()
-            .try_into_qc()
-            .map_err(|_| anyhow::format_err!("Not a quakec function (TODO)"))?;
-
-        let out = self.execute_def(&quakec_func)?;
-        let value = VmValue::try_from(out)?;
-
-        self.to_value(value)
-    }
-
+    /// Run a QuakeC function.
     // TODO: We can use the unsafe checkpoint API if just recursing becomes too slow.
     pub fn execute_def(&mut self, function: &QCFunctionDef) -> anyhow::Result<[VmScalar; 3]> {
         let Self {
@@ -1377,33 +1882,50 @@ where
             memory,
             backtrace,
             context,
+            limits,
+            compat,
             entity_def,
             string_table,
             functions,
         } = self;
 
-        alloc.scoped(move |alloc| {
+        let limits: &Limits = limits;
+        let depth = limits.depth.get();
+        if depth + 1 >= MAX_CALL_DEPTH {
+            anyhow::bail!(
+                "Call stack overflow calling {}: more than {MAX_CALL_DEPTH} nested calls",
+                function.name.to_string_lossy()
+            );
+        }
+
+        let initial_locals = memory.global.initial_range(function.frame_range())?;
+
+        tracing::debug!(target: "qcvm::calls", "Calling QuakeC function {}", function.name.to_string_lossy());
+
+        limits.depth.set(depth + 1);
+
+        let result = alloc.scoped(move |alloc| {
             let mut new_memory = ExecutionMemory {
-                local: function.ctx(&alloc),
+                local: function.ctx(&alloc, initial_locals),
                 global: memory.global,
                 last_ret: None,
             };
 
-            let mut dst_locals = function.body.locals.clone();
+            // Arguments are copied to consecutive addresses starting at the first local, which
+            // are always in the frame (see `QCFunctionDef::frame_range`).
+            let mut dst = function.body.locals.start;
 
-            for (src, dst_size) in function_args().into_iter().zip(&function.args) {
+            for (src, dst_size) in function_args().zip(&function.args) {
                 match dst_size.arg_size() {
                     ArgSize::Scalar => {
-                        let src = src.addr;
-                        let dst = dst_locals
-                            .next()
-                            .ok_or_else(|| anyhow::format_err!("Too few locals for arguments"))?;
-                        new_memory.set(dst, memory.get(src as usize)?)?;
+                        new_memory.set(dst, memory.get(src.addr as usize)?)?;
+                        dst += 1;
                     }
 
                     ArgSize::Vector => {
-                        for (src, dst) in src.vector_field_addrs().zip(dst_locals.by_ref()) {
+                        for src in src.vector_field_addrs() {
                             new_memory.set(dst, memory.get(src as usize)?)?;
+                            dst += 1;
                         }
                     }
                 }
@@ -1414,32 +1936,41 @@ where
                 alloc,
                 backtrace: BacktraceFrame(Some((&function.name, &*backtrace))),
                 context: &mut **context,
+                limits,
+                compat,
                 entity_def,
                 string_table,
                 functions,
             };
 
             out.execute_internal()
-        })
+        });
+
+        limits.depth.set(depth);
+
+        result.with_context(|| format!("in {}", function.name.to_string_lossy()))
     }
 
-    // TODO
+    /// The names of the functions currently being executed, innermost first.
     pub fn backtrace(&self) -> impl Iterator<Item = &'_ CStr> + '_ {
         std::iter::successors(self.backtrace.0.as_ref(), |(_, prev)| prev.0.as_ref())
             .map(|(name, _)| *name)
     }
 
-    // TODO
-    #[expect(dead_code)]
+    /// Logs the QuakeC call stack, if `force` is set or backtraces are enabled with
+    /// `RUST_LIB_BACKTRACE`/`RUST_BACKTRACE`.
     pub fn print_backtrace(&self, force: bool) {
         let backtrace_var =
             std::env::var("RUST_LIB_BACKTRACE").or_else(|_| std::env::var("RUST_BACKTRACE"));
-        let backtrace_enabled = matches!(backtrace_var.as_deref(), Err(_) | Ok("0"));
+        let backtrace_enabled = matches!(backtrace_var.as_deref(), Ok(v) if v != "0");
         if force || backtrace_enabled {
-            for (depth, name) in self.backtrace().enumerate() {
-                // TODO: More info about the function (e.g. builtin vs internal)
-                println!("{}: {}", depth, name.to_string_lossy());
-            }
+            let frames = self
+                .backtrace()
+                .enumerate()
+                .map(|(depth, name)| format!("{depth}: {}", name.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            tracing::warn!("QuakeC backtrace:\n{frames}");
         }
     }
 }
@@ -1475,9 +2006,8 @@ where
             Ok(val) => Ok(val.try_into()?),
             Err(AddrError::Other { error: other }) => Err(other),
             Err(AddrError::OutOfRange) => {
-                let [x, y, z] = self.memory.get_vector(index)?.map(TryInto::try_into);
-                let vec: [f32; 3] = [x?, y?, z?];
-                Ok(vec.into())
+                let [x, y, z] = self.memory.get_vector(index)?.map(f32::try_from);
+                Ok(Vec3::new(x?, y?, z?))
             }
         }
     }
@@ -1487,74 +2017,95 @@ impl<Alloc> ExecutionCtx<'_, dyn ErasedContext, Alloc>
 where
     Alloc: ScopedAlloc,
 {
+    /// Stores a scalar at `index`, which may be a global provided by the host.
     pub fn set<I, V>(&mut self, index: I, value: V) -> anyhow::Result<()>
     where
         I: TryInto<usize>,
         I::Error: std::error::Error + Send + Sync + 'static,
-        V: TryInto<VmValue>,
-        V::Error: std::error::Error + Send + Sync + 'static,
+        V: Into<VmScalar>,
     {
-        // TODO: Performance is unnecessarily wasted here, where we check context for every global.
-        //       Using a type param on `Context` should allow us to fail fast.
-        // TODO: Should we even have global memory that isn't host-controlled? We already have a separate
-        //       `local_range` to prevent functions from mutating one another's locals
         let index = index.try_into()?;
-        let value = self.to_value(value.try_into()?.into())?;
-        match self
-            .context
-            .dyn_set_global(index.try_into()?, value.clone())
-        {
-            Ok(()) => Ok(()),
-            Err(AddrError::Other { error: other }) => Err(other),
-            Err(AddrError::OutOfRange) => self.memory.set(index.try_into()?, value.try_into()?),
+        let value = value.into();
+
+        // Pointers only exist inside the VM, so they can't be host globals.
+        if !matches!(value, VmScalar::Global(_) | VmScalar::EntityField(..)) {
+            let host_value = self.to_value(value.clone().into())?;
+            match self.context.dyn_set_global(index.try_into()?, host_value) {
+                Ok(()) => return Ok(()),
+                Err(AddrError::Other { error: other }) => return Err(other),
+                Err(AddrError::OutOfRange) => {}
+            }
         }
+
+        self.memory.set(index, value)
     }
 
     /// Sets the "last return" global. QuakeC only allows 1 function return to be accessible
     /// at a given time.
     ///
     /// This can't be done with the regular `set` as this shouldn't be accessible by regular
-    /// QuakeC code, only from the engine.
+    /// QuakeC code, only from the VM.
     pub fn set_return(&mut self, values: [VmScalar; 3]) {
         self.memory.last_ret = Some(values);
     }
 
-    pub fn set_vector<I, V>(&mut self, index: I, values: [V; 3]) -> anyhow::Result<()>
-    where
-        I: TryInto<usize>,
-        I::Error: std::error::Error + Send + Sync + 'static,
-        V: TryInto<VmScalar>,
-        V::Error: std::error::Error + Send + Sync + 'static,
-    {
-        let index = index.try_into()?;
-        let [v0, v1, v2] = values.map(|val| val.try_into());
-        let values = [v0?, v1?, v2?];
-
-        for (i, value) in values.into_iter().enumerate() {
-            self.set(index + i, value)?;
-        }
-
-        Ok(())
-    }
-
+    /// Stores a vector at `index`. If the host provides a vector global there, it is set as a
+    /// whole, otherwise each component is stored separately.
     pub fn set_vec3<I, V>(&mut self, index: I, values: V) -> anyhow::Result<()>
     where
         I: TryInto<usize>,
         I::Error: std::error::Error + Send + Sync + 'static,
-        V: TryInto<[f32; 3]>,
-        V::Error: std::error::Error + Send + Sync + 'static,
+        V: Into<Vec3>,
     {
         let index = index.try_into()?;
-        let values = values.try_into()?;
+        let values = values.into();
 
-        self.set(index, values)
+        match self
+            .context
+            .dyn_set_global(index.try_into()?, Value::Vector(values))
+        {
+            Ok(()) => Ok(()),
+            Err(AddrError::Other { error: other }) => Err(other),
+            Err(AddrError::OutOfRange) => {
+                for (i, value) in values.to_array().into_iter().enumerate() {
+                    self.set(index + i, value)?;
+                }
+
+                Ok(())
+            }
+        }
     }
 
     fn execute_internal(&mut self) -> anyhow::Result<[VmScalar; 3]> {
         let mut counter: usize = 0;
 
         loop {
-            match self.execute_statement(self.instr(counter)?)?.into() {
+            let ops_left = self.limits.ops_left.get() - 1;
+            self.limits.ops_left.set(ops_left);
+            if ops_left == 0 {
+                self.print_backtrace(true);
+                self.limits.printed_backtrace.set(true);
+                anyhow::bail!(
+                    "runaway loop error: more than {MAX_OPS_SINGLE_CALL} statements executed"
+                );
+            }
+
+            let statement = self.instr(counter)?;
+            let result = match self.execute_statement(statement, counter) {
+                Ok(result) => result,
+                Err(e) => {
+                    if !self.limits.printed_backtrace.replace(true) {
+                        self.print_backtrace(false);
+                    }
+
+                    return Err(e.context(format!(
+                        "at statement {counter} ({} {} {} {})",
+                        statement.opcode, statement.arg1, statement.arg2, statement.arg3
+                    )));
+                }
+            };
+
+            match result.into() {
                 ControlFlow::Continue(idx) => {
                     counter = counter
                         .checked_add_signed(idx)

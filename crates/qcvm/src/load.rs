@@ -21,6 +21,7 @@ use crate::{
 };
 
 const VERSION: i32 = 6;
+/// The CRC of the `progdefs.h` this crate's Quake bindings expect.
 const CRC: i32 = 5927;
 const LUMP_COUNT: usize = 6;
 const SAVE_GLOBAL: u16 = 1 << 15;
@@ -58,7 +59,7 @@ pub(crate) struct LoadFn {
     pub args: ArrayVec<ArgSize, MAX_ARGS>,
 }
 
-/// Server-side level state.
+/// A loaded `progs.dat`.
 #[derive(Debug)]
 pub struct Progs {
     /// Global values for QuakeC bytecode.
@@ -72,6 +73,16 @@ pub struct Progs {
     pub functions: FunctionRegistry,
 }
 
+/// Checks that we have read exactly up to `expected`.
+fn expect_position<R: Seek>(src: &mut R, expected: u64) -> anyhow::Result<()> {
+    let position = src.stream_position()?;
+    if position != expected {
+        anyhow::bail!("Malformed progs.dat: expected to be at offset {expected}, found {position}");
+    }
+
+    Ok(())
+}
+
 impl Progs {
     /// Loads all data from a `progs.dat` file.
     ///
@@ -80,8 +91,20 @@ impl Progs {
     where
         R: Read + Seek,
     {
-        assert!(src.read_i32::<LittleEndian>()? == VERSION);
-        assert!(src.read_i32::<LittleEndian>()? == CRC);
+        let version = src.read_i32::<LittleEndian>()?;
+        if version != VERSION {
+            anyhow::bail!("progs version {version} not supported (expected {VERSION})");
+        }
+
+        // Quake only uses the CRC to check compatibility with `progdefs.h`, i.e. the layout of the
+        // globals and fields that the engine accesses directly.
+        let crc = src.read_i32::<LittleEndian>()?;
+        if crc != CRC {
+            anyhow::bail!(
+                "progs CRC {crc} does not match the expected CRC {CRC}: this progs.dat uses an \
+                 incompatible global/field layout"
+            );
+        }
 
         let mut lumps = [Lump {
             offset: 0,
@@ -110,12 +133,7 @@ impl Progs {
             .read_to_end(&mut strings)?;
         let string_table = StringTable::new(strings)?;
 
-        assert_eq!(
-            src.stream_position()?,
-            src.seek(SeekFrom::Start(
-                (string_lump.offset + string_lump.count) as u64,
-            ))?
-        );
+        expect_position(&mut src, (string_lump.offset + string_lump.count) as u64)?;
 
         // Read function definitions and statements and construct Functions
 
@@ -131,12 +149,10 @@ impl Progs {
             )?);
         }
 
-        assert_eq!(
-            src.stream_position()?,
-            src.seek(SeekFrom::Start(
-                (statement_lump.offset + statement_lump.count * STATEMENT_SIZE) as u64,
-            ))?
-        );
+        expect_position(
+            &mut src,
+            (statement_lump.offset + statement_lump.count * STATEMENT_SIZE) as u64,
+        )?;
 
         let statements: ArcSlice<[Statement]> = statements.into();
 
@@ -165,8 +181,14 @@ impl Progs {
 
             let mut args = ArrayVec::<ArgSize, MAX_ARGS>::new();
 
-            for byte in &arg_size_buf[..argc as usize] {
-                args.push(ArgSize::from_u8(*byte).unwrap());
+            let argc = usize::try_from(argc)
+                .ok()
+                .filter(|argc| *argc <= MAX_ARGS)
+                .ok_or_else(|| anyhow::format_err!("Function {name:?} has {argc} arguments"))?;
+            for byte in &arg_size_buf[..argc] {
+                args.push(ArgSize::from_u8(*byte).ok_or_else(|| {
+                    anyhow::format_err!("Function {name:?} has an invalid argument size ({byte})")
+                })?);
             }
 
             load_functions.push(LoadFn {
@@ -178,15 +200,12 @@ impl Progs {
             });
         }
 
-        assert_eq!(
-            src.stream_position()?,
-            src.seek(SeekFrom::Start(
-                (function_lump.offset + function_lump.count * FUNCTION_SIZE) as u64,
-            ))?
-        );
+        expect_position(
+            &mut src,
+            (function_lump.offset + function_lump.count * FUNCTION_SIZE) as u64,
+        )?;
 
-        load_functions.sort_unstable_by_key(|def| def.offset);
-
+        // Function pointers are indices into the function lump, so keep `load_functions` in order.
         let functions = FunctionRegistry::new(statements, &load_functions)?;
 
         let globaldef_lump = &lumps[LumpId::GlobalDefs as usize];
@@ -200,20 +219,18 @@ impl Progs {
 
             global_defs.push(GlobalDef {
                 save: type_ & SAVE_GLOBAL != 0,
-                type_: VmType::from_u16(type_ & !SAVE_GLOBAL).unwrap(),
+                type_: VmType::from_u16(type_ & !SAVE_GLOBAL).ok_or_else(|| {
+                    anyhow::format_err!("Global {name:?} has an invalid type ({type_})")
+                })?,
                 offset,
                 name,
             });
         }
 
-        global_defs.sort_by_key(|def| def.offset);
-
-        assert_eq!(
-            src.stream_position()?,
-            src.seek(SeekFrom::Start(
-                (globaldef_lump.offset + globaldef_lump.count * DEF_SIZE) as u64,
-            ))?
-        );
+        expect_position(
+            &mut src,
+            (globaldef_lump.offset + globaldef_lump.count * DEF_SIZE) as u64,
+        )?;
 
         let fielddef_lump = &lumps[LumpId::Fielddefs as usize];
         src.seek(SeekFrom::Start(fielddef_lump.offset as u64))?;
@@ -231,18 +248,18 @@ impl Progs {
                 ));
             }
             field_defs.push(FieldDef {
-                type_: VmType::from_u16(type_).unwrap(),
+                type_: VmType::from_u16(type_).ok_or_else(|| {
+                    anyhow::format_err!("Field {name:?} has an invalid type ({type_})")
+                })?,
                 offset,
                 name,
             });
         }
 
-        assert_eq!(
-            src.stream_position()?,
-            src.seek(SeekFrom::Start(
-                (fielddef_lump.offset + fielddef_lump.count * DEF_SIZE) as u64,
-            ))?
-        );
+        expect_position(
+            &mut src,
+            (fielddef_lump.offset + fielddef_lump.count * DEF_SIZE) as u64,
+        )?;
 
         let globals_lump = &lumps[LumpId::Globals as usize];
         src.seek(SeekFrom::Start(globals_lump.offset as u64))?;
@@ -258,7 +275,7 @@ impl Progs {
 
         let globals = GlobalRegistry::new(global_defs, &global_values)?;
 
-        let entity_def = EntityTypeDef::new(field_defs.into_boxed_slice());
+        let entity_def = EntityTypeDef::new(field_defs);
 
         Ok(Progs {
             globals,

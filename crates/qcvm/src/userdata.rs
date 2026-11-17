@@ -13,9 +13,9 @@ use bump_scope::BumpScope;
 use snafu::Snafu;
 
 use crate::{
-    Address, AsErasedContext, BuiltinDef, CallArgs, EntityRef, ErasedEntityHandle, ExecutionCtx,
-    FunctionRef, MAX_ARGS, QCMemory, QCParams, Type, Value, function_args,
-    progs::{VmScalar, VmValue},
+    Address, AsErasedContext, BuiltinDef, EntityRef, EntityTypeDef, ErasedEntityHandle,
+    ExecutionCtx, FieldDef, FunctionRef, MAX_ARGS, QCMemory, QCParams, ReturnValue, Type, Value,
+    VectorField, VmType, function_args, progs::VmValue,
 };
 
 type ErasedAddr = u16;
@@ -77,12 +77,14 @@ pub trait Context {
     ///
     /// This expected behavior is as follows:
     ///
-    /// - Set `self.nextthink` to `self.time + delta_time`, where `delta_time` is the time between
+    /// - Set `self.nextthink` to `time + delta_time`, where `delta_time` is the time between
     ///   frames.
     /// - Set `self.frame` to the first argument.
-    /// - Set `self.think` to the second argument.
-    fn state(&self, _frame: f32, _think_fn: Arc<dyn ErasedFunction>) -> Result<(), Self::Error> {
-        unimplemented!("`OP_STATE` not available in this environment");
+    /// - Set `self.think` to the second argument (a [`Value::Function`]).
+    ///
+    /// By default, this returns an error.
+    fn state(&mut self, _frame: f32, _think_fn: Value) -> anyhow::Result<()> {
+        anyhow::bail!("`OP_STATE` not available in this environment")
     }
 
     /// Set a global with the given definition
@@ -99,24 +101,30 @@ pub trait ErasedContext: Any {
     fn dyn_builtin(&self, def: &BuiltinDef) -> anyhow::Result<Arc<dyn ErasedFunction>>;
 
     /// Dynamic version of [`Context::state`].
-    fn dyn_state(&self, _frame: f32, _think_fn: Arc<dyn ErasedFunction>) -> anyhow::Result<()> {
+    fn dyn_state(&mut self, _frame: f32, _think_fn: Value) -> anyhow::Result<()> {
         anyhow::bail!("`OP_STATE` not available in this environment")
     }
 
     /// Dynamic version of `<Context::Entity as EntityHandle>::get`.
+    ///
+    /// `entity_def` is used to look up fields that aren't known to the host's field address type
+    /// (i.e. those defined by the `progs.dat` rather than `progdefs.h`).
     fn dyn_entity_get(
         &self,
         erased_ent: EntityRef,
         field: ErasedAddr,
         ty: Type,
+        entity_def: &EntityTypeDef,
     ) -> anyhow::Result<Value, AddrError<anyhow::Error>>;
 
-    /// Dynamic version of `<Context::Entity as EntityHandle>::set`.
+    /// Dynamic version of `<Context::Entity as EntityHandle>::set`. See
+    /// [`ErasedContext::dyn_entity_get`].
     fn dyn_entity_set(
         &mut self,
         erased_ent: EntityRef,
         field: ErasedAddr,
         value: Value,
+        entity_def: &EntityTypeDef,
     ) -> anyhow::Result<(), AddrError<anyhow::Error>>;
 
     /// Dynamic version of [`Context::global`]
@@ -142,6 +150,34 @@ impl fmt::Debug for &'_ dyn ErasedContext {
     }
 }
 
+/// Finds the dynamic field (see [`EntityHandle::get_dynamic`]) to use for an access of type `ty`
+/// at `offset`.
+fn dynamic_field(
+    entity_def: &EntityTypeDef,
+    offset: ErasedAddr,
+    ty: Type,
+) -> Option<(&FieldDef, Option<VectorField>)> {
+    let scalar = entity_def.get(offset)?;
+    match (ty, scalar.def.type_) {
+        // A whole vector.
+        (Type::Vector, VmType::Vector) if scalar.field == VectorField::XOrScalar => {
+            Some((&scalar.def, None))
+        }
+        (Type::Vector, _) => None,
+        // A component of a vector.
+        (_, VmType::Vector) => Some((&scalar.def, Some(scalar.field))),
+        // A scalar.
+        _ => Some((&scalar.def, None)),
+    }
+}
+
+fn dynamic_field_type(def: &FieldDef, component: Option<VectorField>) -> Type {
+    match component {
+        Some(_) => Type::Float,
+        None => Type::try_from(def.type_).unwrap_or_default(),
+    }
+}
+
 impl<T> ErasedContext for T
 where
     T: Any + Context,
@@ -151,20 +187,34 @@ where
         Ok(self.builtin(def).map_err(|e| anyhow::format_err!("{e}"))? as Arc<dyn ErasedFunction>)
     }
 
+    fn dyn_state(&mut self, frame: f32, think_fn: Value) -> anyhow::Result<()> {
+        self.state(frame, think_fn)
+    }
+
     fn dyn_entity_get(
         &self,
         erased_ent: EntityRef,
         field: ErasedAddr,
         ty: Type,
+        entity_def: &EntityTypeDef,
     ) -> anyhow::Result<Value, AddrError<anyhow::Error>> {
-        let field_addr =
-            <<T::Entity as EntityHandle>::FieldAddr as Address>::from_u16_typed(field, ty)
-                .ok_or(AddrError::OutOfRange)?;
-        <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| ent.get(self, field_addr))
-            .map_err(|e| anyhow::format_err!("{e}"))?
-            .map_err(|e| AddrError::Other {
-                error: anyhow::format_err!("{e}"),
-            })
+        let result = <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| {
+            match <<T::Entity as EntityHandle>::FieldAddr as Address>::from_u16_typed(field, ty) {
+                Some(field_addr) => ent.get(self, field_addr),
+                None => match dynamic_field(entity_def, field, ty) {
+                    Some((def, component)) => ent.get_dynamic(self, def, component),
+                    None => Err(AddrError::OutOfRange),
+                },
+            }
+        })
+        .map_err(|e| anyhow::format_err!("{e}"))?;
+
+        result.map_err(|e| match e {
+            AddrError::OutOfRange => AddrError::OutOfRange,
+            AddrError::Other { error } => AddrError::Other {
+                error: anyhow::format_err!("{error}"),
+            },
+        })
     }
 
     fn dyn_entity_set(
@@ -172,17 +222,39 @@ where
         erased_ent: EntityRef,
         field: ErasedAddr,
         value: Value,
+        entity_def: &EntityTypeDef,
     ) -> Result<(), AddrError<anyhow::Error>> {
-        let field_addr = <<T::Entity as EntityHandle>::FieldAddr as Address>::from_u16_typed(
-            field,
-            value.type_(),
-        )
-        .ok_or(AddrError::OutOfRange)?;
-        <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| ent.set(self, field_addr, value))
-            .map_err(|e| anyhow::format_err!("{e}"))?
-            .map_err(|e| AddrError::Other {
-                error: anyhow::format_err!("{e}"),
-            })
+        // `void` is the zero value of whatever it is stored into.
+        let lookup_ty = match value.type_() {
+            Type::Void => Type::AnyScalar,
+            ty => ty,
+        };
+
+        let result = <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| {
+            match <<T::Entity as EntityHandle>::FieldAddr as Address>::from_u16_typed(
+                field, lookup_ty,
+            ) {
+                Some(field_addr) => {
+                    let value = value.or_zero(field_addr.type_());
+                    ent.set(self, field_addr, value)
+                }
+                None => match dynamic_field(entity_def, field, lookup_ty) {
+                    Some((def, component)) => {
+                        let value = value.or_zero(dynamic_field_type(def, component));
+                        ent.set_dynamic(self, def, component, value)
+                    }
+                    None => Err(AddrError::OutOfRange),
+                },
+            }
+        })
+        .map_err(|e| anyhow::format_err!("{e}"))?;
+
+        result.map_err(|e| match e {
+            AddrError::OutOfRange => AddrError::OutOfRange,
+            AddrError::Other { error } => AddrError::Other {
+                error: anyhow::format_err!("{error}"),
+            },
+        })
     }
 
     fn dyn_global(&self, def: ErasedAddr, ty: Type) -> Result<Value, AddrError<anyhow::Error>> {
@@ -197,12 +269,15 @@ where
         def: ErasedAddr,
         value: Value,
     ) -> Result<(), AddrError<anyhow::Error>> {
-        self.set_global(
-            <T as Context>::GlobalAddr::from_u16_typed(def, value.type_())
-                .ok_or(AddrError::OutOfRange)?,
-            value,
-        )
-        .map_err(AddrError::into_anyhow)
+        let lookup_ty = match value.type_() {
+            Type::Void => Type::AnyScalar,
+            ty => ty,
+        };
+        let addr = <T as Context>::GlobalAddr::from_u16_typed(def, lookup_ty)
+            .ok_or(AddrError::OutOfRange)?;
+        let value = value.or_zero(addr.type_());
+
+        self.set_global(addr, value).map_err(AddrError::into_anyhow)
     }
 }
 
@@ -281,6 +356,32 @@ pub trait EntityHandle: QCType {
         field: Self::FieldAddr,
         value: Value,
     ) -> Result<(), AddrError<Self::Error>>;
+
+    /// Get a field that isn't one of [`EntityHandle::FieldAddr`], i.e. one defined by the
+    /// `progs.dat` itself. `component` is `Some` to get a single component of a vector field.
+    ///
+    /// By default, this returns [`AddrError::OutOfRange`].
+    fn get_dynamic(
+        &self,
+        _context: &Self::Context,
+        _def: &FieldDef,
+        _component: Option<VectorField>,
+    ) -> Result<Value, AddrError<Self::Error>> {
+        Err(AddrError::OutOfRange)
+    }
+
+    /// Set a field that isn't one of [`EntityHandle::FieldAddr`], see [`EntityHandle::get_dynamic`].
+    ///
+    /// By default, this returns [`AddrError::OutOfRange`].
+    fn set_dynamic(
+        &self,
+        _context: &mut Self::Context,
+        _def: &FieldDef,
+        _component: Option<VectorField>,
+        _value: Value,
+    ) -> Result<(), AddrError<Self::Error>> {
+        Err(AddrError::OutOfRange)
+    }
 }
 
 /// A function callable from QuakeC code. This may call further internal functions, and is
@@ -304,8 +405,7 @@ pub trait Function: QCType {
 /// The function call context, containing both the user context and the current VM context
 /// (which can be used to call into QuakeC functions).
 pub struct FnCall<'a, T: ?Sized = dyn ErasedContext> {
-    pub(crate) execution:
-        ExecutionCtx<'a, T, BumpScope<'a>, CallArgs<ArrayVec<[VmScalar; 3], MAX_ARGS>>>,
+    pub(crate) execution: ExecutionCtx<'a, T, BumpScope<'a>, crate::RawArgs>,
 }
 
 impl<T: ?Sized> Deref for FnCall<'_, T> {
@@ -338,25 +438,18 @@ where
     /// must be explicitly provided.
     ///
     /// > TODO: The signature should not need to be passed here.
-    pub fn arguments(&self, args: &[Type]) -> impl Iterator<Item = Value> {
-        function_args()
-            .into_iter()
-            .zip(args)
-            .map(|(i, ty)| match ty {
-                Type::Vector => {
-                    let [x, y, z] = self.execution.memory.get_vector(i.addr as _).unwrap();
-                    let vec = [
-                        x.try_into().unwrap(),
-                        y.try_into().unwrap(),
-                        z.try_into().unwrap(),
-                    ];
-                    self.execution.to_value(VmValue::Vector(vec)).unwrap()
-                }
-                _ => {
-                    let value = self.execution.memory.get(i.addr as _).unwrap().into();
-                    self.execution.to_value(value).unwrap()
-                }
-            })
+    pub fn arguments(&self, args: &[Type]) -> impl Iterator<Item = anyhow::Result<Value>> {
+        function_args().zip(args).map(|(i, ty)| match ty {
+            Type::Vector => {
+                let [x, y, z] = self.execution.memory.get_vector(i.addr as _)?;
+                let vec = [x.try_into()?, y.try_into()?, z.try_into()?];
+                self.execution.to_value(VmValue::Vector(vec))
+            }
+            _ => {
+                let value = self.execution.memory.get(i.addr as _)?.into();
+                self.execution.to_value(value)
+            }
+        })
     }
 }
 
@@ -376,7 +469,7 @@ where
     T: ErasedContext,
 {
     /// Call a QuakeC function by index or name.
-    pub fn call<A, F>(&mut self, function_ref: F, args: A) -> anyhow::Result<Value>
+    pub fn call<A, F>(&mut self, function_ref: F, args: A) -> anyhow::Result<ReturnValue<'a>>
     where
         F: Into<FunctionRef>,
         A: QCParams,
@@ -391,10 +484,14 @@ where
                 anyhow::format_err!("Function {:?} is not a QuakeC function", def.name)
             })?;
 
-        self.execution
+        let strings = self.execution.string_table;
+        let scalars = self
+            .execution
             .with_args(&function_def.name, args, |mut exec| {
-                Ok(exec.execute_def(&function_def)?.try_into()?)
-            })
+                exec.execute_def(&function_def)
+            })?;
+
+        Ok(ReturnValue::new(scalars, strings))
     }
 }
 

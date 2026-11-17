@@ -1,19 +1,37 @@
+use anyhow::Context as _;
 use arrayvec::ArrayVec;
 #[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
 use glam::Vec3;
 use num_derive::FromPrimitive;
-use std::{ffi::CStr, fmt, num::NonZeroIsize, sync::Arc};
-use tracing::{debug, error};
+use std::{ffi::CStr, fmt, num::NonZeroIsize};
+use tracing::debug;
 
 use crate::{
-    ArgAddr, ExecutionCtx, OpResult, QCMemory, ScopedAlloc, Type, function_args,
+    ArgAddr, CallSite, ExecutionCtx, OpResult, QCMemory, RawArgs, ScopedAlloc, Type, VectorField,
+    function_args,
     progs::{
         EntityField, EntityRef, FieldPtr, StringRef, VmFunctionRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
     },
-    userdata::{ErasedContext, ErasedFunction, FnCall},
+    userdata::{AddrError, ErasedContext, ErasedFunction, FnCall},
 };
+
+/// The addresses of the parameter slots that arguments are passed in.
+fn parameter_slots() -> std::ops::Range<i16> {
+    let mut args = function_args().map(|arg| arg.addr as i16);
+    let start = args.next().unwrap_or_default();
+    let end = args.last().unwrap_or(start) + VectorField::FIELDS.len() as i16;
+    start..end
+}
+
+/// Converts an error accessing an entity field to an error, as there's no fallback for fields.
+fn entity_addr_error(error: AddrError<anyhow::Error>, field: i32) -> anyhow::Error {
+    match error {
+        AddrError::OutOfRange => anyhow::format_err!("No entity field at offset {field}"),
+        AddrError::Other { error } => error,
+    }
+}
 
 #[derive(Copy, Clone, Debug, FromPrimitive, PartialEq, Eq)]
 #[cfg_attr(feature = "reflect", derive(Reflect))]
@@ -174,8 +192,11 @@ where
     ) -> anyhow::Result<[VmScalar; 3]> {
         let sig = builtin.dyn_signature()?;
         if sig.len() != num_args {
-            error!(
-                "Builtin called with wrong number of args. Proceeding, but this is probably a bug"
+            // This is expected for variadic builtins like `sprint`.
+            debug!(
+                "Builtin {} called with {num_args} args, but it takes {}",
+                name.to_string_lossy(),
+                sig.len(),
             );
         }
 
@@ -190,6 +211,7 @@ where
                 Type::Function => Ok(self.get_scalar::<_, VmFunctionRef>(addr)?.into()),
                 Type::Float => Ok(self.get_scalar::<_, f32>(addr)?.into()),
                 Type::String => Ok(self.get_scalar::<_, StringRef>(addr)?.into()),
+                Type::Field => Ok(self.get_scalar::<_, FieldPtr>(addr)?.into()),
                 Type::Void => Ok(Default::default()),
             })
             .map(|value| match value {
@@ -199,9 +221,10 @@ where
             .collect::<anyhow::Result<ArrayVec<[VmScalar; 3], MAX_ARGS>>>()?;
 
         let vm_value: VmValue = self
-            .with_args(name, params, |ctx| {
+            .with_memory(name, RawArgs(params), |ctx| {
                 builtin.dyn_call(FnCall { execution: ctx })
-            })?
+            })
+            .with_context(|| format!("in builtin {}", name.to_string_lossy()))?
             .into();
 
         Ok(vm_value.into())
@@ -212,7 +235,12 @@ impl<Alloc> ExecutionCtx<'_, dyn ErasedContext, Alloc>
 where
     Alloc: ScopedAlloc,
 {
-    pub(crate) fn execute_statement(&mut self, statement: Statement) -> anyhow::Result<OpResult> {
+    /// Executes `statement`, which is at index `pc` in the current function.
+    pub(crate) fn execute_statement(
+        &mut self,
+        statement: Statement,
+        pc: usize,
+    ) -> anyhow::Result<OpResult> {
         use Opcode as O;
 
         let op = statement.opcode;
@@ -220,8 +248,7 @@ where
         let b = statement.arg2;
         let c = statement.arg3;
 
-        debug!("{:<12} {:>5} {:>5} {:>5}", op.to_string(), a, b, c);
-        println!("{:<12} {:>5} {:>5} {:>5}", op.to_string(), a, b, c);
+        debug!("{:<12} {:>5} {:>5} {:>5}", op, a, b, c);
 
         Ok(match op {
             // Control flow ================================================
@@ -243,8 +270,22 @@ where
 
                 let result = match func_ref {
                     VmFunctionRef::Ptr(p) => {
-                        match self.functions.get_by_index(p.0)?.clone().try_into_qc() {
-                            Ok(quakec) => self.execute_def(&quakec)?,
+                        if p.is_null() {
+                            anyhow::bail!("NULL function");
+                        }
+
+                        let Ok(def) = self.functions.get_by_index(p.0) else {
+                            anyhow::bail!("NULL function ({})", p.0);
+                        };
+
+                        match def.clone().try_into_qc() {
+                            Ok(quakec) => {
+                                let site =
+                                    CallSite::Statement(self.memory.local.first_statement() + pc);
+                                self.check_num_args(&quakec, num_args, site)?;
+
+                                self.execute_def(&quakec)?
+                            }
                             Err(builtin) => self.enter_builtin(
                                 &builtin.name,
                                 &*self.context.dyn_builtin(&builtin)?,
@@ -253,6 +294,10 @@ where
                         }
                     }
                     VmFunctionRef::Extern(func) => {
+                        if func.is_null() {
+                            anyhow::bail!("NULL function");
+                        }
+
                         self.enter_builtin(c"{anonymous}", &*func, num_args)?
                     }
                 };
@@ -360,9 +405,15 @@ where
 
         let value = self
             .context
-            .dyn_entity_get(ent, ptr.0.try_into()?, Type::AnyScalar)?;
+            .dyn_entity_get(ent, ptr.0.try_into()?, Type::AnyScalar, self.entity_def)
+            .map_err(|e| entity_addr_error(e, ptr.0))?;
 
-        self.set(out_ptr, value)
+        self.set(
+            out_ptr,
+            VmScalar::try_from(value).map_err(|_| {
+                anyhow::format_err!("Field {} is a vector, but was loaded as a scalar", ptr.0)
+            })?,
+        )
     }
 
     // LOAD_V: load vector field from entity
@@ -372,10 +423,11 @@ where
 
         let value: Vec3 = self
             .context
-            .dyn_entity_get(ent, ptr.0.try_into()?, Type::Vector)?
+            .dyn_entity_get(ent, ptr.0.try_into()?, Type::Vector, self.entity_def)
+            .map_err(|e| entity_addr_error(e, ptr.0))?
             .try_into()?;
 
-        self.set_vector(out_ptr, value.into())
+        self.set_vec3(out_ptr, value)
     }
 
     fn op_address(&mut self, entity: i16, field: i16, out_ptr: i16) -> anyhow::Result<()> {
@@ -402,7 +454,8 @@ where
         let EntityField { entity, field } = self.get_scalar(out_ptr)?;
 
         self.context
-            .dyn_entity_set(entity, field.0.try_into()?, value)?;
+            .dyn_entity_set(entity, field.0.try_into()?, value, self.entity_def)
+            .map_err(|e| entity_addr_error(e, field.0))?;
 
         Ok(())
     }
@@ -416,7 +469,8 @@ where
         let EntityField { entity, field } = self.get_scalar(out_ptr)?;
 
         self.context
-            .dyn_entity_set(entity, field.0.try_into()?, f.into())?;
+            .dyn_entity_set(entity, field.0.try_into()?, f.into(), self.entity_def)
+            .map_err(|e| entity_addr_error(e, field.0))?;
 
         Ok(())
     }
@@ -605,9 +659,7 @@ where
         let s1 = self.string_table.get(s1)?;
         let s2 = self.string_table.get(s2)?;
 
-        // log_op!(self; ne_ofs = NeS(s1, s2));
-
-        self.set(out_ptr, s1 == s2)?;
+        self.set(out_ptr, s1 != s2)?;
 
         Ok(())
     }
@@ -650,13 +702,26 @@ where
             return Err(anyhow::Error::msg("Nonzero arg3 to STORE_V"));
         }
 
-        self.set_vec3(dest_ofs, self.get_vec3(src_ofs)?)?;
+        if parameter_slots().contains(&dest_ofs) {
+            // `qcc` uses `STORE_V` to copy function arguments of any type into the parameter slots,
+            // so this has to be an untyped copy of three scalars. Anywhere else, `STORE_V` copies a
+            // vector.
+            //
+            // See https://github.com/id-Software/Quake-Tools/blob/master/qcc/pr_comp.c#L362
+            for i in 0..3 {
+                let value: VmScalar = self.get_scalar(src_ofs + i)?;
+                self.set(dest_ofs + i, value)?;
+            }
+        } else {
+            let value = self.get_vec3(src_ofs)?;
+            self.set_vec3(dest_ofs, value)?;
+        }
 
         Ok(())
     }
 
     fn not(&mut self, ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
-        self.set(out_ptr, self.get_scalar::<_, VmScalar>(ptr)?.is_null())
+        self.set(out_ptr, self.get_scalar::<_, VmScalar>(ptr)?.is_false())
     }
 
     // NOT_V: Compare vec to { 0.0, 0.0, 0.0 }
@@ -711,28 +776,28 @@ where
     // AND: Logical AND
     fn op_and(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: VmScalar, b: VmScalar| {
-            !a.is_null() && !b.is_null()
+            !a.is_false() && !b.is_false()
         })
     }
 
     // OR: Logical OR
     fn op_or(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: VmScalar, b: VmScalar| {
-            !a.is_null() || !b.is_null()
+            !a.is_false() || !b.is_false()
         })
     }
 
     // BIT_AND: Bitwise AND
     fn op_bit_and(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| {
-            (a as usize & b as usize) as f32
+            (a as i32 & b as i32) as f32
         })
     }
 
     // BIT_OR: Bitwise OR
     fn op_bit_or(&mut self, f1_ptr: i16, f2_ptr: i16, out_ptr: i16) -> anyhow::Result<()> {
         self.scalar_binop(f1_ptr, f2_ptr, out_ptr, |a: f32, b: f32| {
-            (a as usize | b as usize) as f32
+            (a as i32 | b as i32) as f32
         })
     }
 
@@ -745,871 +810,8 @@ where
         let frame_id: f32 = self.get_scalar(frame_id_addr)?;
         let think_function_ref: VmFunctionRef = self.get_scalar(think_function_addr)?;
 
-        let think_function: Arc<dyn ErasedFunction> =
-            self.to_value(think_function_ref.into())?.try_into()?;
+        let think_function = self.to_value(think_function_ref.into())?;
 
         self.context.dyn_state(frame_id, think_function)
-    }
-}
-
-// Need `quake1` feature for tests.
-#[cfg(test)]
-mod test {
-    use std::{ffi::CString, fmt, num::NonZero, ops::Range, sync::Arc};
-
-    use crate::{
-        Address, EmptyAddress, ErasedEntityHandle, HashMap, VectorField, userdata::AddrError,
-    };
-    use itertools::Itertools;
-    use strum::VariantArray;
-
-    use crate::{
-        EntityRef, Type, Value,
-        entity::EntityTypeDef,
-        load::{LoadFn, Progs},
-        ops::test::assembler::{FunctionBodyBuilder, Reg},
-        progs::{
-            FieldDef, FieldPtr, GlobalDef, GlobalPtr, Ptr, StringTable, VmScalarType, VmType,
-            functions::{FunctionRegistry, MAX_ARGS, Statement},
-            globals::GlobalRegistry,
-        },
-        userdata::{Context, EntityHandle, FnCall, Function, QCType},
-    };
-
-    impl AddrError<anyhow::Error> {
-        /// Convert to anyhow, only used for tests
-        pub(crate) fn into_arc_dyn_error(
-            self,
-        ) -> AddrError<Arc<dyn std::error::Error + Send + Sync + 'static>> {
-            match self {
-                Self::OutOfRange => AddrError::OutOfRange,
-                Self::Other { error: e } => AddrError::Other {
-                    error: e.into_boxed_dyn_error().into(),
-                },
-            }
-        }
-    }
-
-    mod assembler {
-        use std::{ffi::CStr, ops::Range, sync::Arc};
-
-        use num::FromPrimitive;
-
-        use crate::{
-            Type, function_args,
-            load::LoadFn,
-            ops::Opcode,
-            progs::{VmScalarType, VmType, functions::Statement},
-        };
-
-        /// Extremely bare-bones assembler for testing that makes no attempt to reuse registers.
-        pub struct FunctionBodyBuilder<'a> {
-            statements: &'a mut Vec<Statement>,
-            arguments: Vec<Type>,
-            arg_locals: Vec<Reg>,
-            locals: Range<usize>,
-            offset: usize,
-            name: Arc<CStr>,
-        }
-
-        #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-        pub struct Reg {
-            offset: usize,
-            ty: Type,
-        }
-
-        impl Reg {
-            pub fn new(offset: usize, ty: Type) -> Self {
-                Self { offset, ty }
-            }
-        }
-
-        impl<'a> FunctionBodyBuilder<'a> {
-            pub fn new(
-                statements: &'a mut Vec<Statement>,
-                locals_start: usize,
-                name: Arc<CStr>,
-                arguments: Vec<Type>,
-            ) -> Self {
-                let offset = statements.len();
-                let mut cur_local = locals_start;
-                let arg_locals = arguments
-                    .iter()
-                    .map(|arg_type| {
-                        let start = cur_local;
-                        let count = arg_type.arg_size();
-                        cur_local += count as usize;
-                        Reg {
-                            offset: start,
-                            ty: *arg_type,
-                        }
-                    })
-                    .collect();
-
-                Self {
-                    statements,
-                    arguments,
-                    arg_locals,
-                    locals: locals_start..cur_local,
-                    offset,
-                    name,
-                }
-            }
-
-            pub fn build(self) -> LoadFn {
-                LoadFn {
-                    offset: self.offset as _,
-                    name: self.name,
-                    source: c"<test>".to_owned().into(),
-                    locals: self.locals,
-                    args: self
-                        .arguments
-                        .into_iter()
-                        .map(|arg| arg.arg_size())
-                        .collect(),
-                }
-            }
-        }
-
-        impl FunctionBodyBuilder<'_> {
-            pub fn arg(&self, n: usize) -> Reg {
-                self.arg_locals[n]
-            }
-
-            fn allocate_scalar(&mut self, ty: Type) -> Reg {
-                let new_reg = self.locals.end;
-                self.locals.end += ty.arg_size() as usize;
-                Reg {
-                    offset: new_reg,
-                    ty,
-                }
-            }
-
-            pub fn load_field(
-                &mut self,
-                entity_ref: i16,
-                field_ref: i16,
-                ty: impl Into<VmType>,
-            ) -> Reg {
-                let ty = ty.into();
-                let opcode = match ty {
-                    VmType::Vector => todo!(),
-                    VmType::Scalar(VmScalarType::Float) => Opcode::LoadF,
-                    VmType::Scalar(VmScalarType::String) => Opcode::LoadS,
-                    VmType::Scalar(VmScalarType::Entity) => Opcode::LoadEnt,
-                    VmType::Scalar(VmScalarType::FieldRef) => Opcode::LoadFld,
-                    VmType::Scalar(VmScalarType::Function) => Opcode::LoadFnc,
-                    _ => panic!("Unsupported field type!"),
-                };
-
-                let out = self.allocate_scalar(ty.try_into().unwrap());
-
-                self.statements.extend([Statement {
-                    opcode,
-                    arg1: entity_ref,
-                    arg2: field_ref,
-                    arg3: out.offset as _,
-                }]);
-
-                out
-            }
-
-            pub fn mul(&mut self, in_a: Reg, in_b: Reg) -> Reg {
-                let (ty, opcode) = match (in_a.ty, in_b.ty) {
-                    (Type::Float | Type::AnyScalar, Type::Float | Type::AnyScalar) => {
-                        (Type::Float, Opcode::MulF)
-                    }
-                    (Type::Vector, Type::Vector) => (Type::Vector, Opcode::MulV),
-                    (Type::Vector, Type::Float | Type::AnyScalar) => (Type::Vector, Opcode::MulVF),
-                    (Type::Float | Type::AnyScalar, Type::Vector) => (Type::Vector, Opcode::MulFV),
-                    _ => panic!("Invalid args to `mul`"),
-                };
-
-                let out = self.allocate_scalar(ty);
-
-                self.statements.extend([Statement {
-                    opcode,
-                    arg1: in_a.offset as _,
-                    arg2: in_b.offset as _,
-                    arg3: out.offset as _,
-                }]);
-
-                out
-            }
-
-            pub fn call(&mut self, idx: i16, args: &[Reg]) -> Reg {
-                let opcode = Opcode::from_usize(Opcode::Call0 as usize + args.len()).unwrap();
-                for (arg, dst) in args.iter().zip(function_args()) {
-                    self.copy(*arg, Reg::new(dst.addr as usize, arg.ty));
-                }
-
-                self.statements.extend([Statement {
-                    opcode,
-                    arg1: idx,
-                    arg2: 0,
-                    arg3: 0,
-                }]);
-
-                self.ret_reg(Type::AnyScalar)
-            }
-
-            fn ret_reg(&self, ty: Type) -> Reg {
-                Reg {
-                    offset: crate::RETURN_ADDRS.start,
-                    ty,
-                }
-            }
-
-            fn copy(&mut self, src: Reg, dst: Reg) {
-                let ty_to_check = if matches!(src.ty, Type::AnyScalar) {
-                    dst.ty
-                } else {
-                    src.ty
-                };
-
-                let opcode = match ty_to_check {
-                    Type::Vector => Opcode::StoreV,
-                    Type::String => Opcode::StoreS,
-                    Type::Function => Opcode::StoreF,
-                    Type::Entity => Opcode::StoreEnt,
-                    Type::Float => Opcode::StoreF,
-                    Type::Void => return,
-                    Type::AnyScalar => panic!("Can't copy any to any"),
-                };
-
-                self.statements.push(Statement {
-                    opcode,
-                    arg1: src.offset as _,
-                    arg2: dst.offset as _,
-                    arg3: 0,
-                });
-            }
-
-            pub fn ret(&mut self, ofs: Reg) {
-                self.statements.push(Statement {
-                    opcode: Opcode::Return,
-                    arg1: ofs.offset as _,
-                    arg2: 0,
-                    arg3: 0,
-                });
-            }
-        }
-    }
-
-    #[derive(Debug)]
-    struct DefinedFunction {
-        /// For calling externally.
-        function_id: Ptr,
-        /// For use with `call` opcode.
-        dynamic_id: Ptr,
-    }
-
-    struct HeaderBuilder {
-        globals: Vec<GlobalDef>,
-        global_idx: u16,
-        global_values: Vec<u8>,
-        fields: Vec<FieldDef>,
-        field_idx: u16,
-        strings: Vec<u8>,
-        functions: Vec<LoadFn>,
-        locals_start: usize,
-        statements: Vec<Statement>,
-        next_builtin: i32,
-    }
-
-    impl Default for HeaderBuilder {
-        fn default() -> Self {
-            const GLOBAL_RANGE: Range<usize> = 28..92;
-
-            Self {
-                globals: vec![],
-                global_idx: GLOBAL_RANGE.start as u16,
-                global_values: vec![0; GLOBAL_RANGE.start * std::mem::size_of::<u32>()],
-                fields: vec![],
-                field_idx: 0,
-                strings: vec![],
-                statements: vec![],
-                functions: vec![],
-                locals_start: GLOBAL_RANGE.end,
-                next_builtin: -1,
-            }
-        }
-    }
-
-    impl HeaderBuilder {
-        fn push_global(
-            &mut self,
-            name: impl AsRef<str>,
-            ty: impl Into<VmType>,
-            value: impl AsRef<[u8]>,
-        ) -> GlobalPtr {
-            let name = name.as_ref();
-            let ty = ty.into();
-            let value = value.as_ref();
-
-            let ty_size = ty.num_elements();
-            assert_eq!(value.len(), ty_size * 4);
-            let offset = self.global_idx;
-            self.global_idx = self.global_idx.checked_add(ty_size as u16).unwrap();
-            self.globals.push(GlobalDef {
-                save: false,
-                type_: ty,
-                offset,
-                name: CString::new(name).unwrap().into(),
-            });
-            self.global_values.extend_from_slice(value);
-
-            GlobalPtr(Ptr(offset as _))
-        }
-
-        fn push_field(&mut self, name: impl AsRef<str>, ty: impl Into<VmType>) -> FieldPtr {
-            let name = name.as_ref();
-            let ty = ty.into();
-
-            let ty_size = ty.num_elements();
-            let offset = self.field_idx;
-            self.field_idx = self.field_idx.checked_add(ty_size as u16).unwrap();
-            self.fields.push(FieldDef {
-                type_: ty,
-                offset,
-                name: CString::new(name).unwrap().into(),
-            });
-
-            FieldPtr(Ptr(offset as _))
-        }
-
-        #[expect(dead_code)]
-        fn push_str(&mut self, string: impl AsRef<str>) -> i32 {
-            let string = string.as_ref();
-            assert!(string.as_bytes().iter().all(|t| *t != 0));
-            let out_idx = self.strings.len();
-            self.strings.extend_from_slice(string.as_bytes());
-            self.strings.push(0);
-            out_idx.try_into().unwrap()
-        }
-
-        fn push_builtin(
-            &mut self,
-            name: impl AsRef<str>,
-            args: impl IntoIterator<Item = Type>,
-        ) -> DefinedFunction {
-            let name = name.as_ref();
-            let offset = self.next_builtin;
-            self.next_builtin -= 1;
-
-            self.functions.push(LoadFn {
-                offset,
-                name: CString::new(name).unwrap().into(),
-                source: c"<builtin>".to_owned().into(),
-                locals: 0..0,
-                args: args.into_iter().map(|ty| ty.arg_size()).collect(),
-            });
-
-            DefinedFunction {
-                function_id: Ptr(offset),
-                dynamic_id: self
-                    .push_global(
-                        format!("{name}$addr"),
-                        VmScalarType::Function,
-                        offset.to_le_bytes(),
-                    )
-                    .0,
-            }
-        }
-
-        fn push_function(
-            &mut self,
-            name: impl AsRef<str>,
-            args: impl IntoIterator<Item = Type>,
-            body: impl FnOnce(&mut FunctionBodyBuilder<'_>),
-        ) -> DefinedFunction {
-            let locals_start = self.locals_start;
-            let name = name.as_ref();
-
-            let mut builder = FunctionBodyBuilder::new(
-                &mut self.statements,
-                locals_start,
-                CString::new(name).unwrap().into(),
-                args.into_iter().collect(),
-            );
-
-            body(&mut builder);
-
-            let load_fn = builder.build();
-
-            self.locals_start = load_fn.locals.end;
-
-            let function_id = load_fn.offset;
-
-            self.functions.push(load_fn);
-
-            DefinedFunction {
-                function_id: Ptr(function_id),
-                dynamic_id: self
-                    .push_global(
-                        format!("{name}$addr"),
-                        VmScalarType::Function,
-                        function_id.to_le_bytes(),
-                    )
-                    .0,
-            }
-        }
-
-        fn build(self) -> Progs {
-            Progs {
-                globals: GlobalRegistry::new(dbg!(self.globals), &self.global_values).unwrap(),
-                entity_def: EntityTypeDef::new(self.fields),
-                string_table: StringTable::new(self.strings).unwrap(),
-                functions: FunctionRegistry::new(self.statements.into(), &self.functions).unwrap(),
-            }
-        }
-    }
-
-    #[derive(Debug, PartialEq)]
-    struct TestEnt {
-        id: usize,
-    }
-
-    type TestFnBody = dyn Fn(&[Value]) -> Value + Send + Sync;
-
-    struct TestFn {
-        signature: &'static [Type],
-        body: Box<TestFnBody>,
-    }
-
-    impl PartialEq for TestFn {
-        fn eq(&self, other: &Self) -> bool {
-            self.signature == other.signature && std::ptr::eq(&*self.body, &*other.body)
-        }
-    }
-
-    impl fmt::Debug for TestFn {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("TestFn")
-                .field("signature", &self.signature)
-                .field("body", &..)
-                .finish()
-        }
-    }
-
-    struct TestContext {
-        fields: HashMap<(usize, &'static str), Value>,
-    }
-
-    #[derive(VariantArray, Debug, Copy, Clone, PartialEq, Eq)]
-    enum FieldAddr {
-        Float,
-        Vector,
-        VectorX,
-        VectorY,
-        VectorZ,
-    }
-
-    impl Address for FieldAddr {
-        fn name(&self) -> &'static str {
-            match self {
-                FieldAddr::Float => "float_field",
-                FieldAddr::Vector => "vector_field",
-                FieldAddr::VectorX => "vector_field_x",
-                FieldAddr::VectorY => "vector_field_y",
-                FieldAddr::VectorZ => "vector_field_z",
-            }
-        }
-
-        fn vector_field_or_scalar(&self) -> (Self, VectorField) {
-            match self {
-                FieldAddr::VectorX => (FieldAddr::Vector, VectorField::XOrScalar),
-                FieldAddr::VectorY => (FieldAddr::Vector, VectorField::Y),
-                FieldAddr::VectorZ => (FieldAddr::Vector, VectorField::Z),
-                other => (*other, VectorField::XOrScalar),
-            }
-        }
-
-        fn type_(&self) -> Type {
-            match self {
-                FieldAddr::Float => Type::Float,
-                FieldAddr::Vector => Type::Vector,
-                FieldAddr::VectorX => Type::Float,
-                FieldAddr::VectorY => Type::Float,
-                FieldAddr::VectorZ => Type::Float,
-            }
-        }
-
-        fn from_u16_typed(val: u16, ty: Type) -> Option<Self> {
-            let mut i = 0;
-            while i < Self::VARIANTS.len() {
-                let variant = Self::VARIANTS[i];
-
-                if variant.to_u16() == val && variant.type_().typeck(&ty) {
-                    return Some(variant);
-                }
-
-                i += 1;
-            }
-
-            None
-        }
-
-        fn to_u16(&self) -> u16 {
-            match self {
-                FieldAddr::Float => 0,
-                FieldAddr::Vector | FieldAddr::VectorX => 1,
-                FieldAddr::VectorY => 2,
-                FieldAddr::VectorZ => 3,
-            }
-        }
-    }
-
-    const FIELDS: &[(&str, Value)] = &[
-        ("float_field", Value::Float(100.)),
-        ("vector_field", Value::Vector(glam::Vec3::new(0., 0., 0.))),
-    ];
-    const ENTITIES: &[usize] = &[1, 2, 3];
-
-    impl Default for TestContext {
-        fn default() -> Self {
-            Self {
-                fields: ENTITIES
-                    .iter()
-                    .cartesian_product(FIELDS)
-                    .map(|(id, (name, val))| ((*id, *name), val.clone()))
-                    .collect(),
-            }
-        }
-    }
-
-    impl QCType for TestEnt {
-        fn type_(&self) -> Type {
-            Type::Entity
-        }
-
-        fn is_null(&self) -> bool {
-            false
-        }
-    }
-
-    impl EntityHandle for TestEnt {
-        type Context = TestContext;
-        type Error = <TestContext as Context>::Error;
-        type FieldAddr = FieldAddr;
-
-        fn get(
-            &self,
-            context: &Self::Context,
-            field: Self::FieldAddr,
-        ) -> Result<Value, AddrError<Self::Error>> {
-            let (field, offset) = field.vector_field_or_scalar();
-            context
-                .fields
-                .get(&(self.id, field.name()))
-                .and_then(|v| v.field(offset).ok())
-                .ok_or_else(|| {
-                    AddrError::Other {
-                        error: anyhow::format_err!("No field with name {:?}", field.name()),
-                    }
-                    .into_arc_dyn_error()
-                })
-        }
-
-        fn set(
-            &self,
-            context: &mut Self::Context,
-            field: Self::FieldAddr,
-            value: Value,
-        ) -> Result<(), AddrError<Self::Error>> {
-            let (field, offset) = field.vector_field_or_scalar();
-            let existing_value: &mut Value = context
-                .fields
-                .get_mut(&(self.id, field.name()))
-                .ok_or_else(|| {
-                    AddrError::Other {
-                        error: anyhow::format_err!("No field with name {:?}", field.name()),
-                    }
-                    .into_arc_dyn_error()
-                })?;
-
-            existing_value.set(offset, value).map_err(|e| {
-                AddrError::Other {
-                    error: anyhow::Error::from(e),
-                }
-                .into_arc_dyn_error()
-            })?;
-
-            Ok(())
-        }
-
-        fn from_erased_mut<F, O>(erased: EntityRef, callback: F) -> Result<O, Self::Error>
-        where
-            F: FnOnce(&mut Self) -> O,
-        {
-            Ok(callback(&mut Self {
-                id: erased.map(NonZero::get).unwrap_or_default() as _,
-            }))
-        }
-
-        fn to_erased(&self) -> EntityRef {
-            ErasedEntityHandle::new(self.id as _)
-        }
-    }
-
-    impl QCType for TestFn {
-        fn type_(&self) -> Type {
-            Type::Function
-        }
-
-        fn is_null(&self) -> bool {
-            false
-        }
-    }
-
-    impl Function for TestFn {
-        type Context = TestContext;
-        type Error = <TestContext as Context>::Error;
-
-        fn signature(&self) -> Result<arrayvec::ArrayVec<Type, MAX_ARGS>, Self::Error> {
-            Ok(self.signature.iter().copied().collect())
-        }
-
-        fn call(&self, context: FnCall<'_, Self::Context>) -> Result<Value, Self::Error> {
-            let arguments = context.arguments(self.signature).collect::<Vec<_>>();
-
-            Ok((self.body)(&arguments))
-        }
-    }
-
-    impl Context for TestContext {
-        type Entity = TestEnt;
-        type Function = TestFn;
-        type Error = Arc<dyn std::error::Error + Send + Sync>;
-        type GlobalAddr = EmptyAddress;
-
-        fn builtin(
-            &self,
-            def: &crate::progs::functions::BuiltinDef,
-        ) -> Result<std::sync::Arc<Self::Function>, Self::Error> {
-            match def.name.to_bytes() {
-                b"mul" => Ok(Arc::new(TestFn {
-                    signature: &[Type::Float, Type::Float],
-                    body: Box::new(|args| {
-                        let args: &[Value; 2] = args.try_into().unwrap();
-                        let [a_f, b_f]: [f32; 2] =
-                            args.each_ref().map(|v| v.clone().try_into().unwrap());
-
-                        (a_f * b_f).into()
-                    }),
-                })),
-                b"add" => Ok(Arc::new(TestFn {
-                    signature: &[Type::Float, Type::Float],
-                    body: Box::new(|args| {
-                        let args: &[Value; 2] = args.try_into().unwrap();
-                        let [a_f, b_f]: [f32; 2] =
-                            args.each_ref().map(|v| v.clone().try_into().unwrap());
-
-                        (a_f + b_f).into()
-                    }),
-                })),
-                _ => Err(anyhow::format_err!(
-                    "No builtin with name {}",
-                    def.name.to_string_lossy()
-                )
-                .into_boxed_dyn_error()
-                .into()),
-            }
-        }
-
-        fn global(
-            &self,
-            _def: EmptyAddress,
-        ) -> Result<Value, crate::userdata::AddrError<Self::Error>> {
-            unreachable!()
-        }
-
-        fn set_global(
-            &mut self,
-            _def: EmptyAddress,
-            _value: Value,
-        ) -> Result<(), crate::userdata::AddrError<Self::Error>> {
-            unreachable!()
-        }
-    }
-
-    #[test]
-    fn basic() {
-        let mut header_builder = HeaderBuilder::default();
-
-        let just_mul =
-            header_builder.push_function("simple_mul_f", [Type::Float, Type::Float], |body| {
-                let arg_0 = body.arg(0);
-                let arg_1 = body.arg(1);
-                let result = body.mul(arg_0, arg_1);
-                body.ret(result);
-            });
-
-        let executor = crate::QCVm {
-            progs: header_builder.build(),
-        };
-
-        let out: f32 = executor
-            .run(
-                &mut TestContext::default(),
-                just_mul.function_id.0,
-                (3f32, 4f32),
-            )
-            .unwrap()
-            .try_into()
-            .unwrap();
-
-        assert_eq!(out, 12.);
-    }
-
-    #[test]
-    fn subcall() {
-        let mut header_builder = HeaderBuilder::default();
-
-        let constant =
-            header_builder.push_global("my_const", VmScalarType::Float, 10f32.to_le_bytes());
-
-        let mul_by_10 = header_builder.push_function("mul_by_10", [Type::Float], |body| {
-            let arg_0 = body.arg(0);
-            let arg_1 = Reg::new(constant.0.0 as _, Type::Float);
-            let result = body.mul(arg_0, arg_1);
-            body.ret(result);
-        });
-
-        let just_mul =
-            header_builder.push_function("mul_two_by_10", [Type::Float, Type::Float], |body| {
-                let arg_0 = body.arg(0);
-                let arg_1 = body.arg(1);
-                let ret = body.call(mul_by_10.dynamic_id.0 as _, &[arg_1]);
-                let result = body.mul(arg_0, ret);
-                body.ret(result);
-            });
-
-        let executor = crate::QCVm {
-            progs: header_builder.build(),
-        };
-
-        let out: f32 = executor
-            .run(
-                &mut TestContext::default(),
-                just_mul.function_id.0,
-                (3f32, 4f32),
-            )
-            .unwrap()
-            .try_into()
-            .unwrap();
-
-        assert_eq!(out, 120.);
-    }
-
-    #[test]
-    fn call_builtin() {
-        let mut header_builder = HeaderBuilder::default();
-
-        let mul_builtin = header_builder.push_builtin("mul", [Type::Float]);
-
-        let just_mul = header_builder.push_function(
-            "mul_three_with_builtin",
-            [Type::Float, Type::Float, Type::Float],
-            |body| {
-                let arg_0 = body.arg(0);
-                let arg_1 = body.arg(1);
-                let arg_2 = body.arg(2);
-                let ret = body.call(mul_builtin.dynamic_id.0 as _, &[arg_1, arg_2]);
-                let result = body.mul(arg_0, ret);
-                body.ret(result);
-            },
-        );
-
-        let executor = crate::QCVm {
-            progs: header_builder.build(),
-        };
-
-        let out: f32 = executor
-            .run(
-                &mut TestContext::default(),
-                just_mul.function_id.0,
-                (3f32, 4f32, 5f32),
-            )
-            .unwrap()
-            .try_into()
-            .unwrap();
-
-        assert_eq!(out, 60.);
-    }
-
-    #[test]
-    fn ent_fields() {
-        let mut header_builder = HeaderBuilder::default();
-
-        let ent_global_0 =
-            header_builder.push_global("ent_id_0", VmScalarType::Entity, 0i32.to_le_bytes());
-        let ent_global_1 =
-            header_builder.push_global("ent_id_1", VmScalarType::Entity, 0i32.to_le_bytes());
-        let ent_global_2 =
-            header_builder.push_global("ent_id_2", VmScalarType::Entity, 0i32.to_le_bytes());
-        let float_field = header_builder.push_field("float_field", VmScalarType::Float);
-        let field_ref = header_builder.push_global(
-            "ent_field_float",
-            VmScalarType::FieldRef,
-            float_field.0.0.to_le_bytes(),
-        );
-
-        let _just_mul = header_builder.push_function("mul_three_from_fields", [], |body| {
-            let ent_0_fld = body.load_field(
-                ent_global_0.0.0 as _,
-                field_ref.0.0 as _,
-                VmScalarType::Float,
-            );
-            let ent_1_fld = body.load_field(
-                ent_global_1.0.0 as _,
-                field_ref.0.0 as _,
-                VmScalarType::Float,
-            );
-            let ent_2_fld = body.load_field(
-                ent_global_2.0.0 as _,
-                field_ref.0.0 as _,
-                VmScalarType::Float,
-            );
-            let mul_tmp_0 = body.mul(ent_0_fld, ent_1_fld);
-            let result = body.mul(mul_tmp_0, ent_2_fld);
-            body.ret(result);
-        });
-
-        let mut executor = crate::QCVm {
-            progs: (header_builder.build()),
-        };
-
-        executor
-            .progs
-            .globals
-            .get_mut(ent_global_0.0.0)
-            .unwrap()
-            .value = NonZero::new(1).into();
-        executor
-            .progs
-            .globals
-            .get_mut(ent_global_1.0.0)
-            .unwrap()
-            .value = NonZero::new(2).into();
-        executor
-            .progs
-            .globals
-            .get_mut(ent_global_2.0.0)
-            .unwrap()
-            .value = NonZero::new(3).into();
-
-        let out: f32 = executor
-            .run(&mut TestContext::default(), c"mul_three_from_fields", ())
-            .unwrap()
-            .try_into()
-            .unwrap();
-
-        assert_eq!(out, 100f32.powi(3));
-    }
-
-    #[test]
-    fn per_execution_globals() {
-        // TODO: Test per-execution globals (e.g. self, other)
     }
 }

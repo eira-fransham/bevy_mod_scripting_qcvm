@@ -2,11 +2,21 @@
 //!
 //! The main engine is in the `qcvm` crate. This is just bindings for `bevy_mod_scripting`.
 //!
-//! To add builtins to the engine, add callbacks to the [`QCWorldspawn`] namespace. Fields are
+//! To add builtins to the engine, register callbacks with `NamespaceBuilder::<QCWorldspawn>`. Fields are
 //! accessed using the `get` and `set` of `MagicFunctions`, where globals are accessed using
 //! `QCWorldspawn` reflect references and fields are accessed using `QCEntity`. In the rare
 //! case that fields need to be accessed on worldspawn (which, unfortunately, is allowed by
 //! Quake), `QCEntity` is still used.
+//!
+//! Values are passed to and from the magic functions and builtins as follows:
+//!
+//! - Floats are [`ScriptValue::Float`].
+//! - Vectors are a [`ScriptValue::List`] of three floats.
+//! - Entities are references to their [`QCEntity`] component (including worldspawn).
+//! - Strings are references to a [`QCString`], which keeps QuakeC's (not necessarily UTF-8) bytes
+//!   and distinguishes the null string from other empty strings.
+//! - Functions defined by the `progs.dat` are references to a [`QCFunction`].
+//! - Field references are references to a [`QCField`].
 
 #![deny(missing_docs)]
 
@@ -14,28 +24,32 @@ use std::{
     any::{Any, TypeId},
     borrow::Cow,
     collections::VecDeque,
-    ffi::CString,
+    ffi::{CStr, CString},
     fmt,
     marker::PhantomData,
+    num::NonZero,
     str::FromStr as _,
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
-use bevy_ecs::{component::Component, entity::Entity, world::WorldId};
+use bevy_ecs::{
+    component::Component, entity::Entity, resource::Resource, world::World, world::WorldId,
+};
 use bevy_math::Vec3;
 use bevy_mod_scripting_asset::Language;
 use bevy_mod_scripting_bindings::{
-    DynamicScriptFunction, ExternalError, FunctionCallContext, InteropError, IntoNamespace,
-    ReflectAccessId, ReflectBase, ReflectBaseType, ReflectReference, ScriptValue,
-    ThreadScriptContext, ThreadWorldContainer,
+    CurrentScriptAttachment, DynamicScriptFunction, ExternalError, FunctionCallContext,
+    InteropError, ReflectBase, ReflectReference, ScriptValue, ThreadScriptContext,
+    ThreadWorldContainer, VariadicTuple, WorldAccessGuard, WorldExtensions, WorldGuard,
 };
 use bevy_mod_scripting_core::{
     IntoScriptPluginParams, ScriptingPlugin, config::GetPluginThreadConfig, event::CallbackLabel,
 };
 use bevy_mod_scripting_script::ScriptAttachment;
-use bevy_reflect::PartialReflect;
+use bevy_reflect::{PartialReflect, Reflect, std_traits::ReflectDefault};
 use qcvm::{
-    Address, ArgError, EmptyAddress, EntityRef, ErasedEntityHandle, QCParams, anyhow,
+    Address, ArgError, EntityRef, ErasedEntityHandle, FieldDef, FunctionIndex, FunctionRef,
+    QCParams, VectorField, anyhow,
     arrayvec::ArrayVec,
     userdata::{AddrError, EntityHandle, QCType},
 };
@@ -54,10 +68,131 @@ where
 {
     /// The inner config for the plugin
     pub scripting_plugin: ScriptingPlugin<QCScriptingPlugin<GlobalAddr, FieldAddr>>,
+    /// The options that `progs.dat`s are loaded with (and reloaded with). The defaults are
+    /// strict; see [`qcvm::VmOptions`].
+    pub vm_options: qcvm::VmOptions,
 }
 
-// HACK: This should be configurable elsewhere, but this is ok for now
-const SPECIAL_ARGS_ARE_IMMUTABLE: bool = true;
+/// The [`qcvm::VmOptions`] that QuakeC contexts are loaded with, inserted by
+/// [`QCScriptingPlugin`] from [`QCScriptingPlugin::vm_options`].
+#[derive(Resource, Debug, Clone, Default)]
+pub struct QCVmOptions(pub qcvm::VmOptions);
+
+/// The [`QCVmOptions`] of the world that a context is being loaded in.
+fn vm_options() -> Result<qcvm::VmOptions, InteropError> {
+    thread_context()?
+        .world
+        .with_resource::<QCVmOptions, _, _>(|options| options.0.clone())
+}
+
+/// A QuakeC string.
+///
+/// QuakeC strings are bytes rather than UTF-8 (Quake uses the high bit for "gold" text), and the
+/// null string (which unset fields hold) is distinct from other empty strings. The default value is
+/// the null string.
+#[derive(Reflect, Clone, PartialEq, Eq, Hash)]
+#[reflect(opaque, Clone, Debug, PartialEq, Hash, Default)]
+pub struct QCString(pub Arc<CStr>);
+
+impl QCString {
+    /// The null string.
+    pub fn null() -> Self {
+        Self(qcvm::null_string())
+    }
+
+    /// Whether this is the null string. Note that other strings can also be empty.
+    pub fn is_null(&self) -> bool {
+        qcvm::is_null_string(&self.0)
+    }
+
+    /// The bytes of the string, without the terminator.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.to_bytes()
+    }
+
+    /// Creates a (non-null) string from bytes, which are truncated at the first NUL.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+        Self(
+            CString::new(&bytes[..len])
+                .expect("Interior NULs were removed")
+                .into(),
+        )
+    }
+
+    /// The string as UTF-8, replacing invalid sequences.
+    pub fn to_string_lossy(&self) -> Cow<'_, str> {
+        self.0.to_string_lossy()
+    }
+}
+
+impl Default for QCString {
+    fn default() -> Self {
+        Self::null()
+    }
+}
+
+impl fmt::Debug for QCString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_null() {
+            f.write_str("null")
+        } else {
+            write!(f, "\"{}\"", self.as_bytes().escape_ascii())
+        }
+    }
+}
+
+impl From<&str> for QCString {
+    fn from(value: &str) -> Self {
+        Self::from_bytes(value.as_bytes())
+    }
+}
+
+impl From<Arc<CStr>> for QCString {
+    fn from(value: Arc<CStr>) -> Self {
+        Self(value)
+    }
+}
+
+/// A function defined by the `progs.dat` (either in QuakeC or as a builtin), by its index in the
+/// function table. Index 0 is the null function.
+#[derive(Reflect, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[reflect(Clone, Debug, PartialEq, Hash, Default)]
+pub struct QCFunction(pub i32);
+
+impl QCFunction {
+    /// The null function.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is the null function.
+    pub fn is_null(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// A reference to an entity field (QuakeC's `.float` etc.), by its offset (see
+/// [`qcvm::FieldRef`]). This is e.g. the field argument of Quake's `find`.
+#[derive(Reflect, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[reflect(Clone, Debug, PartialEq, Hash, Default)]
+pub struct QCField(pub u16);
+
+impl From<QCField> for qcvm::FieldRef {
+    fn from(value: QCField) -> Self {
+        Self { offset: value.0 }
+    }
+}
+
+impl From<qcvm::FieldRef> for QCField {
+    fn from(value: qcvm::FieldRef) -> Self {
+        Self(value.offset)
+    }
+}
+
+impl From<QCFunction> for FunctionRef {
+    fn from(value: QCFunction) -> Self {
+        FunctionRef::Index(value.0)
+    }
+}
 
 #[derive(Debug)]
 struct BevyScriptContext<GlobalAddr, FieldAddr> {
@@ -67,11 +202,20 @@ struct BevyScriptContext<GlobalAddr, FieldAddr> {
     _phantom: PhantomData<(GlobalAddr, FieldAddr)>,
 }
 
+impl<G, F> BevyScriptContext<G, F> {
+    fn new(context: QCVmContext) -> Self {
+        Self {
+            special_args: Default::default(),
+            context,
+            _phantom: PhantomData,
+        }
+    }
+}
+
 #[derive(PartialEq, Eq)]
 struct BevyEntityHandle<GlobalAddr, FieldAddr> {
-    id: bevy_ecs::entity::Entity,
-    /// Used to sanity check check that the ID bits are not all-zero when converting back to u64
-    is_worldspawn: bool,
+    /// `None` is worldspawn, which is resolved using the context.
+    id: Option<Entity>,
     _phantom: PhantomData<(GlobalAddr, FieldAddr)>,
 }
 
@@ -87,19 +231,60 @@ impl<G, F> QCType for BevyEntityHandle<G, F> {
     }
 
     fn is_null(&self) -> bool {
-        // TODO: Maybe worldspawn should be handled using `BevyEntityHandle` since
-        // Quake 1 allows fields to be stored on worldspawn
-        false
+        self.id.is_none()
     }
 }
 
 /// Marker component for individual entities controlled by QC
-#[derive(Component)]
+#[derive(Component, Reflect, Default)]
 pub struct QCEntity;
 
 /// Marker component for the worldspawn entity, where globals will be stored
-#[derive(Component)]
+#[derive(Component, Reflect, Default)]
 pub struct QCWorldspawn;
+
+impl<G, F> BevyEntityHandle<G, F> {
+    fn entity(&self, context: &QCVmContext) -> Entity {
+        self.id.unwrap_or(context.worldspawn)
+    }
+}
+
+fn magic_get<C: Component>(entity: Entity, key: ScriptValue) -> Result<ScriptValue, InteropError> {
+    let world = thread_context()?.world;
+    let get = world.script_function_registry().read().magic_functions.get;
+
+    get(
+        FUNCTION_CALL_CONTEXT,
+        ReflectReference::new_component_ref::<C>(entity, world.clone())?,
+        key,
+    )
+}
+
+fn magic_set<C: Component>(
+    entity: Entity,
+    key: ScriptValue,
+    value: ScriptValue,
+) -> Result<(), InteropError> {
+    let world = thread_context()?.world;
+    let set = world.script_function_registry().read().magic_functions.set;
+
+    set(
+        FUNCTION_CALL_CONTEXT,
+        ReflectReference::new_component_ref::<C>(entity, world.clone())?,
+        key,
+        value,
+    )
+}
+
+/// The key used to access a field defined by the `progs.dat` (see [`EntityHandle::get_dynamic`]):
+/// its name, or `{name}_x` etc. for the components of vector fields, as `qcc` names them.
+fn dynamic_field_key(def: &FieldDef, component: Option<VectorField>) -> ScriptValue {
+    let name = def.name.to_string_lossy();
+    ScriptValue::String(match component {
+        Some(component) => format!("{name}_{component}").into(),
+        None => name.into_owned().into(),
+    })
+}
 
 impl<GlobalAddr, FieldAddr> qcvm::userdata::EntityHandle for BevyEntityHandle<GlobalAddr, FieldAddr>
 where
@@ -115,116 +300,75 @@ where
         ctx: &Self::Context,
         field: Self::FieldAddr,
     ) -> Result<qcvm::Value, AddrError<Self::Error>> {
-        // TODO: We could do this just once when initialising the context, which may be more efficient
-        let world_ctx = ThreadWorldContainer.try_get_context()?;
-        let world = &world_ctx.world;
+        let key = ScriptValue::String(field.name().into());
+        let value =
+            interop_error_to_addr_error(magic_get::<QCEntity>(self.entity(&ctx.context), key))?;
 
-        let function_registry = world.script_function_registry();
-        let get = function_registry.read().magic_functions.get;
-
-        // TODO: We unfortunately need global access for now, since we don't know what components a getter will access.
-        //       We can add optimised getter/setter configuration later.
-        world
-            .with_read_access(ReflectAccessId::for_global(), |world| {
-                let key = ScriptValue::String(field.name().into());
-
-                get(
-                    FUNCTION_CALL_CONTEXT,
-                    ReflectReference::new_component_ref::<QCEntity>(self.id, world.clone())?,
-                    key,
-                )
-                .or_else(|e| match e {
-                    InteropError::InvalidIndex { .. } => Ok(ScriptValue::Unit),
-                    _ => Err(e),
-                })
-            })
-            .map_err(|()| InteropError::MissingWorld)?
-            .and_then(|v| {
-                bms_script_value_to_qcvm_script_value::<GlobalAddr, FieldAddr>(
-                    &v,
-                    &world_ctx,
-                    &ctx.context,
-                )
-            })
-            .map_err(Into::into)
+        Ok(bms_to_qcvm::<GlobalAddr, FieldAddr>(&value, &ctx.context)?)
     }
 
     fn set(
         &self,
-        context: &mut Self::Context,
+        ctx: &mut Self::Context,
         field: Self::FieldAddr,
         value: qcvm::Value,
     ) -> Result<(), AddrError<Self::Error>> {
-        // TODO: We could do this just once when initialising the context, which may be more efficient
-        let world_ctx = ThreadWorldContainer.try_get_context()?;
+        let key = ScriptValue::String(field.name().into());
+        let value = qcvm_to_bms::<GlobalAddr, FieldAddr>(&value, &ctx.context)?;
 
-        let function_registry = world_ctx.world.script_function_registry();
-        let set = function_registry.read().magic_functions.set;
+        interop_error_to_addr_error(magic_set::<QCEntity>(self.entity(&ctx.context), key, value))
+    }
 
-        let new_value = qcvm_script_value_to_bms_script_value::<GlobalAddr, FieldAddr>(
-            &value,
-            &world_ctx,
-            &context.context,
-        )?;
+    fn get_dynamic(
+        &self,
+        ctx: &Self::Context,
+        def: &FieldDef,
+        component: Option<VectorField>,
+    ) -> Result<qcvm::Value, AddrError<Self::Error>> {
+        let value = interop_error_to_addr_error(magic_get::<QCEntity>(
+            self.entity(&ctx.context),
+            dynamic_field_key(def, component),
+        ))?;
 
-        // TODO: We unfortunately need global access for now, since we don't know what components a getter will access.
-        //       We can add optimised getter/setter configuration later.
-        world_ctx
-            .world
-            .with_read_access(ReflectAccessId::for_global(), |world| {
-                let key = ScriptValue::String(field.name().into());
+        Ok(bms_to_qcvm::<GlobalAddr, FieldAddr>(&value, &ctx.context)?)
+    }
 
-                set(
-                    FUNCTION_CALL_CONTEXT,
-                    ReflectReference::new_component_ref::<QCEntity>(self.id, world.clone())?,
-                    key,
-                    new_value,
-                )
-                .map_err(Into::into)
-            })
-            .map_err(|()| InteropError::MissingWorld)?
+    fn set_dynamic(
+        &self,
+        ctx: &mut Self::Context,
+        def: &FieldDef,
+        component: Option<VectorField>,
+        value: qcvm::Value,
+    ) -> Result<(), AddrError<Self::Error>> {
+        let value = qcvm_to_bms::<GlobalAddr, FieldAddr>(&value, &ctx.context)?;
+
+        interop_error_to_addr_error(magic_set::<QCEntity>(
+            self.entity(&ctx.context),
+            dynamic_field_key(def, component),
+            value,
+        ))
     }
 
     fn from_erased_mut<F, O>(erased: EntityRef, callback: F) -> Result<O, Self::Error>
     where
         F: FnOnce(&mut Self) -> O,
     {
-        match erased {
-            Some(erased) => {
-                let id = bevy_ecs::entity::Entity::from_bits(erased.get());
-
-                Ok(callback(&mut Self {
-                    id,
-                    is_worldspawn: false,
-                    _phantom: PhantomData,
-                }))
-            }
-            None => {
-                let worldspawn = ThreadWorldContainer
-                    .try_get_context()?
-                    .attachment
-                    .entity()
-                    .ok_or(InteropError::MissingWorld)?;
-
-                Ok(callback(&mut Self {
-                    id: worldspawn,
-                    is_worldspawn: true,
-                    _phantom: PhantomData,
-                }))
-            }
-        }
+        Ok(callback(&mut Self {
+            id: erased.map(|erased| Entity::from_bits(erased.get())),
+            _phantom: PhantomData,
+        }))
     }
 
     fn to_erased(&self) -> EntityRef {
-        if self.is_worldspawn {
-            None
-        } else {
-            Some(ErasedEntityHandle::new(self.id.to_bits()).expect(
-                "Sanity check failed: entity references with all-zero bits \
-                 are unsupported as this is used a sentinel for worldspawn",
-            ))
-        }
+        self.id.map(entity_to_erased)
     }
+}
+
+fn entity_to_erased(entity: Entity) -> ErasedEntityHandle {
+    NonZero::new(entity.to_bits()).expect(
+        "Sanity check failed: entity references with all-zero bits \
+         are unsupported as this is used a sentinel for worldspawn",
+    )
 }
 
 fn interop_error_to_addr_error<T>(
@@ -248,32 +392,42 @@ where
     type Error = InteropError;
     type GlobalAddr = GlobalAddr;
 
-    fn builtin(
-        &self,
-        def: &qcvm::BuiltinDef,
-    ) -> Result<std::sync::Arc<Self::Function>, Self::Error> {
-        // TODO: We could do this just once when initialising the context, which may be more efficient
-        let world = ThreadWorldContainer.try_get_context()?.world;
+    fn builtin(&self, def: &qcvm::BuiltinDef) -> Result<Arc<Self::Function>, Self::Error> {
+        let cached = self
+            .context
+            .builtins
+            .read()
+            .ok()
+            .and_then(|builtins| builtins.get(&def.index).cloned())
+            .and_then(|builtin| Arc::downcast::<Self::Function>(builtin).ok());
+        if let Some(builtin) = cached {
+            return Ok(builtin);
+        }
+
+        let world = thread_context()?.world;
 
         let function_registry = world.script_function_registry();
         let function_registry = function_registry.read();
 
-        // TODO: This is a wasteful way to do lookup, maybe we should have a `BuiltinAddr` like for globals and fields?
-        let def_name = def.name.to_string_lossy().into_owned();
+        let def_name = def.name.to_string_lossy();
 
         // TODO: Just in case some progs.dats use renamed builtins, we should have some way of looking up via
         //       index, not just name.
-        if let Ok(func) =
-            function_registry.get_function(QCWorldspawn::into_namespace(), def_name.clone())
-        {
-            Ok(Arc::new(BevyBuiltin {
-                func: func.clone(),
-                context: self.context.clone(),
-                _phantom: PhantomData,
-            }))
-        } else {
-            Err(InteropError::NotImplemented)
+        let func = function_registry
+            .get_function(TypeId::of::<QCWorldspawn>(), def_name.clone())
+            .map_err(|_| {
+                InteropError::external_boxed(format!("No builtin named {def_name}").into())
+            })?;
+
+        let builtin = Arc::new(BevyBuiltin {
+            func: func.clone(),
+            _phantom: PhantomData,
+        });
+        if let Ok(mut builtins) = self.context.builtins.write() {
+            builtins.insert(def.index, builtin.clone());
         }
+
+        Ok(builtin)
     }
 
     fn global(&self, addr: Self::GlobalAddr) -> Result<qcvm::Value, AddrError<InteropError>> {
@@ -284,43 +438,11 @@ where
                 .map_err(|e| qc_interop_error(anyhow::format_err!("{e}")))?);
         }
 
-        // TODO: We could do this just once when initialising the context, which would be significantly more efficient
-        let world_ctx = ThreadWorldContainer.try_get_context()?;
+        let key = ScriptValue::String(addr.name().into());
+        let value =
+            interop_error_to_addr_error(magic_get::<QCWorldspawn>(self.context.worldspawn, key))?;
 
-        let function_registry = world_ctx.world.script_function_registry();
-        let get = function_registry.read().magic_functions.get;
-
-        let worldspawn = world_ctx
-            .attachment
-            .entity()
-            .ok_or(InteropError::MissingWorld)?;
-
-        // TODO: We unfortunately need global access for now, since we don't know what components a getter will access.
-        //       We can add optimised getter/setter configuration later.
-        world_ctx
-            .world
-            .with_read_access(
-                ReflectAccessId::for_global(),
-                |world| -> Result<_, AddrError<InteropError>> {
-                    let key = ScriptValue::String(addr.name().into());
-
-                    Ok(interop_error_to_addr_error(get(
-                        FUNCTION_CALL_CONTEXT,
-                        ReflectReference::new_component_ref::<QCWorldspawn>(
-                            worldspawn,
-                            world.clone(),
-                        )?,
-                        key,
-                    ))?)
-                },
-            )
-            .map_err(|()| InteropError::MissingWorld)?
-            .and_then(|v| {
-                interop_error_to_addr_error(bms_script_value_to_qcvm_script_value::<
-                    GlobalAddr,
-                    FieldAddr,
-                >(&v, &world_ctx, &self.context))
-            })
+        interop_error_to_addr_error(bms_to_qcvm::<GlobalAddr, FieldAddr>(&value, &self.context))
     }
 
     fn set_global(
@@ -330,7 +452,7 @@ where
     ) -> Result<(), AddrError<InteropError>> {
         let (root_addr, field_addr) = addr.vector_field_or_scalar();
         if let Some(val) = self.special_args.get_mut(&root_addr.to_u16()) {
-            if SPECIAL_ARGS_ARE_IMMUTABLE {
+            if self.context.special_args_immutable {
                 let arg_name = addr.name();
                 return Err(AddrError::Other {
                     error: qc_interop_error(anyhow::format_err!(
@@ -344,44 +466,56 @@ where
             }
         }
 
-        // TODO: We could do this just once when initialising the context, which may be more efficient
-        let world_ctx = ThreadWorldContainer.try_get_context()?;
+        let key = ScriptValue::String(addr.name().into());
+        let value = qcvm_to_bms::<GlobalAddr, FieldAddr>(&value, &self.context)?;
 
-        let function_registry = world_ctx.world.script_function_registry();
-        let set = function_registry.read().magic_functions.set;
+        interop_error_to_addr_error(magic_set::<QCWorldspawn>(
+            self.context.worldspawn,
+            key,
+            value,
+        ))
+    }
 
-        let worldspawn = world_ctx
-            .attachment
-            .entity()
-            .ok_or(InteropError::MissingWorld)?;
+    /// Implements `OP_STATE` in terms of the `self` and `time` globals and the `nextthink`, `frame`
+    /// and `think` fields, as Quake does.
+    fn state(&mut self, frame: f32, think_fn: qcvm::Value) -> anyhow::Result<()> {
+        let addr = |name: &str| {
+            GlobalAddr::from_name(name).ok_or_else(|| anyhow::format_err!("No global named {name}"))
+        };
+        let field = |name: &str| {
+            FieldAddr::from_name(name).ok_or_else(|| anyhow::format_err!("No field named {name}"))
+        };
 
-        let new_value = qcvm_script_value_to_bms_script_value::<GlobalAddr, FieldAddr>(
-            &value,
-            &world_ctx,
-            &self.context,
-        )?;
+        let get_global = |this: &Self, name: &str| -> anyhow::Result<qcvm::Value> {
+            this.global(addr(name)?)
+                .map_err(|e| anyhow::format_err!("Failed to get {name}: {e}"))
+        };
 
-        // TODO: We unfortunately need global access for now, since we don't know what components a getter will access.
-        //       We can add optimised getter/setter configuration later.
-        world_ctx
-            .world
-            .with_write_access(
-                ReflectAccessId::for_global(),
-                |world| -> Result<_, AddrError<InteropError>> {
-                    let key = ScriptValue::String(addr.name().into());
+        let qcvm::Value::Entity(self_) = get_global(self, "self")? else {
+            anyhow::bail!("`self` is not an entity");
+        };
+        let time = match get_global(self, "time")? {
+            qcvm::Value::Float(time) => time,
+            qcvm::Value::Void => 0.,
+            other => anyhow::bail!("`time` is not a float: {other:?}"),
+        };
 
-                    Ok(interop_error_to_addr_error(set(
-                        FUNCTION_CALL_CONTEXT,
-                        ReflectReference::new_component_ref::<QCWorldspawn>(
-                            worldspawn,
-                            world.clone(),
-                        )?,
-                        key,
-                        new_value,
-                    ))?)
-                },
-            )
-            .map_err(|()| InteropError::MissingWorld)?
+        let handle = BevyEntityHandle::<GlobalAddr, FieldAddr> {
+            id: self_.map(|erased| Entity::from_bits(erased.get())),
+            _phantom: PhantomData,
+        };
+
+        for (name, value) in [
+            ("nextthink", qcvm::Value::Float(time + 0.1)),
+            ("frame", qcvm::Value::Float(frame)),
+            ("think", think_fn),
+        ] {
+            handle
+                .set(self, field(name)?, value)
+                .map_err(|e| anyhow::format_err!("Failed to set {name}: {e}"))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -413,8 +547,6 @@ where
     type Error = InteropError;
 
     fn nth(&self, index: usize) -> Result<qcvm::Value, ArgError<Self::Error>> {
-        let world_ctx = ThreadWorldContainer.try_get_context()?;
-
         let arg = self
             .args
             .get(index)
@@ -423,11 +555,7 @@ where
                 index,
             })?;
 
-        Ok(bms_script_value_to_qcvm_script_value::<G, F>(
-            arg,
-            &world_ctx,
-            &self.context,
-        )?)
+        Ok(bms_to_qcvm::<G, F>(arg, &self.context)?)
     }
 
     fn count(&self) -> usize {
@@ -443,8 +571,6 @@ where
     type Error = InteropError;
 
     fn nth(&self, index: usize) -> Result<qcvm::Value, ArgError<Self::Error>> {
-        let world_ctx = ThreadWorldContainer.try_get_context()?;
-
         let arg = self
             .args
             .get(index)
@@ -453,11 +579,7 @@ where
                 index,
             })?;
 
-        Ok(bms_script_value_to_qcvm_script_value::<G, F>(
-            arg,
-            &world_ctx,
-            &self.context,
-        )?)
+        Ok(bms_to_qcvm::<G, F>(arg, &self.context)?)
     }
 
     fn count(&self) -> usize {
@@ -466,12 +588,11 @@ where
 }
 
 const FUNCTION_CALL_CONTEXT: FunctionCallContext = FunctionCallContext::new(
-    <QCScriptingPlugin<EmptyAddress, EmptyAddress> as IntoScriptPluginParams>::LANGUAGE,
+    <QCScriptingPlugin<qcvm::EmptyAddress, qcvm::EmptyAddress> as IntoScriptPluginParams>::LANGUAGE,
 );
 
 struct BevyBuiltin<GlobalAddr, FieldAddr> {
     func: DynamicScriptFunction,
-    context: QCVmContext,
     _phantom: PhantomData<(GlobalAddr, FieldAddr)>,
 }
 
@@ -511,9 +632,10 @@ where
             .info
             .arg_info
             .iter()
+            .filter(|arg| arg.type_id != TypeId::of::<FunctionCallContext>())
+            .take(qcvm::MAX_ARGS)
             .map(|arg| {
-                // TODO: Do we need to consider `[f32; 3]` or other `Vec3`-like types?
-                if arg.type_id == TypeId::of::<Vec3>() {
+                if arg.type_id == TypeId::of::<Vec3>() || arg.type_id == TypeId::of::<[f32; 3]>() {
                     qcvm::Type::Vector
                 } else {
                     qcvm::Type::AnyScalar
@@ -526,114 +648,129 @@ where
         &self,
         context: qcvm::userdata::FnCall<'_, Self::Context>,
     ) -> Result<qcvm::Value, Self::Error> {
-        // TODO: We could do this just once when initialising the context, which may be more efficient
-        let world_ctx = ThreadWorldContainer.try_get_context()?;
-
         let sig = self.signature()?;
-        let args = context.arguments(&sig);
-        let args = args
+        let args = context
+            .arguments(&sig)
             .map(|val| {
-                qcvm_script_value_to_bms_script_value::<GlobalAddr, FieldAddr>(
-                    &val,
-                    &world_ctx,
-                    &self.context,
-                )
+                let val = val.map_err(qc_interop_error)?;
+                qcvm_to_bms::<GlobalAddr, FieldAddr>(&val, &context.context)
             })
             .collect::<Result<ArrayVec<_, { qcvm::MAX_ARGS }>, _>>()?;
-        self.func.call(args, FUNCTION_CALL_CONTEXT).and_then(|val| {
-            let world = ThreadWorldContainer.try_get_context()?;
-            bms_script_value_to_qcvm_script_value::<GlobalAddr, FieldAddr>(
-                &val,
-                &world,
-                &context.context,
-            )
-        })
+
+        let result = self.func.call(args, FUNCTION_CALL_CONTEXT)?;
+        bms_to_qcvm::<GlobalAddr, FieldAddr>(&result, &context.context)
     }
 }
 
-fn bms_script_value_to_qcvm_script_value<G, F>(
+/// The default [`ReflectToValue`], which handles [`QCString`], [`QCFunction`], [`QCField`],
+/// [`Vec3`], `[f32; 3]`, `f32`, `f64` and `bool`.
+pub fn default_reflect_to_value(value: &dyn PartialReflect) -> Result<qcvm::Value, InteropError> {
+    if let Some(s) = value.try_downcast_ref::<QCString>() {
+        Ok(qcvm::Value::String(s.0.clone()))
+    } else if let Some(f) = value.try_downcast_ref::<QCFunction>() {
+        Ok(FunctionIndex(f.0).to_value())
+    } else if let Some(f) = value.try_downcast_ref::<QCField>() {
+        Ok(qcvm::Value::Field((*f).into()))
+    } else if let Some(v) = value.try_downcast_ref::<Vec3>() {
+        Ok(qcvm::Value::Vector(v.to_array().into()))
+    } else if let Some(v) = value.try_downcast_ref::<[f32; 3]>() {
+        Ok(qcvm::Value::Vector((*v).into()))
+    } else if let Some(f) = value.try_downcast_ref::<f32>() {
+        Ok(qcvm::Value::Float(*f))
+    } else if let Some(f) = value.try_downcast_ref::<f64>() {
+        Ok(qcvm::Value::Float(*f as f32))
+    } else if let Some(b) = value.try_downcast_ref::<bool>() {
+        Ok((*b).into())
+    } else {
+        Err(InteropError::external_boxed(
+            format!(
+                "Can't convert a value of type {} to QuakeC",
+                value
+                    .get_represented_type_info()
+                    .map(|info| info.type_path())
+                    .unwrap_or("<unknown>")
+            )
+            .into(),
+        ))
+    }
+}
+
+fn bms_to_qcvm<G, F>(
     bms_value: &ScriptValue,
-    world_ctx: &ThreadScriptContext<'_>,
     context: &QCVmContext,
 ) -> Result<qcvm::Value, InteropError>
 where
     G: Address,
     F: Address,
 {
-    let world = &world_ctx.world;
-    let worldspawn = world_ctx
-        .attachment
-        .entity()
-        .ok_or(InteropError::MissingWorld)?;
-    let qc_entity_id = world.get_component_id(TypeId::of::<QCEntity>())?;
-    let qc_worldspawn_id = world.get_component_id(TypeId::of::<QCWorldspawn>())?;
+    let as_f32 = |value: &ScriptValue| match *value {
+        ScriptValue::Float(f) => Some(f as f32),
+        ScriptValue::Integer(i) => Some(i as f32),
+        _ => None,
+    };
 
     match bms_value {
         ScriptValue::Unit => Ok(qcvm::Value::Void),
         &ScriptValue::Bool(b) => Ok(b.into()),
         &ScriptValue::Integer(i) => Ok(i.into()),
         &ScriptValue::Float(f) => Ok(f.into()),
-        ScriptValue::String(cow) => Ok(qcvm::Value::try_from(&cow[..])
-            .map_err(|e| InteropError::External(ExternalError(e.into_boxed_dyn_error().into())))?),
-        ScriptValue::List(script_values) => match &script_values[..] {
-            [
-                ScriptValue::Float(x),
-                ScriptValue::Float(y),
-                ScriptValue::Float(z),
-            ] => Ok(qcvm::Value::Vector([*x, *y, *z].map(|v| v as f32).into())),
-            _ => Err(InteropError::NotImplemented),
-        },
-        ScriptValue::Reference(ReflectReference {
-            base:
-                ReflectBaseType {
-                    base_id: ReflectBase::Component(ent, component_id),
-                    ..
-                },
-            ..
-        }) if Some(component_id) == qc_entity_id.as_ref() => {
-            Ok(qcvm::Value::Entity(
-                // The addresses do not matter for this usecase.
-                //
-                // TODO: Maybe we can make this more ergonomic somehow? Maybe remove the `EntityHandle`
-                //       trait entirely?
-                BevyEntityHandle::<EmptyAddress, EmptyAddress> {
-                    id: *ent,
-                    is_worldspawn: *ent == worldspawn,
-                    _phantom: PhantomData,
-                }
-                .to_erased(),
-            ))
+        ScriptValue::String(cow) => Ok(qcvm::Value::String(
+            CString::from_str(cow)
+                .map_err(|e| InteropError::External(ExternalError(Arc::new(e))))?
+                .into(),
+        )),
+        ScriptValue::List(script_values) | ScriptValue::Tuple(VariadicTuple(script_values)) => {
+            match script_values
+                .iter()
+                .map(as_f32)
+                .collect::<Option<ArrayVec<f32, 3>>>()
+            {
+                Some(values) if values.len() == 3 => Ok(qcvm::Value::Vector(
+                    [values[0], values[1], values[2]].into(),
+                )),
+                _ => Err(InteropError::external_boxed(
+                    "Only lists of 3 numbers (i.e. vectors) can be passed to QuakeC".into(),
+                )),
+            }
         }
-        ScriptValue::Reference(ReflectReference {
-            base:
-                ReflectBaseType {
-                    base_id: ReflectBase::Component(_, component_id),
-                    ..
-                },
-            ..
-        }) if Some(component_id) == qc_worldspawn_id.as_ref() => {
-            return Err(InteropError::external_boxed(
+        ScriptValue::Reference(r)
+            if let ReflectBase::Component(ent, _) = r.base.base_id()
+                && r.base.type_id() == TypeId::of::<QCEntity>() =>
+        {
+            Ok(qcvm::Value::Entity(if *ent == context.worldspawn {
+                None
+            } else {
+                Some(entity_to_erased(*ent))
+            }))
+        }
+        ScriptValue::Reference(r)
+            if matches!(r.base.base_id(), ReflectBase::Component(..))
+                && r.base.type_id() == TypeId::of::<QCWorldspawn>() =>
+        {
+            Err(InteropError::external_boxed(
                 "Tried to convert a `QCWorldspawn` reference to a qcvm entity. If this is what \
                 you intended, add a `QCEntity` component to the worldspawn entity and pass a \
                 `ReflectReference` to that component instead"
                     .into(),
-            ));
+            ))
         }
-        ScriptValue::Reference(val) => val.with_reflect(world.clone(), context.reflect_to_value)?,
-        ScriptValue::FunctionMut(_) => todo!(),
-        ScriptValue::Function(func) => Ok(qcvm::Value::Function(Arc::new(BevyBuiltin::<G, F> {
-            func: func.clone(),
-            context: context.clone(),
-            _phantom: PhantomData,
-        }))),
+        ScriptValue::Reference(val) => {
+            let world = thread_context()?.world;
+            val.with_reflect(world, context.reflect_to_value)?
+        }
+        ScriptValue::Function(func) => Ok(qcvm::Value::Function(qcvm::Function::Host(Arc::new(
+            BevyBuiltin::<G, F> {
+                func: func.clone(),
+                _phantom: PhantomData,
+            },
+        )))),
         ScriptValue::Error(e) => Err(e.clone()),
         _ => Err(InteropError::NotImplemented),
     }
 }
 
-fn qcvm_script_value_to_bms_script_value<G, F>(
+fn qcvm_to_bms<G, F>(
     qcvm_value: &qcvm::Value,
-    world_ctx: &ThreadScriptContext<'_>,
     root_ctx: &QCVmContext,
 ) -> Result<ScriptValue, InteropError>
 where
@@ -642,85 +779,143 @@ where
 {
     match qcvm_value {
         qcvm::Value::Void => Ok(ScriptValue::Unit),
-        qcvm::Value::Entity(Some(bits)) => Ok(ScriptValue::Reference(
-            ReflectReference::new_component_ref::<QCEntity>(
-                Entity::from_bits(bits.get()),
-                world_ctx.world.clone(),
-            )?,
-        )),
-        qcvm::Value::Entity(None) => {
-            let worldspawn = world_ctx
-                .attachment
-                .entity()
-                .ok_or(InteropError::MissingWorld)?;
+        qcvm::Value::Entity(entity) => {
+            let entity = entity
+                .map(|bits| Entity::from_bits(bits.get()))
+                .unwrap_or(root_ctx.worldspawn);
+            let world = thread_context()?.world;
 
             Ok(ScriptValue::Reference(
-                ReflectReference::new_component_ref::<QCEntity>(
-                    worldspawn,
-                    world_ctx.world.clone(),
-                )?,
+                ReflectReference::new_component_ref::<QCEntity>(entity, world)?,
             ))
         }
-        qcvm::Value::Function(function) => {
-            if let Some(builtin) = (&**function as &dyn Any).downcast_ref::<BevyBuiltin<G, F>>() {
+        qcvm::Value::Function(qcvm::Function::Index(index)) => Ok(ScriptValue::Reference(
+            ReflectReference::new_allocated(QCFunction(index.0)),
+        )),
+        qcvm::Value::Function(qcvm::Function::Host(function)) => {
+            let function: &dyn Any = &**function;
+            if let Some(builtin) = function.downcast_ref::<BevyBuiltin<G, F>>() {
                 Ok(ScriptValue::Function(builtin.func.clone()))
             } else {
-                let func = function.clone();
-                let root_ctx = root_ctx.clone();
-                Ok(ScriptValue::Function(DynamicScriptFunction::from(
-                    move |_: FunctionCallContext, args: VecDeque<ScriptValue>| {
-                        let inner = || -> Result<ScriptValue, InteropError> {
-                            let world_ctx = ThreadWorldContainer.try_get_context()?;
-                            let value = root_ctx
-                                .vm
-                                .run_dynamic(
-                                    &mut BevyScriptContext::<G, F> {
-                                        special_args: Default::default(),
-                                        context: root_ctx.clone(),
-                                        _phantom: PhantomData,
-                                    },
-                                    &*func,
-                                    BevyScriptArgs::<VecDeque<ScriptValue>, G, F> {
-                                        context: root_ctx.clone(),
-                                        args: &args,
-                                        _phantom: PhantomData,
-                                    },
-                                )
-                                .map_err(qc_interop_error)?;
-
-                            qcvm_script_value_to_bms_script_value::<G, F>(
-                                &value, &world_ctx, &root_ctx,
-                            )
-                        };
-
-                        inner().unwrap_or_else(ScriptValue::Error)
-                    },
-                )))
+                Err(InteropError::external_boxed(
+                    "Only functions defined by the progs or registered as builtins can be passed \
+                     out of QuakeC"
+                        .into(),
+                ))
             }
         }
         qcvm::Value::Float(f) => Ok(ScriptValue::Float(*f as f64)),
-        qcvm::Value::Vector(vec3) => Ok(ScriptValue::List(vec![
+        qcvm::Value::Vector(vec3) => Ok(ScriptValue::List(VecDeque::from([
             ScriptValue::Float(vec3.x as f64),
             ScriptValue::Float(vec3.y as f64),
             ScriptValue::Float(vec3.z as f64),
-        ])),
-        qcvm::Value::String(cstr) => Ok(ScriptValue::String(
-            cstr.to_string_lossy().into_owned().into(),
-        )),
+        ]))),
+        qcvm::Value::String(cstr) => Ok(ScriptValue::Reference(ReflectReference::new_allocated(
+            QCString(cstr.clone()),
+        ))),
+        qcvm::Value::Field(field) => Ok(ScriptValue::Reference(ReflectReference::new_allocated(
+            QCField::from(*field),
+        ))),
     }
 }
 
-fn qc_interop_error(e: qcvm::Error) -> InteropError {
-    InteropError::External(ExternalError(e.into_boxed_dyn_error().into()))
+/// Fetches the current thread's world context, converting the error to an `InteropError`
+fn thread_context<'a>() -> Result<ThreadScriptContext<'a>, InteropError> {
+    Ok(ThreadWorldContainer::try_get_context()?)
 }
 
+fn qc_interop_error(e: qcvm::Error) -> InteropError {
+    // Keep the whole chain of causes (which includes the QuakeC call stack) in the message.
+    InteropError::external_boxed(format!("{e:#}").into())
+}
+
+/// Builtins looked up by function index, so that each call doesn't need to search by name.
+type BuiltinCache = Arc<RwLock<hashbrown::HashMap<i32, Arc<dyn Any + Send + Sync>>>>;
+
 /// Wrapper around `qcvm::QCVm` that adds extra configuration for converting values
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct QCVmContext {
     /// The inner VM
     pub vm: Arc<qcvm::QCVm>,
-    /// A conversion function for arbitrary reflect values
+    /// A conversion function for arbitrary reflect values. By default, this is
+    /// [`default_reflect_to_value`].
     pub reflect_to_value: ReflectToValue,
+    /// The worldspawn entity, which holds the globals and which QuakeC refers to as `world`.
+    pub worldspawn: Entity,
+    /// If `true`, special arguments (see the callback handler) can't be written by QuakeC.
+    pub special_args_immutable: bool,
+    builtins: BuiltinCache,
+}
+
+impl fmt::Debug for QCVmContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QCVmContext")
+            .field("vm", &self.vm)
+            .field("worldspawn", &self.worldspawn)
+            .field("special_args_immutable", &self.special_args_immutable)
+            .finish_non_exhaustive()
+    }
+}
+
+impl QCVmContext {
+    /// Creates a context for `vm`, with globals stored on `worldspawn`.
+    pub fn new(vm: Arc<qcvm::QCVm>, worldspawn: Entity) -> Self {
+        Self {
+            vm,
+            reflect_to_value: default_reflect_to_value,
+            worldspawn,
+            special_args_immutable: false,
+            builtins: Default::default(),
+        }
+    }
+
+    /// Calls a QuakeC function with exclusive access to `world`.
+    ///
+    /// This can be used both from regular systems and from inside builtins (e.g. to run touch
+    /// functions from a movement builtin), as it doesn't go through `bevy_mod_scripting`'s context
+    /// handling: it creates a fresh world access guard for `world`, which is used by field and
+    /// global accessors and builtins until this returns.
+    ///
+    /// The progs don't say what type functions return, so the return value is read as `R` (see
+    /// [`qcvm::ReturnValue`]). Use `()` to ignore it, which never fails.
+    pub fn call_with_world<G, F, R>(
+        &self,
+        world: &mut World,
+        function: impl Into<FunctionRef>,
+        args: impl QCParams,
+    ) -> Result<R, InteropError>
+    where
+        G: Address,
+        F: Address,
+        R: qcvm::FromReturnValue,
+    {
+        let cache = <WorldGuard<'_> as WorldExtensions>::setup_cache(
+            world,
+            CurrentScriptAttachment::empty(),
+        );
+        WorldAccessGuard::with_static_guard(world, cache, |_guard| {
+            let mut context = BevyScriptContext::<G, F>::new(self.clone());
+            self.vm
+                .run(&mut context, function, args)
+                .and_then(|ret| ret.get())
+                .map_err(qc_interop_error)
+        })
+    }
+
+    /// The global definitions in the `progs.dat`.
+    pub fn global_defs(&self) -> &[qcvm::GlobalDef] {
+        self.vm.global_defs()
+    }
+
+    /// The entity field definitions in the `progs.dat`.
+    pub fn field_defs(&self) -> &[FieldDef] {
+        self.vm.field_defs()
+    }
+
+    /// The initial value of a global (see [`qcvm::QCVm::initial_global`]).
+    pub fn initial_global(&self, addr: u16) -> anyhow::Result<qcvm::Value> {
+        self.vm.initial_global(addr)
+    }
 }
 
 impl<GlobalAddr, FieldAddr> IntoScriptPluginParams for QCScriptingPlugin<GlobalAddr, FieldAddr>
@@ -757,7 +952,6 @@ where
                 callback(context_key, context)?;
             }
 
-            let world_ctx = ThreadWorldContainer.try_get_context()?;
             let (special_args, args_ref) = match args.get_mut(0) {
                 // QuakeC does not support structs, so if any parameter is a struct then we can treat it as
                 // special args. We only support passing special args in the first arg slot though, for
@@ -765,9 +959,7 @@ where
                 Some(ScriptValue::Map(map)) => (
                     map.drain()
                         .map(|(k, v)| {
-                            let value = bms_script_value_to_qcvm_script_value::<G, F>(
-                                &v, &world_ctx, context,
-                            )?;
+                            let value = bms_to_qcvm::<G, F>(&v, context)?;
                             let key = G::from_name(&k).ok_or_else(|| {
                                 let reason = format!("No global with name {k}");
                                 InteropError::InvalidIndex {
@@ -791,15 +983,20 @@ where
                 ))
             })?;
 
-            let val = context
+            // `bevy_mod_scripting` runs callbacks such as `on_script_loaded`, which progs don't
+            // usually define.
+            if context.vm.functions().get_by_name(&callback_cstr).is_err() {
+                return Ok(ScriptValue::Unit);
+            }
+
+            let mut script_context = BevyScriptContext::<G, F>::new(context.clone());
+            script_context.special_args = special_args;
+
+            // The progs don't say what type callbacks return, so their return values are ignored.
+            context
                 .vm
                 .run(
-                    // TODO: Implement special args (should not be part of callargs)
-                    &mut BevyScriptContext::<G, F> {
-                        special_args,
-                        context: context.clone(),
-                        _phantom: PhantomData,
-                    },
+                    &mut script_context,
                     callback_cstr,
                     BevyScriptArgs::<[ScriptValue], G, F> {
                         context: context.clone(),
@@ -809,14 +1006,13 @@ where
                 )
                 .map_err(qc_interop_error)?;
 
-            qcvm_script_value_to_bms_script_value::<G, F>(&val, &world_ctx, context)
+            Ok(ScriptValue::Unit)
         }
 
         qc_callback_handler::<GlobalAddr, FieldAddr>
     }
 
     fn context_loader() -> bevy_mod_scripting_core::context::ContextLoadFn<Self> {
-        // TODO: We should set all globals on the script attachment when loading.
         fn qc_context_loader<G, F>(
             context_key: &ScriptAttachment,
             content: &[u8],
@@ -828,12 +1024,11 @@ where
             QCScriptingPlugin<G, F>: GetPluginThreadConfig<QCScriptingPlugin<G, F>>,
         {
             let config = QCScriptingPlugin::<G, F>::readonly_configuration(world_id);
-            let mut out = QCVmContext {
-                vm: qcvm::QCVm::load(std::io::Cursor::new(content))
-                    .map_err(qc_interop_error)?
-                    .into(),
-                reflect_to_value: |_| Err(InteropError::NotImplemented),
-            };
+            let vm = qcvm::QCVm::load_with_options(std::io::Cursor::new(content), vm_options()?)
+                .map_err(qc_interop_error)?;
+            // Globals are stored on the entity the script is attached to.
+            let worldspawn = context_key.entity().unwrap_or(Entity::PLACEHOLDER);
+            let mut out = QCVmContext::new(vm.into(), worldspawn);
 
             for init in config.context_initialization_callbacks {
                 init(context_key, &mut out)?;
@@ -854,9 +1049,13 @@ where
             previous_context: &mut QCVmContext,
             _world_id: WorldId,
         ) -> Result<(), InteropError> {
-            previous_context.vm = qcvm::QCVm::load(std::io::Cursor::new(content))
-                .map_err(qc_interop_error)?
-                .into();
+            // Keep the options that the context was loaded with.
+            let options = previous_context.vm.options().clone();
+            previous_context.vm =
+                qcvm::QCVm::load_with_options(std::io::Cursor::new(content), options)
+                    .map_err(qc_interop_error)?
+                    .into();
+            previous_context.builtins = Default::default();
 
             Ok(())
         }
@@ -887,6 +1086,22 @@ mod config_impl_quake1 {
     use crate::QCScriptingPlugin;
 
     make_plugin_config_static!(QCScriptingPlugin<qcvm::quake1::globals::GlobalAddr, qcvm::quake1::fields::FieldAddr>);
+}
+
+impl<GlobalAddr, FieldAddr> bevy_app::Plugin for QCScriptingPlugin<GlobalAddr, FieldAddr>
+where
+    GlobalAddr: Address + 'static,
+    FieldAddr: Address + 'static,
+    Self: GetPluginThreadConfig<Self>,
+{
+    fn build(&self, app: &mut bevy_app::App) {
+        app.insert_resource(QCVmOptions(self.vm_options.clone()));
+        self.scripting_plugin.build(app);
+    }
+
+    fn finish(&self, app: &mut bevy_app::App) {
+        self.scripting_plugin.finish(app);
+    }
 }
 
 impl<GlobalAddr, FieldAddr> AsMut<ScriptingPlugin<Self>>
