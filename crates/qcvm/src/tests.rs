@@ -1373,6 +1373,22 @@ fn store_v_into_parameters_is_untyped() {
     assert_eq!(ctx.recorded, [Value::try_from("hello").unwrap()]);
 }
 
+/// Outside of the parameter slots, `STORE_V` copies a vector, so it can't copy other types.
+#[test]
+fn store_v_elsewhere_is_typed() {
+    for dest in [1, 900] {
+        let mut p = Program::new();
+        let text = p.string("text", "hello");
+        let (_, result) = run_main(
+            p,
+            vec![stmt(O::StoreV, text, dest, 0), stmt(O::Done, 0, 0, 0)],
+            &mut TestContext::default(),
+        );
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("ScalarCastError"), "{error}");
+    }
+}
+
 /// `qcc` sometimes says that functions with arguments have no locals, in which case the arguments
 /// are in global memory.
 #[test]

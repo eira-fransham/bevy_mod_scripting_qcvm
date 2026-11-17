@@ -8,7 +8,8 @@ use std::{ffi::CStr, fmt, num::NonZeroIsize};
 use tracing::debug;
 
 use crate::{
-    ArgAddr, CallSite, ExecutionCtx, OpResult, QCMemory, RawArgs, ScopedAlloc, Type, function_args,
+    ArgAddr, CallSite, ExecutionCtx, OpResult, QCMemory, RawArgs, ScopedAlloc, Type, VectorField,
+    function_args,
     progs::{
         EntityField, EntityRef, FieldPtr, StringRef, VmFunctionRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
@@ -16,9 +17,13 @@ use crate::{
     userdata::{AddrError, ErasedContext, ErasedFunction, FnCall},
 };
 
-/// The return value and parameters, i.e. the addresses before the first global defined by the
-/// `progs.dat`.
-const RESERVED_GLOBALS: i16 = 28;
+/// The addresses of the parameter slots that arguments are passed in.
+fn parameter_slots() -> std::ops::Range<i16> {
+    let mut args = function_args().map(|arg| arg.addr as i16);
+    let start = args.next().unwrap_or_default();
+    let end = args.last().unwrap_or(start) + VectorField::FIELDS.len() as i16;
+    start..end
+}
 
 /// Converts an error accessing an entity field to an error, as there's no fallback for fields.
 fn entity_addr_error(error: AddrError<anyhow::Error>, field: i32) -> anyhow::Error {
@@ -696,9 +701,10 @@ where
             return Err(anyhow::Error::msg("Nonzero arg3 to STORE_V"));
         }
 
-        if (0..RESERVED_GLOBALS).contains(&dest_ofs) {
+        if parameter_slots().contains(&dest_ofs) {
             // `qcc` uses `STORE_V` to copy function arguments of any type into the parameter slots,
-            // so this has to be an untyped copy of three scalars.
+            // so this has to be an untyped copy of three scalars. Anywhere else, `STORE_V` copies a
+            // vector.
             //
             // See https://github.com/id-Software/Quake-Tools/blob/master/qcc/pr_comp.c#L362
             for i in 0..3 {
