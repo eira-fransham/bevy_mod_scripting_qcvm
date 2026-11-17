@@ -69,9 +69,9 @@ impl std::fmt::Display for ArgSize {
 
 /// A QuakeC function's call frame.
 ///
-/// Only the function's locals are stored per frame. Everything else, including the parameter slots
-/// that arguments are passed in, is global memory, as in Quake: some functions are called with
-/// fewer arguments than they take, and rely on the stale values left in the parameter slots.
+/// Only the function's locals (including its arguments, see [`QCFunctionDef::frame_range`]) are
+/// stored per frame. Everything else, including the parameter slots that arguments are passed in,
+/// is global memory, as in Quake.
 #[derive(Debug)]
 pub(crate) struct FunctionExecutionCtx<'a> {
     local_storage: FixedBumpVec<'a, VmScalar>,
@@ -225,6 +225,25 @@ impl FunctionDef {
 }
 
 impl QCFunctionDef {
+    /// The addresses stored in this function's call frame: its locals, which start with its
+    /// arguments.
+    ///
+    /// `qcc` only counts locals up to the last `local` declaration, so functions that take
+    /// arguments but don't declare any locals (e.g. `ai_charge` in Quake) say that they have no
+    /// locals, even though their arguments are at the start of the locals. Quake copies arguments
+    /// there anyway, which puts them in global memory where a recursive call would overwrite them.
+    /// The frame covers them instead.
+    pub(crate) fn frame_range(&self) -> Range<usize> {
+        let locals = &self.body.locals;
+        let args_size = self
+            .args
+            .iter()
+            .map(|arg| arg.arg_size() as usize)
+            .sum::<usize>();
+
+        locals.start..locals.end.max(locals.start + args_size)
+    }
+
     /// Creates the call frame for this function. Locals start with their values from the
     /// `progs.dat` (`initial_locals`), which is what Quake's save/restore of locals amounts to.
     pub(crate) fn ctx<'scope>(
@@ -237,7 +256,7 @@ impl QCFunctionDef {
                 initial_locals.iter().cloned(),
                 &mut alloc,
             ),
-            local_range: self.body.locals.clone(),
+            local_range: self.frame_range(),
             statements: self.body.statements.clone(),
             first_statement: usize::try_from(self.offset).unwrap_or_default(),
         }

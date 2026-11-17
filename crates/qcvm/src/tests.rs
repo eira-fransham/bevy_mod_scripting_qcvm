@@ -1516,3 +1516,29 @@ fn real_progs_missing_arguments() {
     // This is the only one in Quake's `id1/progs.dat`. If testing other progs, update this list.
     assert_eq!(found, ["ogre_smash12 -> ai_charge (0 of 1)"]);
 }
+
+/// Functions that `qcc` says have no locals (see [`QCFunctionDef::frame_range`]) still get their own
+/// copy of their arguments, so a recursive call doesn't overwrite them.
+#[test]
+fn arguments_without_locals_are_per_frame() {
+    let mut p = Program::new();
+    // Function pointers are indices, so we know what this one will be.
+    let rec_ptr = p.function_ptr(1);
+    let one = p.float("one", 1.);
+    let sum = p.float("sum", 0.);
+    // void(float n) rec = { if (n) rec(n - 1); sum = sum + n; };
+    let rec = p.function("rec", &[ArgSize::Scalar], 0, |n| {
+        vec![
+            jump(O::IfNot, n, 3),
+            stmt(O::SubF, n, one, 4),
+            stmt(O::Call1, rec_ptr, 0, 0),
+            stmt(O::AddF, sum, n, sum),
+            stmt(O::Done, 0, 0, 0),
+        ]
+    });
+    assert_eq!(rec, 1);
+    let vm = p.build();
+
+    vm.run(&mut TestContext::default(), rec, (2f32,)).unwrap();
+    assert_eq!(read_float(&vm, sum), 3.);
+}

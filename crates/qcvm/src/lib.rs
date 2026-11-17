@@ -1708,7 +1708,7 @@ where
             );
         }
 
-        let initial_locals = memory.global.initial_range(function.body.locals.clone())?;
+        let initial_locals = memory.global.initial_range(function.frame_range())?;
 
         tracing::debug!(target: "qcvm::calls", "Calling QuakeC function {}", function.name.to_string_lossy());
 
@@ -1721,10 +1721,8 @@ where
                 last_ret: None,
             };
 
-            // Arguments are copied to consecutive addresses starting at the first local. Like
-            // Quake, this doesn't check that they fit in the locals: `qcc` sometimes says that
-            // functions have no locals even though they have arguments, in which case they are
-            // copied to (and read from) global memory.
+            // Arguments are copied to consecutive addresses starting at the first local, which
+            // are always in the frame (see `QCFunctionDef::frame_range`).
             let mut dst = function.body.locals.start;
 
             for (src, dst_size) in function_args().zip(&function.args) {
