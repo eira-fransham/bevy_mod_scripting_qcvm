@@ -12,7 +12,7 @@ use strum::VariantArray;
 
 use crate::{
     Address, EmptyAddress, EntityRef, EntityTypeDef, FieldDef, FunctionIndex, GlobalDef, MAX_ARGS,
-    QCVm, Type, Value, VectorField,
+    MissingArguments, QCVm, Type, Value, VectorField, VmOptions,
     load::{LoadFn, Progs},
     ops::Opcode,
     progs::{
@@ -234,21 +234,26 @@ impl Program {
         index
     }
 
-    fn build(mut self) -> QCVm {
+    fn build(self) -> QCVm {
+        self.build_with(VmOptions::default())
+    }
+
+    fn build_with(mut self, options: VmOptions) -> QCVm {
         // Make sure that the locals (and the arguments of functions without locals, which come
         // after them) are inside the globals lump.
         let end = self.next_local + 3 * MAX_ARGS as u16;
         self.set_value(end, [0; 4]);
 
         let raw = self.values.iter().flatten().copied().collect::<Vec<u8>>();
-        QCVm {
-            progs: Progs {
+        QCVm::from_progs(
+            Progs {
                 globals: GlobalRegistry::new(self.globals, &raw).unwrap(),
                 entity_def: EntityTypeDef::new(self.fields),
                 string_table: StringTable::new(self.strings).unwrap(),
                 functions: FunctionRegistry::new(self.statements.into(), &self.functions).unwrap(),
             },
-        }
+            options,
+        )
     }
 }
 
@@ -1313,13 +1318,22 @@ fn scalar_return_values() {
     assert_eq!(value, Value::try_from("hello").unwrap());
 }
 
-/// Loads a real `progs.dat`, from the path in `QCVM_PROGS`, and runs `main`.
-#[test]
-#[ignore = "needs a real progs.dat in `QCVM_PROGS`"]
-fn real_progs() {
-    let path = std::env::var_os("QCVM_PROGS").expect("`QCVM_PROGS` should be set");
+/// Loads the real `progs.dat` from the path in `QCVM_PROGS`. If it isn't set, the test is skipped.
+fn real_progs_vm() -> Option<QCVm> {
+    let Some(path) = std::env::var_os("QCVM_PROGS") else {
+        eprintln!("Skipping test: `QCVM_PROGS` isn't set");
+        return None;
+    };
     let bytes = std::fs::read(path).unwrap();
-    let vm = QCVm::load(std::io::Cursor::new(bytes)).unwrap();
+    Some(QCVm::load(std::io::Cursor::new(bytes)).unwrap())
+}
+
+/// Loads a real `progs.dat` (see [`real_progs_vm`]) and runs `main`.
+#[test]
+fn real_progs() {
+    let Some(vm) = real_progs_vm() else {
+        return;
+    };
 
     let main = vm.functions().get_by_name(c"main").unwrap().index;
     run(&vm, &mut TestContext::default(), main).unwrap();
@@ -1388,10 +1402,9 @@ fn arguments_without_locals() {
     assert_eq!(read_float(&vm, out), 3.);
 }
 
-/// Parameter slots are global memory, so a function called with fewer arguments than it takes gets
-/// the values left by the previous call, as in Quake.
-#[test]
-fn missing_arguments_use_stale_parameters() {
+/// Builds a program where `call_without_args` calls `store` (which takes an argument) without any
+/// arguments, after `set_param` has left a value in the first parameter slot.
+fn missing_arguments_program(options: VmOptions) -> (QCVm, [i32; 2], u16) {
     let mut p = Program::new();
     let three = p.float("three", 3.);
     let out = p.float("out", 0.);
@@ -1405,9 +1418,101 @@ fn missing_arguments_use_stale_parameters() {
     let call_without_args = p.function("call_without_args", &[], 0, |_| {
         vec![stmt(O::Call0, store_ptr, 0, 0), stmt(O::Done, 0, 0, 0)]
     });
-    let vm = p.build();
+    (p.build_with(options), [set_param, call_without_args], out)
+}
+
+/// By default, calling a function with fewer arguments than it takes is an error.
+#[test]
+fn missing_arguments_error_by_default() {
+    let (vm, [set_param, call_without_args], out) = missing_arguments_program(VmOptions::default());
+
+    run(&vm, &mut TestContext::default(), set_param).unwrap();
+    let error = format!(
+        "{:#}",
+        run(&vm, &mut TestContext::default(), call_without_args).unwrap_err()
+    );
+    assert!(
+        error.contains("store called with 0 args, but it takes 1"),
+        "{error}"
+    );
+    assert_eq!(read_float(&vm, out), 0.);
+
+    // The same goes for calls from the host.
+    let store = vm.functions().get_by_name(c"store").unwrap().index;
+    let error = format!(
+        "{:#}",
+        run(&vm, &mut TestContext::default(), store).unwrap_err()
+    );
+    assert!(
+        error.contains("store called with 0 args, but it takes 1"),
+        "{error}"
+    );
+}
+
+/// With [`MissingArguments::Stale`], parameter slots are global memory, so a function called with
+/// fewer arguments than it takes gets the values left by the previous call, as in Quake.
+#[test]
+fn missing_arguments_use_stale_parameters_in_compat() {
+    let (vm, [set_param, call_without_args], out) = missing_arguments_program(VmOptions {
+        missing_arguments: MissingArguments::Stale,
+    });
 
     run(&vm, &mut TestContext::default(), set_param).unwrap();
     run(&vm, &mut TestContext::default(), call_without_args).unwrap();
     assert_eq!(read_float(&vm, out), 3.);
+}
+
+/// Lists the calls in a real `progs.dat` (see [`real_progs_vm`]) that pass a QuakeC function fewer
+/// arguments than it takes. These are bugs in the QuakeC, which only work with
+/// [`MissingArguments::Stale`].
+///
+/// Only calls to constants (i.e. the function's own global) are checked, as other calls can't be
+/// resolved statically. Builtins are variadic, so they aren't checked either.
+#[test]
+fn real_progs_missing_arguments() {
+    let Some(vm) = real_progs_vm() else {
+        return;
+    };
+
+    let functions = vm.functions();
+    let mut found = vec![];
+    for caller in functions.iter() {
+        let crate::progs::functions::FunctionBody::Progs(body) = &caller.body else {
+            continue;
+        };
+
+        for statement in body.statements.iter() {
+            let Some(num_args) = (statement.opcode as usize).checked_sub(O::Call0 as usize) else {
+                continue;
+            };
+            if num_args > O::Call8 as usize - O::Call0 as usize {
+                continue;
+            }
+
+            let Ok(VmScalar::Function(crate::progs::VmFunctionRef::Ptr(ptr))) =
+                vm.progs.globals.initial(statement.arg1 as u16 as usize)
+            else {
+                continue;
+            };
+            let Ok(callee) = functions.get_by_index(ptr.0) else {
+                continue;
+            };
+            let is_constant = vm
+                .global_defs()
+                .iter()
+                .any(|def| def.offset == statement.arg1 as u16 && def.name == callee.name);
+
+            if is_constant && !callee.is_builtin() && num_args < callee.args.len() {
+                found.push(format!(
+                    "{} -> {} ({num_args} of {})",
+                    caller.name.to_string_lossy(),
+                    callee.name.to_string_lossy(),
+                    callee.args.len()
+                ));
+            }
+        }
+    }
+
+    // This is the only one in Quake's `id1/progs.dat`. If testing other progs, update this list.
+    assert_eq!(found, ["ogre_smash12 -> ai_charge (0 of 1)"]);
 }

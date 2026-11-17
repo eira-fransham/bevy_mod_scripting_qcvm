@@ -80,9 +80,17 @@ pub(crate) struct FunctionExecutionCtx<'a> {
     /// > TODO: We should only define globals at all if they are specified in the `progdefs.h` equivalent.
     local_range: Range<usize>,
     statements: ArcSlice<[Statement]>,
+    /// The index in the `progs.dat` of the function's first statement.
+    first_statement: usize,
 }
 
 impl FunctionExecutionCtx<'_> {
+    /// The index in the `progs.dat` of the function's first statement, so that statements can be
+    /// identified across functions.
+    pub fn first_statement(&self) -> usize {
+        self.first_statement
+    }
+
     pub fn instr(&self, index: usize) -> anyhow::Result<Statement> {
         Ok(*self
             .statements
@@ -231,6 +239,7 @@ impl QCFunctionDef {
             ),
             local_range: self.body.locals.clone(),
             statements: self.body.statements.clone(),
+            first_statement: usize::try_from(self.offset).unwrap_or_default(),
         }
     }
 }

@@ -31,7 +31,9 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use bevy_ecs::{component::Component, entity::Entity, world::World, world::WorldId};
+use bevy_ecs::{
+    component::Component, entity::Entity, resource::Resource, world::World, world::WorldId,
+};
 use bevy_math::Vec3;
 use bevy_mod_scripting_asset::Language;
 use bevy_mod_scripting_bindings::{
@@ -65,6 +67,22 @@ where
 {
     /// The inner config for the plugin
     pub scripting_plugin: ScriptingPlugin<QCScriptingPlugin<GlobalAddr, FieldAddr>>,
+    /// The options that `progs.dat`s are loaded with (and reloaded with). The defaults are
+    /// strict; see [`qcvm::VmOptions`] for the Quake behaviours that can be enabled to run buggy
+    /// QuakeC.
+    pub vm_options: qcvm::VmOptions,
+}
+
+/// The [`qcvm::VmOptions`] that QuakeC contexts are loaded with, inserted by
+/// [`QCScriptingPlugin`] from [`QCScriptingPlugin::vm_options`].
+#[derive(Resource, Debug, Clone, Default)]
+pub struct QCVmOptions(pub qcvm::VmOptions);
+
+/// The [`QCVmOptions`] of the world that a context is being loaded in.
+fn vm_options() -> Result<qcvm::VmOptions, InteropError> {
+    thread_context()?
+        .world
+        .with_resource::<QCVmOptions, _, _>(|options| options.0.clone())
 }
 
 /// A QuakeC string.
@@ -976,7 +994,8 @@ where
             QCScriptingPlugin<G, F>: GetPluginThreadConfig<QCScriptingPlugin<G, F>>,
         {
             let config = QCScriptingPlugin::<G, F>::readonly_configuration(world_id);
-            let vm = qcvm::QCVm::load(std::io::Cursor::new(content)).map_err(qc_interop_error)?;
+            let vm = qcvm::QCVm::load_with_options(std::io::Cursor::new(content), vm_options()?)
+                .map_err(qc_interop_error)?;
             // Globals are stored on the entity the script is attached to.
             let worldspawn = context_key.entity().unwrap_or(Entity::PLACEHOLDER);
             let mut out = QCVmContext::new(vm.into(), worldspawn);
@@ -1000,9 +1019,12 @@ where
             previous_context: &mut QCVmContext,
             _world_id: WorldId,
         ) -> Result<(), InteropError> {
-            previous_context.vm = qcvm::QCVm::load(std::io::Cursor::new(content))
-                .map_err(qc_interop_error)?
-                .into();
+            // Keep the options that the context was loaded with.
+            let options = previous_context.vm.options().clone();
+            previous_context.vm =
+                qcvm::QCVm::load_with_options(std::io::Cursor::new(content), options)
+                    .map_err(qc_interop_error)?
+                    .into();
             previous_context.builtins = Default::default();
 
             Ok(())
@@ -1043,6 +1065,7 @@ where
     Self: GetPluginThreadConfig<Self>,
 {
     fn build(&self, app: &mut bevy_app::App) {
+        app.insert_resource(QCVmOptions(self.vm_options.clone()));
         self.scripting_plugin.build(app);
     }
 

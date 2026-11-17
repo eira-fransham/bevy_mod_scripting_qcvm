@@ -38,6 +38,12 @@ Values cross into and out of QuakeC as follows:
 
 To call QuakeC from Rust, including from inside a builtin, use `QCVmContext::call_with_world`.
 
+`progs.dat`s are loaded with `QCScriptingPlugin::vm_options` (a `qcvm::VmOptions`, also available
+as the `QCVmOptions` resource), and reloaded with the options they were loaded with. The defaults
+are strict, so that bugs in QuakeC are errors. Some of the original Quake QuakeC is buggy and relies
+on quirks of Quake's VM, so to run it unmodified, opt into those quirks, e.g.
+`MissingArguments::Stale` for functions called with fewer arguments than they take.
+
 ## Sources
 
 Writing a new language for `bevy_mod_scripting` is currently poorly documented,

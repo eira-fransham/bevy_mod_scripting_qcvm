@@ -709,6 +709,10 @@ where
 {
     type Scalar = Option<VmScalar>;
 
+    fn num_args(&self) -> Option<usize> {
+        Some(self.params.count())
+    }
+
     fn get(&self, index: usize) -> anyhow::Result<Self::Scalar> {
         let Ok(index) = u16::try_from(index) else {
             return Ok(None);
@@ -731,6 +735,10 @@ pub(crate) struct RawArgs(pub ArrayVec<[VmScalar; 3], MAX_ARGS>);
 
 impl QCMemory for RawArgs {
     type Scalar = Option<VmScalar>;
+
+    fn num_args(&self) -> Option<usize> {
+        Some(self.0.len())
+    }
 
     fn get(&self, index: usize) -> anyhow::Result<Self::Scalar> {
         let Ok(index) = u16::try_from(index) else {
@@ -911,7 +919,16 @@ impl ErasedFunction for FunctionIndex {
         let def = context.execution.functions.get_by_index(self.0)?.clone();
         let num_args = def.args.len();
         let vm_value = match def.try_into_qc() {
-            Ok(quakec) => context.execution.execute_def(&quakec)?,
+            Ok(quakec) => {
+                if let Some(passed) = context.execution.memory.local.num_args() {
+                    context.execution.check_num_args(
+                        &quakec,
+                        passed,
+                        CallSite::Host(quakec.index),
+                    )?;
+                }
+                context.execution.execute_def(&quakec)?
+            }
             Err(builtin) => {
                 let func = context.execution.context.dyn_builtin(&builtin)?;
                 context
@@ -930,6 +947,54 @@ pub const MAX_OPS_SINGLE_CALL: u32 = 100_000;
 
 /// The maximum depth of nested QuakeC function calls (see `MAX_STACK_DEPTH` in Quake).
 pub const MAX_CALL_DEPTH: usize = 32;
+
+/// Options chosen when the VM is initialised, see [`QCVm::load_with_options`].
+///
+/// The defaults are strict, so that bugs in QuakeC are errors. Some of the original QuakeC
+/// (e.g. Quake's `id1/progs.dat`) is buggy and only works because of quirks of Quake's VM, so
+/// hosts that need to run it unmodified can opt into those quirks here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VmOptions {
+    /// What happens when a QuakeC function is called with fewer arguments than it takes.
+    pub missing_arguments: MissingArguments,
+}
+
+/// What happens when a QuakeC function is called with fewer arguments than it takes. See
+/// [`VmOptions::missing_arguments`].
+///
+/// This doesn't apply to builtins, which (like Quake's `pr_argc`) see how many arguments they were
+/// passed, and get `void` for the rest. Passing more arguments than a function takes is always
+/// allowed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MissingArguments {
+    /// Calling a QuakeC function with fewer arguments than it takes is an error.
+    #[default]
+    Error,
+    /// Quake's behaviour: missing arguments are whatever was left in the parameter slots.
+    ///
+    /// Parameter slots are global memory, so this is the value of that argument in the last call
+    /// (to any function) that passed it. For example, `ogre_smash12` in Quake calls `ai_charge()`
+    /// without its argument. A warning is logged the first time each call site does this.
+    Stale,
+}
+
+/// Where a function was called from, used to only warn once about each call with missing
+/// arguments.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+enum CallSite {
+    /// A call statement, by its index in the `progs.dat`.
+    Statement(usize),
+    /// A call from the host, by the index of the function called.
+    Host(i32),
+}
+
+/// [`VmOptions`], and the state needed to implement them.
+#[derive(Debug, Default)]
+struct Compat {
+    options: VmOptions,
+    /// The call sites that have already been warned about missing arguments.
+    warned_missing_arguments: parking_lot::Mutex<hashbrown::HashSet<CallSite>>,
+}
 
 /// Per-call (rather than per-frame) execution state.
 #[derive(Debug)]
@@ -956,6 +1021,7 @@ impl Default for Limits {
 #[derive(Debug)]
 pub struct QCVm {
     progs: Progs,
+    compat: Compat,
 }
 
 /// A reference to a function stored in a `QuakeCVm`.
@@ -1015,14 +1081,35 @@ impl TryFrom<&str> for FunctionRef {
 }
 
 impl QCVm {
-    /// Load the runtime from a `progs.dat` file.
+    /// Load the runtime from a `progs.dat` file, with the default (strict) [`VmOptions`].
     pub fn load<R>(bytes: R) -> anyhow::Result<Self>
     where
         R: std::io::Read + std::io::Seek,
     {
-        Ok(Self {
-            progs: Progs::load(bytes)?,
-        })
+        Self::load_with_options(bytes, VmOptions::default())
+    }
+
+    /// Load the runtime from a `progs.dat` file, with the given options.
+    pub fn load_with_options<R>(bytes: R, options: VmOptions) -> anyhow::Result<Self>
+    where
+        R: std::io::Read + std::io::Seek,
+    {
+        Ok(Self::from_progs(Progs::load(bytes)?, options))
+    }
+
+    fn from_progs(progs: Progs, options: VmOptions) -> Self {
+        Self {
+            progs,
+            compat: Compat {
+                options,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The options that the VM was loaded with.
+    pub fn options(&self) -> &VmOptions {
+        &self.compat.options
     }
 
     /// The global definitions in the `progs.dat`, sorted by offset.
@@ -1111,6 +1198,7 @@ impl QCVm {
             backtrace: Default::default(),
             context,
             limits,
+            compat: &self.compat,
             entity_def: &self.progs.entity_def,
             string_table: &self.progs.string_table,
             functions: &self.progs.functions,
@@ -1196,6 +1284,11 @@ trait QCMemory {
 
     fn get(&self, index: usize) -> anyhow::Result<Self::Scalar>;
 
+    /// If this is the arguments to a call from the host, the number of arguments passed.
+    fn num_args(&self) -> Option<usize> {
+        None
+    }
+
     fn get_vector(&self, index: usize) -> anyhow::Result<[Self::Scalar; 3]> {
         Ok([self.get(index)?, self.get(index + 1)?, self.get(index + 2)?])
     }
@@ -1252,6 +1345,7 @@ struct ExecutionCtx<
     backtrace: BacktraceFrame<'a>,
     context: &'a mut Ctx,
     limits: &'a Limits,
+    compat: &'a Compat,
     entity_def: &'a EntityTypeDef,
 
     string_table: &'a StringTable,
@@ -1398,6 +1492,7 @@ where
             backtrace,
             context,
             limits,
+            compat,
             entity_def,
             string_table,
             functions,
@@ -1414,6 +1509,7 @@ where
                 backtrace: BacktraceFrame(Some((name, backtrace))),
                 context: context.as_erased_mut(),
                 limits,
+                compat,
                 entity_def,
                 string_table,
                 functions,
@@ -1433,6 +1529,7 @@ impl<'a, Alloc, Caller> ExecutionCtx<'a, dyn ErasedContext, Alloc, Caller> {
             backtrace,
             context,
             limits,
+            compat,
             entity_def,
             string_table,
             functions,
@@ -1444,6 +1541,7 @@ impl<'a, Alloc, Caller> ExecutionCtx<'a, dyn ErasedContext, Alloc, Caller> {
             backtrace,
             context: (context as &mut dyn Any).downcast_mut()?,
             limits,
+            compat,
             entity_def,
             string_table,
             functions,
@@ -1483,6 +1581,45 @@ impl AsErasedContext for dyn ErasedContext {
 
     fn as_erased(&self) -> &dyn ErasedContext {
         self
+    }
+}
+
+impl<Ctx, Alloc, Caller> ExecutionCtx<'_, Ctx, Alloc, Caller>
+where
+    Ctx: ?Sized,
+{
+    /// Checks the number of arguments that a QuakeC function was called with, see
+    /// [`VmOptions::missing_arguments`].
+    fn check_num_args(
+        &self,
+        function: &QCFunctionDef,
+        num_args: usize,
+        site: CallSite,
+    ) -> anyhow::Result<()> {
+        let takes = function.args.len();
+        let name = function.name.to_string_lossy();
+
+        match num_args.cmp(&takes) {
+            std::cmp::Ordering::Equal => {}
+            std::cmp::Ordering::Greater => {
+                tracing::debug!("{name} called with {num_args} args, but it takes {takes}");
+            }
+            std::cmp::Ordering::Less => match self.compat.options.missing_arguments {
+                MissingArguments::Error => {
+                    anyhow::bail!("{name} called with {num_args} args, but it takes {takes}")
+                }
+                MissingArguments::Stale => {
+                    if self.compat.warned_missing_arguments.lock().insert(site) {
+                        tracing::warn!(
+                            "{name} called with {num_args} args, but it takes {takes}: using the \
+                             values left in the parameter slots ({site:?})"
+                        );
+                    }
+                }
+            },
+        }
+
+        Ok(())
     }
 }
 
@@ -1529,7 +1666,12 @@ where
         let num_args = def.args.len();
 
         let out = match def.try_into_qc() {
-            Ok(quakec) => self.execute_def(&quakec)?,
+            Ok(quakec) => {
+                if let Some(passed) = self.memory.local.num_args() {
+                    self.check_num_args(&quakec, passed, CallSite::Host(quakec.index))?;
+                }
+                self.execute_def(&quakec)?
+            }
             // Running a builtin directly is allowed, it just runs the host's function.
             Err(builtin) => {
                 let func = self.context.dyn_builtin(&builtin)?;
@@ -1551,6 +1693,7 @@ where
             backtrace,
             context,
             limits,
+            compat,
             entity_def,
             string_table,
             functions,
@@ -1606,6 +1749,7 @@ where
                 backtrace: BacktraceFrame(Some((&function.name, &*backtrace))),
                 context: &mut **context,
                 limits,
+                compat,
                 entity_def,
                 string_table,
                 functions,
@@ -1762,7 +1906,7 @@ where
             }
 
             let statement = self.instr(counter)?;
-            let result = match self.execute_statement(statement) {
+            let result = match self.execute_statement(statement, counter) {
                 Ok(result) => result,
                 Err(e) => {
                     if !self.limits.printed_backtrace.replace(true) {

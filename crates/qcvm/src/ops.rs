@@ -8,7 +8,7 @@ use std::{ffi::CStr, fmt, num::NonZeroIsize};
 use tracing::debug;
 
 use crate::{
-    ArgAddr, ExecutionCtx, OpResult, QCMemory, RawArgs, ScopedAlloc, Type, function_args,
+    ArgAddr, CallSite, ExecutionCtx, OpResult, QCMemory, RawArgs, ScopedAlloc, Type, function_args,
     progs::{
         EntityField, EntityRef, FieldPtr, StringRef, VmFunctionRef, VmScalar, VmValue,
         functions::{MAX_ARGS, Statement},
@@ -229,7 +229,12 @@ impl<Alloc> ExecutionCtx<'_, dyn ErasedContext, Alloc>
 where
     Alloc: ScopedAlloc,
 {
-    pub(crate) fn execute_statement(&mut self, statement: Statement) -> anyhow::Result<OpResult> {
+    /// Executes `statement`, which is at index `pc` in the current function.
+    pub(crate) fn execute_statement(
+        &mut self,
+        statement: Statement,
+        pc: usize,
+    ) -> anyhow::Result<OpResult> {
         use Opcode as O;
 
         let op = statement.opcode;
@@ -269,13 +274,9 @@ where
 
                         match def.clone().try_into_qc() {
                             Ok(quakec) => {
-                                if quakec.args.len() != num_args {
-                                    debug!(
-                                        "{} called with {num_args} args, but it takes {}",
-                                        quakec.name.to_string_lossy(),
-                                        quakec.args.len()
-                                    );
-                                }
+                                let site =
+                                    CallSite::Statement(self.memory.local.first_statement() + pc);
+                                self.check_num_args(&quakec, num_args, site)?;
 
                                 self.execute_def(&quakec)?
                             }
