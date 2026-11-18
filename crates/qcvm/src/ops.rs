@@ -184,6 +184,25 @@ where
     Caller: fmt::Debug + QCMemory,
     <Caller as QCMemory>::Scalar: Into<Option<VmScalar>>,
 {
+    /// Reads the value at `addr` as type `ty`. A null of any type (e.g. fteqcc's `__NULL__`,
+    /// a float `0`) reads as the null of `ty`; any other type mismatch is an error.
+    pub(crate) fn get_typed<I>(&self, addr: I, ty: Type) -> anyhow::Result<VmValue>
+    where
+        I: TryInto<usize>,
+        I::Error: std::error::Error + Send + Sync + 'static,
+    {
+        Ok(match ty {
+            Type::Vector => self.get_vec3(addr)?.into(),
+            Type::AnyScalar => self.get_scalar::<_, VmValue>(addr)?,
+            Type::Entity => self.get_scalar::<_, EntityRef>(addr)?.into(),
+            Type::Function => self.get_scalar::<_, VmFunctionRef>(addr)?.into(),
+            Type::Float => self.get_scalar::<_, f32>(addr)?.into(),
+            Type::String => self.get_scalar::<_, StringRef>(addr)?.into(),
+            Type::Field => self.get_scalar::<_, FieldPtr>(addr)?.into(),
+            Type::Void => Default::default(),
+        })
+    }
+
     pub(crate) fn enter_builtin(
         &mut self,
         name: &CStr,
@@ -204,16 +223,7 @@ where
             .into_iter()
             .take(num_args)
             .zip(sig)
-            .map(|(ArgAddr { addr, .. }, ty)| match ty {
-                Type::Vector => Ok(self.get_vec3(addr)?.into()),
-                Type::AnyScalar => Ok(self.get_scalar::<_, VmValue>(addr)?),
-                Type::Entity => Ok(self.get_scalar::<_, EntityRef>(addr)?.into()),
-                Type::Function => Ok(self.get_scalar::<_, VmFunctionRef>(addr)?.into()),
-                Type::Float => Ok(self.get_scalar::<_, f32>(addr)?.into()),
-                Type::String => Ok(self.get_scalar::<_, StringRef>(addr)?.into()),
-                Type::Field => Ok(self.get_scalar::<_, FieldPtr>(addr)?.into()),
-                Type::Void => Ok(Default::default()),
-            })
+            .map(|(ArgAddr { addr, .. }, ty)| self.get_typed(addr, ty))
             .map(|value| match value {
                 Ok(value) => Ok(<[VmScalar; 3]>::from(value)),
                 Err(e) => Err(e),
@@ -342,9 +352,13 @@ where
                 self.copy(a, b, c)?.into()
             }
             O::StorePV => self.op_storep_v(a, b, c)?.into(),
-            O::StorePF | O::StorePS | O::StorePEnt | O::StorePFld | O::StorePFnc => {
-                self.store_scalar_to_field(a, b, c)?.into()
-            }
+            // These are typed (unlike global-to-global `STORE_*`, which fteqcc also uses as an
+            // untyped move), so the host sees e.g. a null function for `self.touch = __NULL__`.
+            O::StorePF => self.store_scalar_to_field(a, b, c, Type::Float)?.into(),
+            O::StorePS => self.store_scalar_to_field(a, b, c, Type::String)?.into(),
+            O::StorePEnt => self.store_scalar_to_field(a, b, c, Type::Entity)?.into(),
+            O::StorePFld => self.store_scalar_to_field(a, b, c, Type::Field)?.into(),
+            O::StorePFnc => self.store_scalar_to_field(a, b, c, Type::Function)?.into(),
             O::NotF => self.op_not_f(a, b, c)?.into(),
             O::NotV => self.op_not_v(a, b, c)?.into(),
             O::NotS => self.op_not_s(a, b, c)?.into(),
@@ -444,13 +458,13 @@ where
         src_ptr: i16,
         out_ptr: i16,
         unused: i16,
+        ty: Type,
     ) -> anyhow::Result<()> {
         if unused != 0 {
             return Err(anyhow::Error::msg("storep_f: nonzero arg3"));
         }
 
-        let f: VmScalar = self.get_scalar(src_ptr)?;
-        let value = self.to_value(f.into())?;
+        let value = self.to_value(self.get_typed(src_ptr, ty)?)?;
         let EntityField { entity, field } = self.get_scalar(out_ptr)?;
 
         self.context

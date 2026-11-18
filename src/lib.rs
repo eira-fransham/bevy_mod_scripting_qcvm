@@ -382,6 +382,23 @@ fn interop_error_to_addr_error<T>(
     })
 }
 
+/// The name that a builtin is registered under.
+///
+/// With `quake1`, builtins are dispatched by number like Quake does, as `progs.dat`s can rename or
+/// alias builtins (e.g. LibreQuake's `bprint_e = #23`). Unknown numbers are extensions, which hosts
+/// register by name.
+fn builtin_name(def: &qcvm::BuiltinDef) -> Cow<'_, str> {
+    #[cfg(feature = "quake1")]
+    if let Some(name) = def
+        .builtin_number()
+        .and_then(qcvm::quake1::builtins::builtin_name)
+    {
+        return name.into();
+    }
+
+    def.name.to_string_lossy()
+}
+
 impl<GlobalAddr, FieldAddr> qcvm::userdata::Context for BevyScriptContext<GlobalAddr, FieldAddr>
 where
     GlobalAddr: Address,
@@ -409,10 +426,8 @@ where
         let function_registry = world.script_function_registry();
         let function_registry = function_registry.read();
 
-        let def_name = def.name.to_string_lossy();
+        let def_name = builtin_name(def);
 
-        // TODO: Just in case some progs.dats use renamed builtins, we should have some way of looking up via
-        //       index, not just name.
         let func = function_registry
             .get_function(TypeId::of::<QCWorldspawn>(), def_name.clone())
             .map_err(|_| {

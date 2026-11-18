@@ -607,8 +607,8 @@ impl TryFrom<VmScalar> for f32 {
 
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            VmScalar::Void => Ok(Default::default()),
             VmScalar::Float(f) => Ok(f),
+            other if other.is_zero() => Ok(Default::default()),
             _ => Err(ScalarCastError {
                 expected: VmScalarType::Float,
                 found: value.type_(),
@@ -634,8 +634,8 @@ impl TryFrom<VmScalar> for VmFunctionRef {
 
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            VmScalar::Void => Ok(Default::default()),
             VmScalar::Function(f) => Ok(f),
+            other if other.is_zero() => Ok(Default::default()),
             _ => Err(ScalarCastError {
                 expected: VmScalarType::Function,
                 found: value.type_(),
@@ -649,8 +649,8 @@ impl TryFrom<VmScalar> for EntityRef {
 
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            VmScalar::Void => Ok(Default::default()),
             VmScalar::Entity(f) => Ok(f),
+            other if other.is_zero() => Ok(Default::default()),
             _ => Err(ScalarCastError {
                 expected: VmScalarType::Entity,
                 found: value.type_(),
@@ -664,8 +664,8 @@ impl TryFrom<VmScalar> for StringRef {
 
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            VmScalar::Void => Ok(Default::default()),
             VmScalar::String(f) => Ok(f),
+            other if other.is_zero() => Ok(Default::default()),
             _ => Err(ScalarCastError {
                 expected: VmScalarType::String,
                 found: value.type_(),
@@ -679,10 +679,10 @@ impl TryFrom<VmScalar> for GlobalPtr {
 
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            VmScalar::Void => Ok(Default::default()),
             VmScalar::Global(p) => Ok(GlobalPtr(p)),
+            other if other.is_zero() => Ok(Default::default()),
             _ => Err(ScalarCastError {
-                expected: VmScalarType::String,
+                expected: VmScalarType::GlobalRef,
                 found: value.type_(),
             }),
         }
@@ -694,10 +694,10 @@ impl TryFrom<VmScalar> for FieldPtr {
 
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
-            VmScalar::Void => Ok(Default::default()),
             VmScalar::Field(p) => Ok(FieldPtr(p)),
+            other if other.is_zero() => Ok(Default::default()),
             _ => Err(ScalarCastError {
-                expected: VmScalarType::String,
+                expected: VmScalarType::FieldRef,
                 found: value.type_(),
             }),
         }
@@ -722,6 +722,19 @@ impl VmScalar {
             VmScalar::Field(ptr) => ptr.is_null(),
             // 0 field is valid
             VmScalar::EntityField(ent, _) => ent.is_none(),
+        }
+    }
+
+    /// Whether this value is the all-zero word, i.e. the null of _every_ type. Quake's
+    /// globals are untyped 32-bit words, and fteqcc's `__NULL__` is a single shared float
+    /// immediate `0` that it uses as the null of any type (e.g. `self.touch = __NULL__`).
+    ///
+    /// Unlike [`VmScalar::is_null`], an [`VmScalar::EntityField`] is never zero: a field
+    /// pointer isn't the zero word, even on world.
+    fn is_zero(&self) -> bool {
+        match self {
+            VmScalar::EntityField(..) => false,
+            other => other.is_null(),
         }
     }
 

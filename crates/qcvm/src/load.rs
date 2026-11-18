@@ -14,7 +14,7 @@ use tracing::debug;
 use crate::{
     entity::EntityTypeDef,
     progs::{
-        FieldDef, GlobalDef, StringTable, VmType,
+        FieldDef, GlobalDef, StringTable, VmScalarType, VmType,
         functions::{ArgSize, FunctionRegistry, MAX_ARGS, Statement},
         globals::GlobalRegistry,
     },
@@ -81,6 +81,48 @@ fn expect_position<R: Seek>(src: &mut R, expected: u64) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Parses the argument sizes (`parm_size`) of a function definition.
+///
+/// Builtins get no argument sizes: Quake ignores them (builtins use the caller's argument count),
+/// and `fteqcc` writes 0 for them. QuakeC functions must have valid sizes, as they're used to copy
+/// arguments into the function's locals.
+pub(crate) fn parse_arg_sizes(
+    name: &CStr,
+    offset: i32,
+    argc: i32,
+    arg_sizes: &[u8; MAX_ARGS],
+) -> anyhow::Result<ArrayVec<ArgSize, MAX_ARGS>> {
+    let argc = usize::try_from(argc)
+        .ok()
+        .filter(|argc| *argc <= MAX_ARGS)
+        .ok_or_else(|| anyhow::format_err!("Function {name:?} has {argc} arguments"))?;
+
+    if offset < 0 {
+        return Ok(ArrayVec::new());
+    }
+
+    arg_sizes[..argc]
+        .iter()
+        .map(|byte| {
+            ArgSize::from_u8(*byte).ok_or_else(|| {
+                anyhow::format_err!("Function {name:?} has an invalid argument size ({byte})")
+            })
+        })
+        .collect()
+}
+
+/// Converts the type of a global or field definition (without `DEF_SAVEGLOBAL`).
+///
+/// Types that Quake doesn't know (e.g. `fteqcc`'s struct and union types) are treated as untyped,
+/// as Quake ignores them. `fteqcc` also emits definitions for the members of structs, which
+/// supply the actual types.
+pub(crate) fn def_type(kind: &str, name: &CStr, type_: u16) -> VmType {
+    VmType::from_u16(type_).unwrap_or_else(|| {
+        debug!("{kind} {name:?} has an unsupported type ({type_:#x}), treating it as untyped");
+        VmType::Scalar(VmScalarType::Void)
+    })
 }
 
 impl Progs {
@@ -179,17 +221,7 @@ impl Progs {
             let mut arg_size_buf = [0; MAX_ARGS];
             src.read_exact(&mut arg_size_buf)?;
 
-            let mut args = ArrayVec::<ArgSize, MAX_ARGS>::new();
-
-            let argc = usize::try_from(argc)
-                .ok()
-                .filter(|argc| *argc <= MAX_ARGS)
-                .ok_or_else(|| anyhow::format_err!("Function {name:?} has {argc} arguments"))?;
-            for byte in &arg_size_buf[..argc] {
-                args.push(ArgSize::from_u8(*byte).ok_or_else(|| {
-                    anyhow::format_err!("Function {name:?} has an invalid argument size ({byte})")
-                })?);
-            }
+            let args = parse_arg_sizes(&name, offset, argc, &arg_size_buf)?;
 
             load_functions.push(LoadFn {
                 offset,
@@ -219,9 +251,7 @@ impl Progs {
 
             global_defs.push(GlobalDef {
                 save: type_ & SAVE_GLOBAL != 0,
-                type_: VmType::from_u16(type_ & !SAVE_GLOBAL).ok_or_else(|| {
-                    anyhow::format_err!("Global {name:?} has an invalid type ({type_})")
-                })?,
+                type_: def_type("Global", &name, type_ & !SAVE_GLOBAL),
                 offset,
                 name,
             });
@@ -248,9 +278,7 @@ impl Progs {
                 ));
             }
             field_defs.push(FieldDef {
-                type_: VmType::from_u16(type_).ok_or_else(|| {
-                    anyhow::format_err!("Field {name:?} has an invalid type ({type_})")
-                })?,
+                type_: def_type("Field", &name, type_),
                 offset,
                 name,
             });

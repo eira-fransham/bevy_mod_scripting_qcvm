@@ -192,6 +192,20 @@ impl<T> FunctionDef<T> {
     pub fn is_builtin(&self) -> bool {
         self.offset < 0
     }
+
+    /// For builtins, the builtin number (`#n` in QuakeC), which is what Quake dispatches on.
+    ///
+    /// This is not the same as [`Self::index`]: builtin numbers can have gaps, and several
+    /// functions can alias the same builtin (e.g. LibreQuake's `bprint_e = #23`).
+    pub fn builtin_number(&self) -> Option<u32> {
+        if self.is_builtin() {
+            self.offset
+                .checked_neg()
+                .and_then(|n| u32::try_from(n).ok())
+        } else {
+            None
+        }
+    }
 }
 
 /// No body as the function is provided by the host.

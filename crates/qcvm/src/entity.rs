@@ -62,8 +62,10 @@ impl EntityTypeDef {
                 }
 
                 let slot = &mut scalars[offset];
+                // Untyped definitions (e.g. `fteqcc` structs) never replace typed ones.
                 let keep_existing = slot.as_ref().is_some_and(|existing| {
-                    existing.is_vector_component() && !scalar.is_vector_component()
+                    (existing.is_vector_component() && !scalar.is_vector_component())
+                        || scalar.type_ == VmScalarType::Void
                 });
                 if !keep_existing {
                     *slot = Some(scalar);

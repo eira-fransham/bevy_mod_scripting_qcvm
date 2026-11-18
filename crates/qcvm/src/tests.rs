@@ -13,7 +13,7 @@ use strum::VariantArray;
 use crate::{
     Address, EmptyAddress, EntityRef, EntityTypeDef, FieldDef, FieldRef, FunctionIndex, GlobalDef,
     MAX_ARGS, MissingArguments, QCVm, ReturnValue, Type, Value, VectorField, VmOptions,
-    load::{LoadFn, Progs},
+    load::{LoadFn, Progs, def_type, parse_arg_sizes},
     ops::Opcode,
     progs::{
         StringRef, StringTable, VmScalar, VmScalarType, VmType,
@@ -207,6 +207,20 @@ impl Program {
             args: args.iter().copied().collect(),
         });
         self.next_builtin -= 1;
+        index
+    }
+
+    /// A builtin with an explicit builtin number (`#number` in QuakeC), which doesn't affect the
+    /// numbering of later [`Self::builtin`]s.
+    fn numbered_builtin(&mut self, name: &str, number: i32) -> i32 {
+        let index = self.functions.len() as i32;
+        self.functions.push(LoadFn {
+            offset: -number,
+            name: cstring(name),
+            source: cstring("<builtin>"),
+            locals: 0..0,
+            args: ArrayVec::new(),
+        });
         index
     }
 
@@ -574,6 +588,14 @@ impl Context for TestContext {
                     .unwrap()
             }),
             b"hello" => builtin(&[], |_, _| Value::try_from("hello").unwrap()),
+            // Records the builtin number it was declared with.
+            name if name.starts_with(b"which") => {
+                let number = def.builtin_number().expect("builtins have numbers") as f32;
+                builtin(&[], move |ctx, _| {
+                    ctx.recorded.push(number.into());
+                    Value::Void
+                })
+            }
             // Accepts anything, for running real `progs.dat`s.
             _ => builtin(&[], |_, _| Value::Void),
         })
@@ -1114,6 +1136,128 @@ fn void_stores() {
     assert_eq!(ctx.dynamic[&(1, "speed".into())], Value::Float(0.));
 }
 
+/// fteqcc's `__NULL__` is a single nameless float immediate `0`, which it uses as the null of every
+/// type. In Quake that's just the zero word, so it must act as a null function/string/entity.
+#[test]
+fn fteqcc_null_is_null_of_every_type() {
+    let mut p = Program::new();
+    let null = p.float("", 0.);
+    let ent = p.entity("ent");
+    let world = p.entity("world");
+    let touch = p.field("touch", VmScalarType::Function);
+    let null_fn = p.function_ptr(0);
+    let some_fn = p.function_ptr(1);
+    let some_s = p.string("some_s", "hello");
+    let null_s = p.string_with_id("null_s", 0);
+    let fn_ne = p.float("fn_ne", -1.);
+    let null_fn_ne = p.float("null_fn_ne", -1.);
+    let null_fn_eq = p.float("null_fn_eq", -1.);
+    let s_ne = p.float("s_ne", -1.);
+    let s_eq = p.float("s_eq", -1.);
+    let null_s_eq = p.float("null_s_eq", -1.);
+    let world_eq = p.float("world_eq", -1.);
+    let ent_eq = p.float("ent_eq", -1.);
+    let ptr = 900;
+    let main = p.function("main", &[], 0, |_| {
+        vec![
+            // self.touch = __NULL__
+            stmt(O::Address, ent, touch, ptr),
+            stmt(O::StorePFnc, null, ptr, 0),
+            stmt(O::NeFnc, some_fn, null, fn_ne),
+            stmt(O::NeFnc, null_fn, null, null_fn_ne),
+            stmt(O::EqFnc, null, null_fn, null_fn_eq),
+            stmt(O::NeS, some_s, null, s_ne),
+            stmt(O::EqS, some_s, null, s_eq),
+            stmt(O::EqS, null_s, null, null_s_eq),
+            stmt(O::EqEnt, world, null, world_eq),
+            stmt(O::EqEnt, ent, null, ent_eq),
+            stmt(O::Done, 0, 0, 0),
+        ]
+    });
+    let vm = p.build();
+    set_entity(&vm, ent, 1);
+
+    let mut ctx = TestContext::default();
+    ctx.dynamic
+        .insert((1, "touch".into()), FunctionIndex(1).to_value());
+    run(&vm, &mut ctx, main).unwrap();
+
+    assert_eq!(
+        ctx.dynamic[&(1, "touch".into())],
+        Value::Function(crate::Function::NULL)
+    );
+    assert_eq!(read_float(&vm, fn_ne), 1.);
+    assert_eq!(read_float(&vm, null_fn_ne), 0.);
+    assert_eq!(read_float(&vm, null_fn_eq), 1.);
+    assert_eq!(read_float(&vm, s_ne), 1.);
+    assert_eq!(read_float(&vm, s_eq), 0.);
+    assert_eq!(read_float(&vm, null_s_eq), 1.);
+    assert_eq!(read_float(&vm, world_eq), 1.);
+    assert_eq!(read_float(&vm, ent_eq), 0.);
+}
+
+/// Only the zero word is the null of every type: other mismatched values are still errors.
+#[test]
+fn non_null_type_mismatches_still_error() {
+    let mut p = Program::new();
+    let ent = p.entity("ent");
+    let touch = p.field("touch", VmScalarType::Function);
+    let one = p.float("one", 1.);
+    let ptr = 900;
+    let body = vec![
+        stmt(O::Address, ent, touch, ptr),
+        stmt(O::StorePFnc, one, ptr, 0),
+        stmt(O::Done, 0, 0, 0),
+    ];
+    let mut ctx = TestContext::default();
+    let main = p.function("main", &[], 0, |_| body);
+    let vm = p.build();
+    set_entity(&vm, ent, 1);
+    let error = format!("{:#}", run(&vm, &mut ctx, main).unwrap_err());
+    assert!(error.contains("ScalarCastError"), "{error}");
+
+    // `-0.0` isn't the zero word.
+    let mut p = Program::new();
+    let neg_zero = p.float("neg_zero", -0.);
+    let some_fn = p.function_ptr(1);
+    let out = p.float("out", -1.);
+    let (_, result) = run_main(
+        p,
+        vec![
+            stmt(O::NeFnc, some_fn, neg_zero, out),
+            stmt(O::Done, 0, 0, 0),
+        ],
+        &mut TestContext::default(),
+    );
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("ScalarCastError"), "{error}");
+}
+
+#[test]
+fn null_scalar_conversions() {
+    use crate::progs::{EntityField, Ptr, VmFunctionRef};
+
+    assert!(
+        StringRef::try_from(VmScalar::Entity(None))
+            .unwrap()
+            .is_null()
+    );
+    assert!(
+        VmFunctionRef::try_from(VmScalar::Float(0.))
+            .unwrap()
+            .is_null()
+    );
+    assert_eq!(
+        EntityRef::try_from(VmScalar::String(StringRef::default())).unwrap(),
+        None
+    );
+    assert!(f32::try_from(VmScalar::EntityField(None, Ptr(0))).is_err());
+    assert!(VmFunctionRef::try_from(VmScalar::Float(-0.)).is_err());
+    assert!(StringRef::try_from(VmScalar::Float(1.)).is_err());
+    // `EntityField` itself is unchanged: only a real field pointer converts.
+    assert!(EntityField::try_from(VmScalar::Float(0.)).is_err());
+}
+
 #[test]
 fn host_fields() {
     let mut p = Program::new();
@@ -1650,4 +1794,138 @@ fn arguments_without_locals_are_per_frame() {
 
     vm.run(&mut TestContext::default(), rec, (2f32,)).unwrap();
     assert_eq!(read_float(&vm, sum), 3.);
+}
+
+/// Builtins are identified by number (`-first_statement`), not by their position in the function
+/// table: numbers can have gaps (id1 has no `#5`), and several functions can alias one number
+/// (LibreQuake's `bprint_e = #23`).
+#[test]
+fn builtins_are_identified_by_number() {
+    let mut p = Program::new();
+    let first = p.builtin("which_first", &[]);
+    let bprint = p.numbered_builtin("which_bprint", 23);
+    let bprint_e = p.numbered_builtin("which_bprint_e", 23);
+    let spawn = p.numbered_builtin("which_spawn", 14);
+    let ptrs = [first, bprint, bprint_e, spawn].map(|f| p.function_ptr(f));
+    let main = p.function("main", &[], 0, |_| {
+        let mut body = ptrs.map(|ptr| stmt(O::Call0, ptr, 0, 0)).to_vec();
+        body.push(stmt(O::Done, 0, 0, 0));
+        body
+    });
+    let vm = p.build();
+
+    let numbers = [first, bprint, bprint_e, spawn]
+        .map(|f| vm.functions().get_by_index(f).unwrap().builtin_number());
+    assert_eq!(numbers, [Some(1), Some(23), Some(23), Some(14)]);
+    assert_eq!(
+        vm.functions().get_by_index(main).unwrap().builtin_number(),
+        None
+    );
+
+    let mut ctx = TestContext::default();
+    run(&vm, &mut ctx, main).unwrap();
+    assert_eq!(ctx.recorded, [1., 23., 23., 14.].map(Value::from).to_vec());
+}
+
+#[cfg(feature = "quake1")]
+#[test]
+fn quake1_builtin_names_are_by_number() {
+    use crate::quake1::builtins::builtin_name;
+
+    assert_eq!(builtin_name(1), Some("makevectors"));
+    assert_eq!(builtin_name(5), None);
+    assert_eq!(builtin_name(13), Some("vectoyaw"));
+    assert_eq!(builtin_name(14), Some("spawn"));
+    assert_eq!(builtin_name(45), Some("cvar"));
+    assert_eq!(builtin_name(0), None);
+    assert_eq!(builtin_name(83), None);
+}
+
+/// `fteqcc` writes 0 for the argument sizes of builtins, which Quake ignores.
+#[test]
+fn builtin_argument_sizes_are_ignored() {
+    let mut sizes = [0; MAX_ARGS];
+    let args = parse_arg_sizes(c"cvar", -45, 1, &sizes).unwrap();
+    assert!(args.is_empty());
+
+    sizes[..2].copy_from_slice(&[3, 1]);
+    let args = parse_arg_sizes(c"setorigin", -2, 2, &sizes).unwrap();
+    assert!(args.is_empty());
+
+    // Too many arguments is still an error.
+    parse_arg_sizes(c"cvar", -45, MAX_ARGS as i32 + 1, &sizes).unwrap_err();
+}
+
+/// QuakeC functions' argument sizes are used to copy their arguments, so must be valid.
+#[test]
+fn quakec_argument_sizes_are_checked() {
+    let mut sizes = [0; MAX_ARGS];
+    sizes[..2].copy_from_slice(&[3, 1]);
+    let args = parse_arg_sizes(c"f", 10, 2, &sizes).unwrap();
+    assert_eq!(args.as_slice(), [ArgSize::Vector, ArgSize::Scalar]);
+
+    // Sizes past `argc` aren't read.
+    sizes[2] = 0;
+    parse_arg_sizes(c"f", 10, 2, &sizes).unwrap();
+
+    let err = parse_arg_sizes(c"f", 10, 3, &sizes).unwrap_err();
+    assert!(format!("{err}").contains("invalid argument size"), "{err}");
+    sizes[2] = 2;
+    parse_arg_sizes(c"f", 10, 3, &sizes).unwrap_err();
+}
+
+/// `fteqcc` emits definitions with types Quake doesn't know (e.g. `0xe` for the struct array
+/// `intermission_levels[]` in LibreQuake), alongside definitions of their members.
+#[test]
+fn unknown_def_types_are_untyped() {
+    assert_eq!(def_type("Global", c"s", 0xe), VmScalarType::Void.into());
+    assert_eq!(def_type("Global", c"s", 9), VmScalarType::Void.into());
+    assert_eq!(def_type("Global", c"s", 8), VmScalarType::Void.into());
+    assert_eq!(def_type("Global", c"s", 1), VmScalarType::String.into());
+    assert_eq!(def_type("Global", c"v", 3), VmType::Vector);
+
+    // The struct and its first member share an offset, in either order.
+    for struct_first in [true, false] {
+        let mut p = Program::new();
+        let id = p.string_id("start");
+        let struct_def = GlobalDef {
+            save: false,
+            type_: def_type("Global", c"levels", 0xe),
+            offset: p.next_global,
+            name: cstring("levels"),
+        };
+        if struct_first {
+            p.globals.push(struct_def.clone());
+        }
+        let member = p.string_with_id("levels[0].map_name", id);
+        if !struct_first {
+            p.globals.push(struct_def);
+        }
+        let vm = p.build();
+        assert_eq!(
+            vm.global(member).unwrap(),
+            Value::try_from("start").unwrap()
+        );
+    }
+
+    // The same goes for fields.
+    for struct_first in [true, false] {
+        let untyped = FieldDef {
+            type_: def_type("Field", c"s", 0xe),
+            offset: 0,
+            name: cstring("s"),
+        };
+        let float = FieldDef {
+            type_: VmScalarType::Float.into(),
+            offset: 0,
+            name: cstring("s.f"),
+        };
+        let defs = if struct_first {
+            [untyped, float]
+        } else {
+            [float, untyped]
+        };
+        let entity_def = EntityTypeDef::new(defs);
+        assert_eq!(entity_def.get(0).unwrap().type_, VmScalarType::Float);
+    }
 }

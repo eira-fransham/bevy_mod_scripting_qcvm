@@ -47,6 +47,88 @@ impl<A: Address + Copy> AddrTable<A> {
     }
 }
 
+/// The builtins of the Quake GPL release, by builtin number.
+pub mod builtins {
+    /// The name of Quake builtin `#number`, as declared in id1's `defs.qc`.
+    ///
+    /// Hosts should dispatch builtins by number (see [`crate::FunctionDef::builtin_number`])
+    /// rather than by name, as `progs.dat`s can rename or alias builtins (e.g. LibreQuake's
+    /// `bprint_e = #23`). Returns `None` for unused numbers (e.g. `#5`) and extension builtins.
+    pub fn builtin_name(number: u32) -> Option<&'static str> {
+        Some(match number {
+            1 => "makevectors",
+            2 => "setorigin",
+            3 => "setmodel",
+            4 => "setsize",
+            6 => "break",
+            7 => "random",
+            8 => "sound",
+            9 => "normalize",
+            10 => "error",
+            11 => "objerror",
+            12 => "vlen",
+            13 => "vectoyaw",
+            14 => "spawn",
+            15 => "remove",
+            16 => "traceline",
+            17 => "checkclient",
+            18 => "find",
+            19 => "precache_sound",
+            20 => "precache_model",
+            21 => "stuffcmd",
+            22 => "findradius",
+            23 => "bprint",
+            24 => "sprint",
+            25 => "dprint",
+            26 => "ftos",
+            27 => "vtos",
+            28 => "coredump",
+            29 => "traceon",
+            30 => "traceoff",
+            31 => "eprint",
+            32 => "walkmove",
+            34 => "droptofloor",
+            35 => "lightstyle",
+            36 => "rint",
+            37 => "floor",
+            38 => "ceil",
+            40 => "checkbottom",
+            41 => "pointcontents",
+            43 => "fabs",
+            44 => "aim",
+            45 => "cvar",
+            46 => "localcmd",
+            47 => "nextent",
+            49 => "ChangeYaw",
+            51 => "vectoangles",
+            52 => "WriteByte",
+            53 => "WriteChar",
+            54 => "WriteShort",
+            55 => "WriteLong",
+            56 => "WriteCoord",
+            57 => "WriteAngle",
+            58 => "WriteString",
+            59 => "WriteEntity",
+            67 => "movetogoal",
+            68 => "precache_file",
+            69 => "makestatic",
+            70 => "changelevel",
+            72 => "cvar_set",
+            73 => "centerprint",
+            74 => "ambientsound",
+            75 => "precache_model2",
+            76 => "precache_sound2",
+            77 => "precache_file2",
+            78 => "setspawnparms",
+            79 => "logfrag",
+            80 => "infokey",
+            81 => "stof",
+            82 => "multicast",
+            _ => return None,
+        })
+    }
+}
+
 /// Global definitions for `progdefs.q1`, see [the Quake GPL release](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 pub mod globals {
     use std::fmt;
