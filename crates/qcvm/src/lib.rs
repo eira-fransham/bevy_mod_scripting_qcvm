@@ -326,6 +326,10 @@ fn scalar_to_value(scalar: VmScalar, strings: &StringTable) -> anyhow::Result<Va
         VmScalar::String(s) => Value::String(strings.get(s)?),
         VmScalar::Function(func) => Value::Function(func.into()),
         VmScalar::Field(ptr) => Value::Field(FieldRef::from_ptr(ptr)?),
+        // This is only reached when no type is known (`AnyScalar` builtin parameters,
+        // `ReturnValue::scalar`, `QCVm::global`, etc.), so fall back to a float that
+        // preserves the bits.
+        VmScalar::Bits(b) => Value::Float(f32::from_bits(b)),
         other @ (VmScalar::Global(_) | VmScalar::EntityField(..)) => {
             anyhow::bail!(
                 "Values of type {} can't be passed to the host",
@@ -2067,7 +2071,24 @@ where
         V: Into<VmScalar>,
     {
         let index = index.try_into()?;
-        let value = value.into();
+        let mut value = value.into();
+
+        // An untyped word stored into a host global takes the type of that global.
+        if let VmScalar::Bits(bits) = value
+            && let Some(ty) = self.context.dyn_global_type(index.try_into()?)
+        {
+            let scalar_ty = match ty {
+                Type::Float | Type::Vector => Some(VmScalarType::Float),
+                Type::String => Some(VmScalarType::String),
+                Type::Entity => Some(VmScalarType::Entity),
+                Type::Function => Some(VmScalarType::Function),
+                Type::Field => Some(VmScalarType::FieldRef),
+                Type::AnyScalar | Type::Void => None,
+            };
+            if let Some(scalar_ty) = scalar_ty {
+                value = VmScalar::bits_as(scalar_ty, bits)?;
+            }
+        }
 
         // Pointers only exist inside the VM, so they can't be host globals.
         if !matches!(value, VmScalar::Global(_) | VmScalar::EntityField(..)) {

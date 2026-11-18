@@ -136,6 +136,10 @@ pub trait ErasedContext: Any {
         def: ErasedAddr,
         value: Value,
     ) -> Result<(), AddrError<anyhow::Error>>;
+
+    /// The type of the host global at `def`, if there is one. This is the global that an untyped
+    /// value would be stored to by [`ErasedContext::dyn_set_global`].
+    fn dyn_global_type(&self, def: ErasedAddr) -> Option<Type>;
 }
 
 impl fmt::Debug for &'_ mut dyn ErasedContext {
@@ -278,6 +282,10 @@ where
         let value = value.or_zero(addr.type_());
 
         self.set_global(addr, value).map_err(AddrError::into_anyhow)
+    }
+
+    fn dyn_global_type(&self, def: ErasedAddr) -> Option<Type> {
+        <T as Context>::GlobalAddr::from_u16_typed(def, Type::AnyScalar).map(|addr| addr.type_())
     }
 }
 

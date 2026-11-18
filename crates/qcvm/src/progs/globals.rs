@@ -5,8 +5,10 @@ use crate::progs::{GlobalDef, VmScalar, VmScalarType, VmType};
 /// QuakeC global memory that isn't provided by the host.
 ///
 /// This covers every address in the `progs.dat` globals lump, not just the ones with definitions:
-/// `qcc` allocates temporaries as globals without definitions. Locals are stored per call frame
-/// instead, see `FunctionExecutionCtx`.
+/// `qcc` allocates temporaries as globals without definitions, and optimizing compilers (e.g.
+/// fteqcc) strip the definitions of immediates. Slots without a typed definition hold their raw
+/// word (see [`VmScalar::Bits`]), which is typed lazily by whatever reads it. Locals are stored per
+/// call frame instead, see `FunctionExecutionCtx`.
 ///
 /// The values are behind a lock rather than requiring `&mut` access, since QuakeC can be re-entered
 /// from a builtin (e.g. a touch function run by `walkmove`).
@@ -32,10 +34,16 @@ impl GlobalRegistry {
             anyhow::bail!("Globals lump size ({}) is not a multiple of 4", raw.len());
         }
 
-        let mut initial = vec![VmScalar::Void; chunks.len()];
+        let mut initial = chunks
+            .iter()
+            .map(|chunk| VmScalar::from_bits(*chunk))
+            .collect::<Vec<_>>();
 
         for def in &defs {
             let types: &[VmScalarType] = match def.type_ {
+                // Already initialized as untyped. Skipping these also means they don't overwrite a
+                // typed def at the same offset (e.g. fteqcc's struct defs share an offset with
+                // their first member).
                 VmType::Scalar(VmScalarType::Void) => continue,
                 VmType::Scalar(ty) => &[ty][..],
                 VmType::Vector => &[VmScalarType::Float; 3][..],

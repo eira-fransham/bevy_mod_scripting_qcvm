@@ -42,7 +42,7 @@ use bevy_mod_scripting_asset::Language;
 use bevy_mod_scripting_bindings::{
     CurrentScriptAttachment, DynamicScriptFunction, ExternalError, FunctionCallContext,
     InteropError, ReflectBase, ReflectReference, ScriptValue, ThreadScriptContext,
-    ThreadWorldContainer, VariadicTuple, WorldAccessGuard, WorldExtensions, WorldGuard,
+    ThreadWorldContainer, V, VariadicTuple, WorldAccessGuard, WorldExtensions, WorldGuard,
 };
 use bevy_mod_scripting_core::{
     IntoScriptPluginParams, ScriptingPlugin, config::GetPluginThreadConfig, event::CallbackLabel,
@@ -653,6 +653,42 @@ impl<G, F, B> QCType for BevyBuiltin<G, F, B> {
     }
 }
 
+/// The QuakeC type of a builtin parameter of the Rust type with ID `type_id`.
+///
+/// Precise types let the VM resolve untyped arguments to the parameter's type, as Quake does: `void`
+/// (the zero word, e.g. a global initialized to 0) becomes the zero of that type, and an untyped
+/// word (an immediate whose def was stripped by an optimizing compiler) is reinterpreted as that
+/// type. Unknown types are [`qcvm::Type::AnyScalar`], which pass `void` through as `()` and
+/// untyped words as floats.
+fn param_type(type_id: TypeId) -> qcvm::Type {
+    /// Whether `type_id` is `T`, or `T` wrapped in `V` and/or `Option`.
+    fn is<T: 'static>(type_id: TypeId) -> bool {
+        [
+            TypeId::of::<T>(),
+            TypeId::of::<V<T>>(),
+            TypeId::of::<Option<T>>(),
+            TypeId::of::<Option<V<T>>>(),
+        ]
+        .contains(&type_id)
+    }
+
+    if is::<Vec3>(type_id) || is::<[f32; 3]>(type_id) {
+        qcvm::Type::Vector
+    } else if is::<f32>(type_id) || is::<f64>(type_id) {
+        qcvm::Type::Float
+    } else if is::<QCString>(type_id) {
+        qcvm::Type::String
+    } else if is::<QCFunction>(type_id) {
+        qcvm::Type::Function
+    } else if is::<QCField>(type_id) {
+        qcvm::Type::Field
+    } else if is::<ReflectReference>(type_id) {
+        qcvm::Type::Entity
+    } else {
+        qcvm::Type::AnyScalar
+    }
+}
+
 impl<GlobalAddr, FieldAddr, BuiltinAddr> qcvm::userdata::Function
     for BevyBuiltin<GlobalAddr, FieldAddr, BuiltinAddr>
 where
@@ -671,13 +707,7 @@ where
             .iter()
             .filter(|arg| arg.type_id != TypeId::of::<FunctionCallContext>())
             .take(qcvm::MAX_ARGS)
-            .map(|arg| {
-                if arg.type_id == TypeId::of::<Vec3>() || arg.type_id == TypeId::of::<[f32; 3]>() {
-                    qcvm::Type::Vector
-                } else {
-                    qcvm::Type::AnyScalar
-                }
-            })
+            .map(|arg| param_type(arg.type_id))
             .collect())
     }
 
