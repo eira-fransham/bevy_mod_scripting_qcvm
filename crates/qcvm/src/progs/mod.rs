@@ -531,6 +531,16 @@ pub(crate) enum VmScalar {
     ///
     /// > TODO: NaN-boxing with SoA-style extra storage for larger variants
     EntityField(EntityRef, Ptr),
+    /// A nonzero word whose type the `progs.dat` doesn't record.
+    ///
+    /// Optimizing compilers (e.g. fteqcc) strip the defs of immediates, so many globals in the
+    /// globals lump have no type. Like in Quake, where globals are untyped words, the word is kept
+    /// as-is and only reinterpreted when it is read with a known type (by a typed opcode, or as a
+    /// builtin parameter), see [`VmScalar::bits_as`]. Untyped moves (`STORE_*` between globals,
+    /// `RETURN`, etc.) copy it unchanged.
+    ///
+    /// The zero word is always [`VmScalar::Void`], so this is never `Bits(0)`.
+    Bits(u32),
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -607,6 +617,7 @@ impl TryFrom<VmScalar> for f32 {
 
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
+            VmScalar::Bits(b) => VmScalar::bits_as(VmScalarType::Float, b)?.try_into(),
             VmScalar::Float(f) => Ok(f),
             other if other.is_zero() => Ok(Default::default()),
             _ => Err(ScalarCastError {
@@ -634,6 +645,7 @@ impl TryFrom<VmScalar> for VmFunctionRef {
 
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
+            VmScalar::Bits(b) => VmScalar::bits_as(VmScalarType::Function, b)?.try_into(),
             VmScalar::Function(f) => Ok(f),
             other if other.is_zero() => Ok(Default::default()),
             _ => Err(ScalarCastError {
@@ -664,6 +676,7 @@ impl TryFrom<VmScalar> for StringRef {
 
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
+            VmScalar::Bits(b) => VmScalar::bits_as(VmScalarType::String, b)?.try_into(),
             VmScalar::String(f) => Ok(f),
             other if other.is_zero() => Ok(Default::default()),
             _ => Err(ScalarCastError {
@@ -679,6 +692,7 @@ impl TryFrom<VmScalar> for GlobalPtr {
 
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
+            VmScalar::Bits(b) => VmScalar::bits_as(VmScalarType::GlobalRef, b)?.try_into(),
             VmScalar::Global(p) => Ok(GlobalPtr(p)),
             other if other.is_zero() => Ok(Default::default()),
             _ => Err(ScalarCastError {
@@ -694,6 +708,7 @@ impl TryFrom<VmScalar> for FieldPtr {
 
     fn try_from(value: VmScalar) -> Result<Self, Self::Error> {
         match value {
+            VmScalar::Bits(b) => VmScalar::bits_as(VmScalarType::FieldRef, b)?.try_into(),
             VmScalar::Field(p) => Ok(FieldPtr(p)),
             other if other.is_zero() => Ok(Default::default()),
             _ => Err(ScalarCastError {
@@ -722,6 +737,7 @@ impl VmScalar {
             VmScalar::Field(ptr) => ptr.is_null(),
             // 0 field is valid
             VmScalar::EntityField(ent, _) => ent.is_none(),
+            VmScalar::Bits(b) => *b == 0,
         }
     }
 
@@ -743,6 +759,9 @@ impl VmScalar {
     pub fn is_false(&self) -> bool {
         match self {
             VmScalar::Float(f) => *f == 0.,
+            // Without a type, treat the word as a float like `OP_NOT_F`, which is also what Quake
+            // does for e.g. `OP_AND`.
+            VmScalar::Bits(b) => f32::from_bits(*b) == 0.,
             other => other.is_null(),
         }
     }
@@ -757,18 +776,45 @@ impl VmScalar {
             VmScalar::Global(_) => VmScalarType::GlobalRef,
             VmScalar::Field(_) => VmScalarType::FieldRef,
             VmScalar::EntityField(..) => VmScalarType::EntityFieldRef,
+            // `void` doubles as "untyped" here.
+            VmScalar::Bits(_) => VmScalarType::Void,
         }
+    }
+
+    /// A word from the `progs.dat`: [`VmScalar::Void`] if it's zero and [`VmScalar::Bits`]
+    /// (i.e. untyped) otherwise.
+    pub fn from_bits(bytes: [u8; 4]) -> Self {
+        match u32::from_le_bytes(bytes) {
+            0 => VmScalar::Void,
+            b => VmScalar::Bits(b),
+        }
+    }
+
+    /// Reinterprets the untyped word `bits` (see [`VmScalar::Bits`]) as a value of type `ty`.
+    pub fn bits_as(ty: VmScalarType, bits: u32) -> Result<Self, ScalarCastError> {
+        let int = bits as i32;
+        Ok(match ty {
+            _ if bits == 0 => VmScalar::Void,
+            VmScalarType::Void => VmScalar::Bits(bits),
+            VmScalarType::Float => VmScalar::Float(f32::from_bits(bits)),
+            VmScalarType::String => VmScalar::String(StringRef::Id(int)),
+            VmScalarType::Function => VmScalar::Function(VmFunctionRef::Ptr(Ptr(int))),
+            VmScalarType::FieldRef => VmScalar::Field(Ptr(int)),
+            VmScalarType::GlobalRef => VmScalar::Global(Ptr(int)),
+            // Entities only exist at runtime, so they can't be literals.
+            VmScalarType::Entity | VmScalarType::EntityFieldRef => {
+                return Err(ScalarCastError {
+                    expected: ty,
+                    found: VmScalarType::Void,
+                });
+            }
+        })
     }
 
     pub fn try_from_bytes(ty: VmScalarType, bytes: [u8; 4]) -> anyhow::Result<Self> {
         match ty {
-            VmScalarType::Void => {
-                if bytes == [0; 4] {
-                    Ok(VmScalar::Void)
-                } else {
-                    Err(anyhow::Error::msg("`void` can only be initialized with 0"))
-                }
-            }
+            // `void` defs are untyped (this includes fteqcc types that we don't support).
+            VmScalarType::Void => Ok(VmScalar::from_bits(bytes)),
             VmScalarType::Float => Ok(VmScalar::Float(f32::from_le_bytes(bytes))),
             VmScalarType::String => Ok(VmScalar::String(StringRef::Id(i32::from_le_bytes(bytes)))),
             VmScalarType::Entity => {

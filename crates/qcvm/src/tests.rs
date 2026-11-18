@@ -17,7 +17,7 @@ use crate::{
     ops::Opcode,
     progs::{
         StringRef, StringTable, VmScalar, VmScalarType, VmType,
-        functions::{ArgSize, FunctionRegistry, Statement},
+        functions::{ArgSize, FunctionBody, FunctionRegistry, Statement},
         globals::GlobalRegistry,
     },
     userdata::{AddrError, Context, EntityHandle, FnCall, Function, QCType},
@@ -126,6 +126,15 @@ impl Program {
         for (i, value) in values.iter().enumerate() {
             self.set_value(addr + i as u16, *value);
         }
+        addr
+    }
+
+    /// A global without a def, as optimizing compilers emit for immediates.
+    fn untyped(&mut self, value: [u8; 4]) -> u16 {
+        let addr = self.next_global;
+        assert!(addr + 1 < LOCALS_START, "Too many globals");
+        self.next_global += 1;
+        self.set_value(addr, value);
         addr
     }
 
@@ -570,6 +579,16 @@ impl Context for TestContext {
                 (a + b).into()
             }),
             b"record" => builtin(&[Type::AnyScalar], |ctx, mut args| {
+                ctx.recorded.push(args.remove(0));
+                Value::Void
+            }),
+            // Records its argument, which must be a float.
+            b"record_float" => builtin(&[Type::Float], |ctx, mut args| {
+                ctx.recorded.push(args.remove(0));
+                Value::Void
+            }),
+            // Records its argument, which must be a string.
+            b"record_string" => builtin(&[Type::String], |ctx, mut args| {
                 ctx.recorded.push(args.remove(0));
                 Value::Void
             }),
@@ -1954,4 +1973,269 @@ fn unknown_def_types_are_untyped() {
         let entity_def = EntityTypeDef::new(defs);
         assert_eq!(entity_def.get(0).unwrap().type_, VmScalarType::Float);
     }
+}
+
+// Untyped globals =================================================================================
+
+/// Optimizing compilers strip the defs of immediates, so globals without a typed def keep their
+/// raw word, which is typed when it's read.
+#[test]
+fn untyped_globals_are_raw_bits() {
+    let def = |name: &CStr, type_: VmType, offset: u16| GlobalDef {
+        save: false,
+        type_,
+        offset,
+        name: name.into(),
+    };
+    let raw = [
+        0.5f32.to_le_bytes(),
+        [0; 4],
+        // Covered by a `void` def, which is untyped.
+        0.25f32.to_le_bytes(),
+        // Covered by a float def.
+        10i32.to_le_bytes(),
+        // Covered by a string def.
+        1.5f32.to_le_bytes(),
+    ]
+    .concat();
+    let globals = GlobalRegistry::new(
+        [
+            def(c"v", VmScalarType::Void.into(), 2),
+            def(c"f", VmScalarType::Float.into(), 3),
+            def(c"s", VmScalarType::String.into(), 4),
+        ],
+        &raw,
+    )
+    .unwrap();
+
+    let initial = |i| globals.initial(i).unwrap().clone();
+    assert_eq!(initial(0), VmScalar::Bits(0.5f32.to_bits()));
+    assert_eq!(initial(1), VmScalar::Void);
+    assert_eq!(initial(2), VmScalar::Bits(0.25f32.to_bits()));
+    assert_eq!(initial(3), VmScalar::Float(f32::from_bits(10)));
+    assert_eq!(
+        initial(4),
+        VmScalar::String(StringRef::Id(1.5f32.to_bits() as i32))
+    );
+}
+
+#[test]
+fn bits_convert_by_use() {
+    use crate::progs::{FieldPtr, Ptr, VmFunctionRef};
+
+    let bits = || VmScalar::Bits(10);
+    assert_eq!(f32::try_from(bits()), Ok(f32::from_bits(10)));
+    assert_eq!(StringRef::try_from(bits()), Ok(StringRef::Id(10)));
+    assert_eq!(
+        VmFunctionRef::try_from(bits()),
+        Ok(VmFunctionRef::Ptr(Ptr(10)))
+    );
+    assert_eq!(FieldPtr::try_from(bits()), Ok(FieldPtr(Ptr(10))));
+    assert!(EntityRef::try_from(bits()).is_err());
+
+    assert!(!bits().is_null());
+    assert!(!bits().is_false());
+    // `-0.0` isn't null, but it is false.
+    assert!(VmScalar::Bits((-0f32).to_bits()).is_false());
+}
+
+#[test]
+fn untyped_float_operand() {
+    let mut p = Program::new();
+    let half = p.untyped(0.5f32.to_le_bytes());
+    let one = p.float("one", 1.);
+    let out = p.float("out", 0.);
+    let (vm, result) = run_main(
+        p,
+        vec![stmt(O::AddF, half, one, out), stmt(O::Done, 0, 0, 0)],
+        &mut TestContext::default(),
+    );
+    result.unwrap();
+    assert_eq!(read_float(&vm, out), 1.5);
+}
+
+#[test]
+fn untyped_string_operand() {
+    let mut p = Program::new();
+    let id = p.string_id("hello");
+    let untyped = p.untyped(id.to_le_bytes());
+    let typed = p.string_with_id("typed", id);
+    let out = p.float("out", 0.);
+    let (vm, result) = run_main(
+        p,
+        vec![stmt(O::EqS, untyped, typed, out), stmt(O::Done, 0, 0, 0)],
+        &mut TestContext::default(),
+    );
+    result.unwrap();
+    assert_eq!(read_float(&vm, out), 1.);
+}
+
+/// Untyped arguments are copied into the parameter slots as-is, and take the type of the builtin's
+/// parameter. Without a type, they fall back to a float.
+#[test]
+fn untyped_builtin_arguments() {
+    for (builtin, value, expected) in [
+        ("record_string", None, Value::try_from("hello").unwrap()),
+        ("record", Some(0.5f32), Value::Float(0.5)),
+    ] {
+        let mut p = Program::new();
+        let record = p.builtin(builtin, &[ArgSize::Scalar]);
+        let record_ptr = p.function_ptr(record);
+        let bits = match value {
+            Some(f) => f.to_le_bytes(),
+            None => p.string_id("hello").to_le_bytes(),
+        };
+        let arg = p.untyped(bits);
+        let main = p.function("main", &[], 0, |_| {
+            vec![
+                stmt(O::StoreF, arg, 4, 0),
+                stmt(O::Call1, record_ptr, 0, 0),
+                stmt(O::Done, 0, 0, 0),
+            ]
+        });
+        let vm = p.build();
+
+        let mut ctx = TestContext::default();
+        run(&vm, &mut ctx, main).unwrap();
+        assert_eq!(ctx.recorded, [expected], "{builtin}");
+    }
+}
+
+#[test]
+fn untyped_state_frame() {
+    let mut p = Program::new();
+    let frame = p.untyped(7f32.to_le_bytes());
+    let think = p.function("think", &[], 0, |_| vec![stmt(O::Done, 0, 0, 0)]);
+    let think_ptr = p.function_ptr(think);
+
+    let mut ctx = TestContext::default();
+    let (_, result) = run_main(
+        p,
+        vec![stmt(O::State, frame, think_ptr, 0), stmt(O::Done, 0, 0, 0)],
+        &mut ctx,
+    );
+    result.unwrap();
+
+    assert_eq!(ctx.states.len(), 1);
+    assert_eq!(ctx.states[0].0, 7.);
+    assert_eq!(function_index(&ctx.states[0].1), think);
+}
+
+/// A global initialized to 0 is `Void`, which is resolved to the zero of the builtin's parameter
+/// type, as in Quake (e.g. `lightstyle(0, "m")` where the `0` is a shared zero global).
+#[test]
+fn void_builtin_argument_is_zero_of_parameter_type() {
+    let mut p = Program::new();
+    let record = p.builtin("record_float", &[ArgSize::Scalar]);
+    let record_ptr = p.function_ptr(record);
+    let zero = p.global("zero", VmScalarType::Void, &[[0; 4]]);
+    let main = p.function("main", &[], 0, |_| {
+        vec![
+            stmt(O::StoreF, zero, 4, 0),
+            stmt(O::Call1, record_ptr, 0, 0),
+            stmt(O::Done, 0, 0, 0),
+        ]
+    });
+    let vm = p.build();
+
+    let mut ctx = TestContext::default();
+    run(&vm, &mut ctx, main).unwrap();
+    assert_eq!(ctx.recorded, [Value::Float(0.)]);
+}
+
+/// Every statement operand that is read with a fixed type, and whose initial value is untyped (see
+/// [`untyped_globals_are_raw_bits`]), converts to that type, and refers to a valid string or
+/// function. With an optimized `progs.dat` (see [`real_progs_vm`]), there are many such globals.
+#[test]
+fn real_progs_untyped_globals_convert() {
+    use VmScalarType as T;
+
+    let Some(vm) = real_progs_vm() else {
+        return;
+    };
+    let globals = &vm.progs.globals;
+
+    let mut errors = Vec::new();
+    let mut checked = std::collections::HashSet::new();
+    for function in vm.functions().iter() {
+        let FunctionBody::Progs(body) = &function.body else {
+            continue;
+        };
+        for statement in body.statements.iter() {
+            let (a, b) = (statement.arg1, statement.arg2);
+            // Vectors are 3 floats.
+            let v = |addr: i16| [(addr, T::Float), (addr + 1, T::Float), (addr + 2, T::Float)];
+            let reads: Vec<(i16, T)> = match statement.opcode {
+                O::MulF
+                | O::Div
+                | O::AddF
+                | O::SubF
+                | O::EqF
+                | O::NeF
+                | O::Le
+                | O::Ge
+                | O::Lt
+                | O::Gt
+                | O::BitAnd
+                | O::BitOr => vec![(a, T::Float), (b, T::Float)],
+                O::MulV | O::AddV | O::SubV | O::EqV | O::NeV => [v(a), v(b)].concat(),
+                O::MulFV => [&[(a, T::Float)][..], &v(b)].concat(),
+                O::MulVF => [&v(a)[..], &[(b, T::Float)]].concat(),
+                O::NotF | O::StorePF => vec![(a, T::Float)],
+                O::NotV | O::StorePV => v(a).into(),
+                O::EqS | O::NeS => vec![(a, T::String), (b, T::String)],
+                O::NotS | O::StorePS => vec![(a, T::String)],
+                O::EqEnt | O::NeEnt => vec![(a, T::Entity), (b, T::Entity)],
+                O::NotEnt | O::StorePEnt => vec![(a, T::Entity)],
+                O::EqFnc | O::NeFnc => vec![(a, T::Function), (b, T::Function)],
+                O::NotFnc | O::StorePFnc => vec![(a, T::Function)],
+                O::StorePFld => vec![(a, T::FieldRef)],
+                O::LoadF
+                | O::LoadV
+                | O::LoadS
+                | O::LoadEnt
+                | O::LoadFld
+                | O::LoadFnc
+                | O::Address => vec![(a, T::Entity), (b, T::FieldRef)],
+                O::Call0
+                | O::Call1
+                | O::Call2
+                | O::Call3
+                | O::Call4
+                | O::Call5
+                | O::Call6
+                | O::Call7
+                | O::Call8 => vec![(a, T::Function)],
+                O::State => vec![(a, T::Float), (b, T::Function)],
+                _ => vec![],
+            };
+
+            for (addr, ty) in reads {
+                let addr = addr as u16 as usize;
+                let Ok(&VmScalar::Bits(bits)) = globals.initial(addr) else {
+                    continue;
+                };
+                checked.insert(addr);
+                let result = VmScalar::bits_as(ty, bits)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|value| match value {
+                        VmScalar::String(s) => vm.progs.string_table.get(s).map(drop),
+                        VmScalar::Function(crate::progs::VmFunctionRef::Ptr(ptr)) => {
+                            vm.functions().get_by_index(ptr.0).map(drop)
+                        }
+                        _ => Ok(()),
+                    });
+                if let Err(e) = result {
+                    errors.push(format!(
+                        "{}: {:?} reads global {addr} ({bits:#x}) as {ty}: {e:#}",
+                        function.name.to_string_lossy(),
+                        statement.opcode,
+                    ));
+                }
+            }
+        }
+    }
+
+    eprintln!("Checked {} untyped globals", checked.len());
+    assert!(errors.is_empty(), "{errors:#?}");
 }
