@@ -1,13 +1,12 @@
 //! # Quake 1 field, global and builtin definitions
-//! const MAP
 //!
-//! This module contains Quake-compatible builtin IDs, which should be implemented
-//! if writing a host that can load unmodified `progs.dat` files designed for the
-//! vanilla Quake engine.
+//! This module contains Quake-compatible global and field addresses, and builtin numbers
+//! (see [`BuiltinAddr`]), which should be implemented if writing a host that can load
+//! unmodified `progs.dat` files designed for the vanilla Quake engine.
 //!
 //! This is compatible with [`progdefs.q1`](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 
-pub use self::{fields::FieldAddr, globals::GlobalAddr};
+pub use self::{builtins::BuiltinAddr, fields::FieldAddr, globals::GlobalAddr};
 
 use crate::{Address, Type};
 
@@ -49,83 +48,399 @@ impl<A: Address + Copy> AddrTable<A> {
 
 /// The builtins of the Quake GPL release, by builtin number.
 pub mod builtins {
-    /// The name of Quake builtin `#number`, as declared in id1's `defs.qc`.
+    use std::fmt;
+
+    use strum::{EnumIter, VariantArray};
+
+    use crate::BuiltinAddress;
+
+    /// Builtin numbers of the Quake GPL release, named as declared in id1's `defs.qc`.
     ///
-    /// Hosts should dispatch builtins by number (see [`crate::FunctionDef::builtin_number`])
-    /// rather than by name, as `progs.dat`s can rename or alias builtins (e.g. LibreQuake's
-    /// `bprint_e = #23`). Returns `None` for unused numbers (e.g. `#5`) and extension builtins.
-    pub fn builtin_name(number: u32) -> Option<&'static str> {
-        Some(match number {
-            1 => "makevectors",
-            2 => "setorigin",
-            3 => "setmodel",
-            4 => "setsize",
-            6 => "break",
-            7 => "random",
-            8 => "sound",
-            9 => "normalize",
-            10 => "error",
-            11 => "objerror",
-            12 => "vlen",
-            13 => "vectoyaw",
-            14 => "spawn",
-            15 => "remove",
-            16 => "traceline",
-            17 => "checkclient",
-            18 => "find",
-            19 => "precache_sound",
-            20 => "precache_model",
-            21 => "stuffcmd",
-            22 => "findradius",
-            23 => "bprint",
-            24 => "sprint",
-            25 => "dprint",
-            26 => "ftos",
-            27 => "vtos",
-            28 => "coredump",
-            29 => "traceon",
-            30 => "traceoff",
-            31 => "eprint",
-            32 => "walkmove",
-            34 => "droptofloor",
-            35 => "lightstyle",
-            36 => "rint",
-            37 => "floor",
-            38 => "ceil",
-            40 => "checkbottom",
-            41 => "pointcontents",
-            43 => "fabs",
-            44 => "aim",
-            45 => "cvar",
-            46 => "localcmd",
-            47 => "nextent",
-            49 => "ChangeYaw",
-            51 => "vectoangles",
-            52 => "WriteByte",
-            53 => "WriteChar",
-            54 => "WriteShort",
-            55 => "WriteLong",
-            56 => "WriteCoord",
-            57 => "WriteAngle",
-            58 => "WriteString",
-            59 => "WriteEntity",
-            67 => "movetogoal",
-            68 => "precache_file",
-            69 => "makestatic",
-            70 => "changelevel",
-            72 => "cvar_set",
-            73 => "centerprint",
-            74 => "ambientsound",
-            75 => "precache_model2",
-            76 => "precache_sound2",
-            77 => "precache_file2",
-            78 => "setspawnparms",
-            79 => "logfrag",
-            80 => "infokey",
-            81 => "stof",
-            82 => "multicast",
-            _ => return None,
-        })
+    /// Hosts should dispatch builtins by number (see [`crate::FunctionDef::builtin_number`] and
+    /// [`crate::FunctionDef::builtin_addr`]) rather than by name, as `progs.dat`s can rename or
+    /// alias builtins (e.g. LibreQuake's `bprint_e = #23`). Unused numbers (e.g. `#5`) and
+    /// extension builtins have no variant.
+    #[derive(VariantArray, EnumIter, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum BuiltinAddr {
+        /// `#1`: `makevectors`
+        MakeVectors,
+        /// `#2`: `setorigin`
+        SetOrigin,
+        /// `#3`: `setmodel`
+        SetModel,
+        /// `#4`: `setsize`
+        SetSize,
+        /// `#6`: `break`
+        Break,
+        /// `#7`: `random`
+        Random,
+        /// `#8`: `sound`
+        Sound,
+        /// `#9`: `normalize`
+        Normalize,
+        /// `#10`: `error`
+        Error,
+        /// `#11`: `objerror`
+        ObjError,
+        /// `#12`: `vlen`
+        Vlen,
+        /// `#13`: `vectoyaw`
+        VecToYaw,
+        /// `#14`: `spawn`
+        Spawn,
+        /// `#15`: `remove`
+        Remove,
+        /// `#16`: `traceline`
+        TraceLine,
+        /// `#17`: `checkclient`
+        CheckClient,
+        /// `#18`: `find`
+        Find,
+        /// `#19`: `precache_sound`
+        PrecacheSound,
+        /// `#20`: `precache_model`
+        PrecacheModel,
+        /// `#21`: `stuffcmd`
+        StuffCmd,
+        /// `#22`: `findradius`
+        FindRadius,
+        /// `#23`: `bprint`
+        BPrint,
+        /// `#24`: `sprint`
+        SPrint,
+        /// `#25`: `dprint`
+        DPrint,
+        /// `#26`: `ftos`
+        Ftos,
+        /// `#27`: `vtos`
+        Vtos,
+        /// `#28`: `coredump`
+        CoreDump,
+        /// `#29`: `traceon`
+        TraceOn,
+        /// `#30`: `traceoff`
+        TraceOff,
+        /// `#31`: `eprint`
+        EPrint,
+        /// `#32`: `walkmove`
+        WalkMove,
+        /// `#34`: `droptofloor`
+        DropToFloor,
+        /// `#35`: `lightstyle`
+        LightStyle,
+        /// `#36`: `rint`
+        Rint,
+        /// `#37`: `floor`
+        Floor,
+        /// `#38`: `ceil`
+        Ceil,
+        /// `#40`: `checkbottom`
+        CheckBottom,
+        /// `#41`: `pointcontents`
+        PointContents,
+        /// `#43`: `fabs`
+        Fabs,
+        /// `#44`: `aim`
+        Aim,
+        /// `#45`: `cvar`
+        Cvar,
+        /// `#46`: `localcmd`
+        LocalCmd,
+        /// `#47`: `nextent`
+        NextEnt,
+        /// `#49`: `ChangeYaw`
+        ChangeYaw,
+        /// `#51`: `vectoangles`
+        VecToAngles,
+        /// `#52`: `WriteByte`
+        WriteByte,
+        /// `#53`: `WriteChar`
+        WriteChar,
+        /// `#54`: `WriteShort`
+        WriteShort,
+        /// `#55`: `WriteLong`
+        WriteLong,
+        /// `#56`: `WriteCoord`
+        WriteCoord,
+        /// `#57`: `WriteAngle`
+        WriteAngle,
+        /// `#58`: `WriteString`
+        WriteString,
+        /// `#59`: `WriteEntity`
+        WriteEntity,
+        /// `#67`: `movetogoal`
+        MoveToGoal,
+        /// `#68`: `precache_file`
+        PrecacheFile,
+        /// `#69`: `makestatic`
+        MakeStatic,
+        /// `#70`: `changelevel`
+        ChangeLevel,
+        /// `#72`: `cvar_set`
+        CvarSet,
+        /// `#73`: `centerprint`
+        CenterPrint,
+        /// `#74`: `ambientsound`
+        AmbientSound,
+        /// `#75`: `precache_model2`
+        PrecacheModel2,
+        /// `#76`: `precache_sound2`
+        PrecacheSound2,
+        /// `#77`: `precache_file2`
+        PrecacheFile2,
+        /// `#78`: `setspawnparms`
+        SetSpawnParms,
+        /// `#79`: `logfrag`
+        LogFrag,
+        /// `#80`: `infokey`
+        InfoKey,
+        /// `#81`: `stof`
+        Stof,
+        /// `#82`: `multicast`
+        Multicast,
+    }
+
+    impl BuiltinAddress for BuiltinAddr {
+        fn number(&self) -> u32 {
+            match self {
+                Self::MakeVectors => 1,
+                Self::SetOrigin => 2,
+                Self::SetModel => 3,
+                Self::SetSize => 4,
+                Self::Break => 6,
+                Self::Random => 7,
+                Self::Sound => 8,
+                Self::Normalize => 9,
+                Self::Error => 10,
+                Self::ObjError => 11,
+                Self::Vlen => 12,
+                Self::VecToYaw => 13,
+                Self::Spawn => 14,
+                Self::Remove => 15,
+                Self::TraceLine => 16,
+                Self::CheckClient => 17,
+                Self::Find => 18,
+                Self::PrecacheSound => 19,
+                Self::PrecacheModel => 20,
+                Self::StuffCmd => 21,
+                Self::FindRadius => 22,
+                Self::BPrint => 23,
+                Self::SPrint => 24,
+                Self::DPrint => 25,
+                Self::Ftos => 26,
+                Self::Vtos => 27,
+                Self::CoreDump => 28,
+                Self::TraceOn => 29,
+                Self::TraceOff => 30,
+                Self::EPrint => 31,
+                Self::WalkMove => 32,
+                Self::DropToFloor => 34,
+                Self::LightStyle => 35,
+                Self::Rint => 36,
+                Self::Floor => 37,
+                Self::Ceil => 38,
+                Self::CheckBottom => 40,
+                Self::PointContents => 41,
+                Self::Fabs => 43,
+                Self::Aim => 44,
+                Self::Cvar => 45,
+                Self::LocalCmd => 46,
+                Self::NextEnt => 47,
+                Self::ChangeYaw => 49,
+                Self::VecToAngles => 51,
+                Self::WriteByte => 52,
+                Self::WriteChar => 53,
+                Self::WriteShort => 54,
+                Self::WriteLong => 55,
+                Self::WriteCoord => 56,
+                Self::WriteAngle => 57,
+                Self::WriteString => 58,
+                Self::WriteEntity => 59,
+                Self::MoveToGoal => 67,
+                Self::PrecacheFile => 68,
+                Self::MakeStatic => 69,
+                Self::ChangeLevel => 70,
+                Self::CvarSet => 72,
+                Self::CenterPrint => 73,
+                Self::AmbientSound => 74,
+                Self::PrecacheModel2 => 75,
+                Self::PrecacheSound2 => 76,
+                Self::PrecacheFile2 => 77,
+                Self::SetSpawnParms => 78,
+                Self::LogFrag => 79,
+                Self::InfoKey => 80,
+                Self::Stof => 81,
+                Self::Multicast => 82,
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            match self {
+                Self::MakeVectors => "makevectors",
+                Self::SetOrigin => "setorigin",
+                Self::SetModel => "setmodel",
+                Self::SetSize => "setsize",
+                Self::Break => "break",
+                Self::Random => "random",
+                Self::Sound => "sound",
+                Self::Normalize => "normalize",
+                Self::Error => "error",
+                Self::ObjError => "objerror",
+                Self::Vlen => "vlen",
+                Self::VecToYaw => "vectoyaw",
+                Self::Spawn => "spawn",
+                Self::Remove => "remove",
+                Self::TraceLine => "traceline",
+                Self::CheckClient => "checkclient",
+                Self::Find => "find",
+                Self::PrecacheSound => "precache_sound",
+                Self::PrecacheModel => "precache_model",
+                Self::StuffCmd => "stuffcmd",
+                Self::FindRadius => "findradius",
+                Self::BPrint => "bprint",
+                Self::SPrint => "sprint",
+                Self::DPrint => "dprint",
+                Self::Ftos => "ftos",
+                Self::Vtos => "vtos",
+                Self::CoreDump => "coredump",
+                Self::TraceOn => "traceon",
+                Self::TraceOff => "traceoff",
+                Self::EPrint => "eprint",
+                Self::WalkMove => "walkmove",
+                Self::DropToFloor => "droptofloor",
+                Self::LightStyle => "lightstyle",
+                Self::Rint => "rint",
+                Self::Floor => "floor",
+                Self::Ceil => "ceil",
+                Self::CheckBottom => "checkbottom",
+                Self::PointContents => "pointcontents",
+                Self::Fabs => "fabs",
+                Self::Aim => "aim",
+                Self::Cvar => "cvar",
+                Self::LocalCmd => "localcmd",
+                Self::NextEnt => "nextent",
+                Self::ChangeYaw => "ChangeYaw",
+                Self::VecToAngles => "vectoangles",
+                Self::WriteByte => "WriteByte",
+                Self::WriteChar => "WriteChar",
+                Self::WriteShort => "WriteShort",
+                Self::WriteLong => "WriteLong",
+                Self::WriteCoord => "WriteCoord",
+                Self::WriteAngle => "WriteAngle",
+                Self::WriteString => "WriteString",
+                Self::WriteEntity => "WriteEntity",
+                Self::MoveToGoal => "movetogoal",
+                Self::PrecacheFile => "precache_file",
+                Self::MakeStatic => "makestatic",
+                Self::ChangeLevel => "changelevel",
+                Self::CvarSet => "cvar_set",
+                Self::CenterPrint => "centerprint",
+                Self::AmbientSound => "ambientsound",
+                Self::PrecacheModel2 => "precache_model2",
+                Self::PrecacheSound2 => "precache_sound2",
+                Self::PrecacheFile2 => "precache_file2",
+                Self::SetSpawnParms => "setspawnparms",
+                Self::LogFrag => "logfrag",
+                Self::InfoKey => "infokey",
+                Self::Stof => "stof",
+                Self::Multicast => "multicast",
+            }
+        }
+
+        fn from_number(n: u32) -> Option<Self> {
+            Some(match n {
+                1 => Self::MakeVectors,
+                2 => Self::SetOrigin,
+                3 => Self::SetModel,
+                4 => Self::SetSize,
+                6 => Self::Break,
+                7 => Self::Random,
+                8 => Self::Sound,
+                9 => Self::Normalize,
+                10 => Self::Error,
+                11 => Self::ObjError,
+                12 => Self::Vlen,
+                13 => Self::VecToYaw,
+                14 => Self::Spawn,
+                15 => Self::Remove,
+                16 => Self::TraceLine,
+                17 => Self::CheckClient,
+                18 => Self::Find,
+                19 => Self::PrecacheSound,
+                20 => Self::PrecacheModel,
+                21 => Self::StuffCmd,
+                22 => Self::FindRadius,
+                23 => Self::BPrint,
+                24 => Self::SPrint,
+                25 => Self::DPrint,
+                26 => Self::Ftos,
+                27 => Self::Vtos,
+                28 => Self::CoreDump,
+                29 => Self::TraceOn,
+                30 => Self::TraceOff,
+                31 => Self::EPrint,
+                32 => Self::WalkMove,
+                34 => Self::DropToFloor,
+                35 => Self::LightStyle,
+                36 => Self::Rint,
+                37 => Self::Floor,
+                38 => Self::Ceil,
+                40 => Self::CheckBottom,
+                41 => Self::PointContents,
+                43 => Self::Fabs,
+                44 => Self::Aim,
+                45 => Self::Cvar,
+                46 => Self::LocalCmd,
+                47 => Self::NextEnt,
+                49 => Self::ChangeYaw,
+                51 => Self::VecToAngles,
+                52 => Self::WriteByte,
+                53 => Self::WriteChar,
+                54 => Self::WriteShort,
+                55 => Self::WriteLong,
+                56 => Self::WriteCoord,
+                57 => Self::WriteAngle,
+                58 => Self::WriteString,
+                59 => Self::WriteEntity,
+                67 => Self::MoveToGoal,
+                68 => Self::PrecacheFile,
+                69 => Self::MakeStatic,
+                70 => Self::ChangeLevel,
+                72 => Self::CvarSet,
+                73 => Self::CenterPrint,
+                74 => Self::AmbientSound,
+                75 => Self::PrecacheModel2,
+                76 => Self::PrecacheSound2,
+                77 => Self::PrecacheFile2,
+                78 => Self::SetSpawnParms,
+                79 => Self::LogFrag,
+                80 => Self::InfoKey,
+                81 => Self::Stof,
+                82 => Self::Multicast,
+                _ => return None,
+            })
+        }
+    }
+
+    impl fmt::Display for BuiltinAddr {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.name())
+        }
+    }
+
+    #[cfg(test)]
+    mod test {
+        use strum::IntoEnumIterator;
+
+        use crate::{BuiltinAddress as _, quake1::builtins::BuiltinAddr};
+
+        #[test]
+        fn check_to_from_parity() {
+            for builtin in <BuiltinAddr as IntoEnumIterator>::iter() {
+                assert_eq!(BuiltinAddr::from_number(builtin.number()), Some(builtin));
+                assert_eq!(BuiltinAddr::from_name(builtin.name()), Some(builtin));
+            }
+        }
     }
 }
 

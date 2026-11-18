@@ -1830,7 +1830,9 @@ fn builtins_are_identified_by_number() {
 #[cfg(feature = "quake1")]
 #[test]
 fn quake1_builtin_names_are_by_number() {
-    use crate::quake1::builtins::builtin_name;
+    use crate::{BuiltinAddress as _, quake1::BuiltinAddr};
+
+    let builtin_name = |n| BuiltinAddr::from_number(n).map(|b| b.name());
 
     assert_eq!(builtin_name(1), Some("makevectors"));
     assert_eq!(builtin_name(5), None);

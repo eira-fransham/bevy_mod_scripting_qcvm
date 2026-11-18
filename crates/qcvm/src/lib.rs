@@ -123,7 +123,36 @@ pub trait Address: strum::VariantArray + Clone + Send + Sync + Sized + 'static {
     fn type_(&self) -> Type;
 }
 
-/// Dummy address for when there are no external globals
+/// Trait for builtin numbers (`#n` in QuakeC).
+///
+/// This is the builtin counterpart to [`Address`]: it maps the builtin numbers in a `progs.dat`
+/// to canonical names, so that hosts can dispatch builtins by number even when the `progs.dat`
+/// renames or aliases them.
+pub trait BuiltinAddress: strum::VariantArray + Clone + Send + Sync + Sized + 'static {
+    /// Get the builtin number (`#n` in QuakeC) of this builtin.
+    fn number(&self) -> u32;
+
+    /// Get the canonical name of this builtin.
+    fn name(&self) -> &'static str;
+
+    /// Given a builtin number, get the builtin it corresponds to.
+    fn from_number(n: u32) -> Option<Self> {
+        Self::VARIANTS
+            .iter()
+            .find(|variant| variant.number() == n)
+            .cloned()
+    }
+
+    /// Given a name, get the builtin the name corresponds to.
+    fn from_name(name: &str) -> Option<Self> {
+        Self::VARIANTS
+            .iter()
+            .find(|variant| variant.name() == name)
+            .cloned()
+    }
+}
+
+/// Dummy address for when there are no external globals, fields or builtins
 #[derive(VariantArray, PartialEq, Hash, Clone)]
 pub enum EmptyAddress {}
 
@@ -146,6 +175,24 @@ impl Address for EmptyAddress {
 
     fn name(&self) -> &'static str {
         unreachable!()
+    }
+}
+
+impl BuiltinAddress for EmptyAddress {
+    fn number(&self) -> u32 {
+        unreachable!()
+    }
+
+    fn name(&self) -> &'static str {
+        unreachable!()
+    }
+
+    fn from_number(_: u32) -> Option<Self> {
+        None
+    }
+
+    fn from_name(_: &str) -> Option<Self> {
+        None
     }
 }
 

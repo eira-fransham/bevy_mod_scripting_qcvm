@@ -206,6 +206,11 @@ impl<T> FunctionDef<T> {
             None
         }
     }
+
+    /// For builtins whose number is known to `B`, the typed builtin address.
+    pub fn builtin_addr<B: crate::BuiltinAddress>(&self) -> Option<B> {
+        self.builtin_number().and_then(B::from_number)
+    }
 }
 
 /// No body as the function is provided by the host.

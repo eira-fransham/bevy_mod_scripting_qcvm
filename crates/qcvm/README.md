@@ -36,11 +36,12 @@ Quake 1-compatible global and field addresses are defined in the `quake1` module
 (behind a feature flag, disabled by default), it is intended that users of this
 library will use this as a base upon which to add their own extensions. However,
 if desired, the user can define a completely new set of global/field definitions
-that is entirely unrelated to Quake 1's. The intention in the future is to use a
-similar mechanism for builtins, but that will require some more design work in order
-to allow e.g. overriding QuakeC-defined functions from host code. For now, when
-calling a builtin the host is provided with the raw name and index of the builtin
-that we read from the `progs.dat` (the filename of compiled QuakeC bytecode).
+that is entirely unrelated to Quake 1's. Builtins work similarly: the `BuiltinAddress`
+trait maps builtin numbers (`#n` in QuakeC) to canonical names, and `quake1::BuiltinAddr`
+implements it for the vanilla Quake builtins. However, when resolving a builtin the host is
+still provided with the raw `BuiltinDef` (name, index and builtin number) read from the
+`progs.dat` (the filename of compiled QuakeC bytecode), and can use
+`BuiltinDef::builtin_addr` to look up the typed builtin.
 
 The host is intended to manage storage for globals and fields, although any
 host-unknown globals will be managed internally by the VM. This is to allow mods to
