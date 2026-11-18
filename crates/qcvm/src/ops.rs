@@ -220,7 +220,6 @@ where
         }
 
         let params = function_args()
-            .into_iter()
             .take(num_args)
             .zip(sig)
             .map(|(ArgAddr { addr, .. }, ty)| self.get_typed(addr, ty))

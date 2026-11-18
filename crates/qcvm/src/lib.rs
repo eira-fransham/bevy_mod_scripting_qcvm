@@ -65,11 +65,7 @@ pub trait Address: strum::VariantArray + Clone + Send + Sync + Sized + 'static {
     /// For vector globals, returns the component fields. For scalars, just returns `self`.
     fn fields(&self) -> Option<[(Self, VectorField); 3]> {
         fn float_field<A: Address>(addr: u16, field: VectorField) -> Option<(A, VectorField)> {
-            if let Some(addr) = A::from_u16_typed(addr + field as u16, Type::Float) {
-                Some((addr, field))
-            } else {
-                None
-            }
+            A::from_u16_typed(addr + field as u16, Type::Float).map(|addr| (addr, field))
         }
 
         match self.type_() {
@@ -101,8 +97,8 @@ pub trait Address: strum::VariantArray + Clone + Send + Sync + Sized + 'static {
     fn from_u16_typed(val: u16, ty: Type) -> Option<Self> {
         Self::VARIANTS
             .iter()
+            .find(|&variant| variant.to_u16() == val && variant.type_().typeck(&ty))
             .cloned()
-            .find(|variant| variant.to_u16() == val && variant.type_().typeck(&ty))
     }
 
     /// Get the offset to this global.
@@ -115,8 +111,8 @@ pub trait Address: strum::VariantArray + Clone + Send + Sync + Sized + 'static {
     fn from_name(name: &str) -> Option<Self> {
         Self::VARIANTS
             .iter()
+            .find(|&variant| variant.name() == name)
             .cloned()
-            .find(|variant| variant.name() == name)
     }
 
     /// Get the type of values at this address
@@ -571,7 +567,7 @@ impl Value {
 
     /// Get a field of a value.
     pub fn field(&self, field: VectorField) -> Result<Value, TryScalarError> {
-        Ok(match (self, field.into()) {
+        Ok(match (self, field) {
             (Value::Vector(v), offset) => match offset {
                 VectorField::XOrScalar => v.x.into(),
                 VectorField::Y => v.y.into(),
@@ -587,7 +583,7 @@ impl Value {
     /// Set a field of this type, if possible. If this value is a scalar and `field` is
     /// not `XOrScalar`, return an error.
     pub fn set(&mut self, field: VectorField, value: Value) -> Result<(), SetValueError> {
-        match (self, field.into(), value) {
+        match (self, field, value) {
             (this, VectorField::XOrScalar, value) => *this = value,
             (Value::Vector(v), offset, Value::Float(f)) => match offset {
                 VectorField::XOrScalar => v.x = f,
@@ -1107,26 +1103,25 @@ impl Type {
     }
 
     pub(crate) const fn typeck(&self, other: &Self) -> bool {
-        match (self, other) {
+        matches!(
+            (self, other),
             (
                 Type::AnyScalar
-                | Type::Void
-                | Type::Entity
-                | Type::Function
-                | Type::Float
-                | Type::String
-                | Type::Field,
+                    | Type::Void
+                    | Type::Entity
+                    | Type::Function
+                    | Type::Float
+                    | Type::String
+                    | Type::Field,
                 Type::AnyScalar,
-            ) => true,
-            (Type::Void, Type::Void) => true,
-            (Type::Entity, Type::Entity) => true,
-            (Type::Function, Type::Function) => true,
-            (Type::Vector, Type::Vector) => true,
-            (Type::Float, Type::Float) => true,
-            (Type::String, Type::String) => true,
-            (Type::Field, Type::Field) => true,
-            _ => false,
-        }
+            ) | (Type::Void, Type::Void)
+                | (Type::Entity, Type::Entity)
+                | (Type::Function, Type::Function)
+                | (Type::Vector, Type::Vector)
+                | (Type::Float, Type::Float)
+                | (Type::String, Type::String)
+                | (Type::Field, Type::Field)
+        )
     }
 }
 
