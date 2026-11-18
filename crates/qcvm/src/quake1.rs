@@ -148,6 +148,8 @@ pub mod builtins {
         LocalCmd,
         /// `#47`: `nextent`
         NextEnt,
+        /// `#48`: `particle`
+        Particle,
         /// `#49`: `ChangeYaw`
         ChangeYaw,
         /// `#51`: `vectoangles`
@@ -246,6 +248,7 @@ pub mod builtins {
                 Self::Cvar => 45,
                 Self::LocalCmd => 46,
                 Self::NextEnt => 47,
+                Self::Particle => 48,
                 Self::ChangeYaw => 49,
                 Self::VecToAngles => 51,
                 Self::WriteByte => 52,
@@ -319,6 +322,7 @@ pub mod builtins {
                 Self::Cvar => "cvar",
                 Self::LocalCmd => "localcmd",
                 Self::NextEnt => "nextent",
+                Self::Particle => "particle",
                 Self::ChangeYaw => "ChangeYaw",
                 Self::VecToAngles => "vectoangles",
                 Self::WriteByte => "WriteByte",
@@ -392,6 +396,7 @@ pub mod builtins {
                 45 => Self::Cvar,
                 46 => Self::LocalCmd,
                 47 => Self::NextEnt,
+                48 => Self::Particle,
                 49 => Self::ChangeYaw,
                 51 => Self::VecToAngles,
                 52 => Self::WriteByte,

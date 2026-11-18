@@ -1839,8 +1839,32 @@ fn quake1_builtin_names_are_by_number() {
     assert_eq!(builtin_name(13), Some("vectoyaw"));
     assert_eq!(builtin_name(14), Some("spawn"));
     assert_eq!(builtin_name(45), Some("cvar"));
+    assert_eq!(builtin_name(48), Some("particle"));
     assert_eq!(builtin_name(0), None);
     assert_eq!(builtin_name(83), None);
+}
+
+/// Every builtin in a real `progs.dat` (see [`real_progs_vm`]) must be known to
+/// [`quake1::BuiltinAddr`](crate::quake1::BuiltinAddr), as optimizing compilers strip builtin
+/// names so builtins can only be resolved by number.
+#[cfg(feature = "quake1")]
+#[test]
+fn real_progs_builtins_are_known() {
+    use crate::{BuiltinAddress as _, quake1::BuiltinAddr};
+
+    let Some(vm) = real_progs_vm() else {
+        return;
+    };
+
+    let mut unknown = vm
+        .functions()
+        .iter()
+        .filter_map(|def| def.builtin_number())
+        .filter(|&n| BuiltinAddr::from_number(n).is_none())
+        .collect::<Vec<_>>();
+    unknown.sort_unstable();
+    unknown.dedup();
+    assert!(unknown.is_empty(), "unknown builtin numbers: {unknown:?}");
 }
 
 /// `fteqcc` writes 0 for the argument sizes of builtins, which Quake ignores.

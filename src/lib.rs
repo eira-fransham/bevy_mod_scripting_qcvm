@@ -440,7 +440,13 @@ where
         let func = function_registry
             .get_function(TypeId::of::<QCWorldspawn>(), def_name.clone())
             .map_err(|_| {
-                InteropError::external_boxed(format!("No builtin named {def_name}").into())
+                let number = def
+                    .builtin_number()
+                    .map(|n| format!(" (#{n})"))
+                    .unwrap_or_default();
+                InteropError::external_boxed(
+                    format!("No builtin named {def_name:?}{number}").into(),
+                )
             })?;
 
         let builtin = Arc::new(BevyBuiltin {
