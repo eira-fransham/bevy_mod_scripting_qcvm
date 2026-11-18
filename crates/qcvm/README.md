@@ -31,14 +31,18 @@ Not unless you want to be sectioned.
 
 ## Design
 
-The VM is designed with no specific global and builtin definitions in mind. While
-Quake 1-compatible global and field addresses are defined in the `quake1` module
-(behind a feature flag, disabled by default), it is intended that users of this
-library will use this as a base upon which to add their own extensions. However,
-if desired, the user can define a completely new set of global/field definitions
-that is entirely unrelated to Quake 1's. Builtins work similarly: the `BuiltinAddress`
-trait maps builtin numbers (`#n` in QuakeC) to canonical names, and `quake1::BuiltinAddr`
-implements it for the vanilla Quake builtins. However, when resolving a builtin the host is
+The VM is designed with no specific global and builtin definitions in mind. The
+globals, fields and builtins that a host knows about come from a `defs.qc`, and are
+described by an implementation of the `QCDefs` trait, which bundles the global and
+field address types (implementing `Address`), the builtin type (implementing
+`BuiltinAddress`) and the `progdefs.h` CRC that `progs.dat`s compiled against those
+defs carry. `progs.dat`s are loaded with `QCVm::load::<Defs, _>`, which rejects
+`progs.dat`s with a different CRC. Quake 1-compatible defs are provided by the
+sister crate `qcvm-defs-quake1`, and other `defs.qc`s (e.g. of engines with
+extensions) can be provided by other `qcvm-defs-*` crates, or the user can define
+a completely new set of definitions that is entirely unrelated to Quake 1's. The
+`BuiltinAddress` trait maps builtin numbers (`#n` in QuakeC) to canonical names, and
+`qcvm_defs_quake1::BuiltinAddr` implements it for the vanilla Quake builtins. However, when resolving a builtin the host is
 still provided with the raw `BuiltinDef` (name, index and builtin number) read from the
 `progs.dat` (the filename of compiled QuakeC bytecode), and can use
 `BuiltinDef::builtin_addr` to look up the typed builtin.

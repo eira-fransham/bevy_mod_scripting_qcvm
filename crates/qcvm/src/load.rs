@@ -21,8 +21,6 @@ use crate::{
 };
 
 const VERSION: i32 = 6;
-/// The CRC of the `progdefs.h` this crate's Quake bindings expect.
-const CRC: i32 = 5927;
 const LUMP_COUNT: usize = 6;
 const SAVE_GLOBAL: u16 = 1 << 15;
 
@@ -129,7 +127,9 @@ impl Progs {
     /// Loads all data from a `progs.dat` file.
     ///
     /// This returns objects representing the necessary context to execute QuakeC bytecode.
-    pub fn load<R>(mut src: R) -> anyhow::Result<Progs>
+    /// `expected_crc` is the CRC of the `progdefs.h` the host expects (see
+    /// [`QCDefs::CRC`](crate::QCDefs::CRC)).
+    pub fn load<R>(mut src: R, expected_crc: i32) -> anyhow::Result<Progs>
     where
         R: Read + Seek,
     {
@@ -141,9 +141,9 @@ impl Progs {
         // Quake only uses the CRC to check compatibility with `progdefs.h`, i.e. the layout of the
         // globals and fields that the engine accesses directly.
         let crc = src.read_i32::<LittleEndian>()?;
-        if crc != CRC {
+        if crc != expected_crc {
             anyhow::bail!(
-                "progs CRC {crc} does not match the expected CRC {CRC}: this progs.dat uses an \
+                "progs CRC {crc} does not match the expected CRC {expected_crc}: this progs.dat uses an \
                  incompatible global/field layout"
             );
         }

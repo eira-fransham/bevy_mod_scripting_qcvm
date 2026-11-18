@@ -54,8 +54,70 @@ pub use crate::{
     },
 };
 
-#[cfg(feature = "quake1")]
-pub mod quake1;
+/// The globals, fields and builtins defined by a `defs.qc` (e.g. Quake 1's `progdefs.q1`).
+///
+/// This is implemented by a marker type (usually an uninhabited enum) in a `qcvm-defs-*` crate,
+/// such as `qcvm_defs_quake1::Quake1`. Hosts are generic over a single `QCDefs` type rather than
+/// the three address types separately, as they always come from the same `defs.qc`.
+pub trait QCDefs: Send + Sync + 'static {
+    /// The globals that the host accesses directly.
+    type GlobalAddr: Address;
+    /// The entity fields that the host accesses directly.
+    type FieldAddr: Address;
+    /// The builtins that the host knows by number.
+    type BuiltinAddr: BuiltinAddress;
+
+    /// The CRC of the `progdefs.h` generated from these defs, which `progs.dat`s compiled against
+    /// them carry. `progs.dat`s with a different CRC are rejected when loading, as their global
+    /// and field layout is incompatible.
+    const CRC: i32;
+}
+
+/// For each offset, the scalar and vector addresses at that offset (if any).
+///
+/// [`Address::from_u16_typed`] is called for every operand of every instruction, so
+/// implementations can use this to replace the default linear search of
+/// [`strum::VariantArray::VARIANTS`] with an index. This is usually stored in a
+/// [`std::sync::LazyLock`].
+pub struct AddrTable<A: 'static> {
+    by_offset: Box<[[Option<A>; 2]]>,
+}
+
+impl<A: Address + Copy> AddrTable<A> {
+    /// Builds the table from [`strum::VariantArray::VARIANTS`].
+    pub fn new() -> Self {
+        let len = A::VARIANTS
+            .iter()
+            .map(|addr| addr.to_u16() as usize + 1)
+            .max()
+            .unwrap_or_default();
+        let mut by_offset = vec![[None, None]; len];
+        for addr in A::VARIANTS.iter().copied() {
+            let slot = usize::from(addr.type_() == Type::Vector);
+            by_offset[addr.to_u16() as usize][slot] = Some(addr);
+        }
+
+        Self {
+            by_offset: by_offset.into(),
+        }
+    }
+
+    /// The address at `offset` that has type `ty`, as specified by [`Address::from_u16_typed`].
+    #[inline]
+    pub fn get(&self, offset: u16, ty: Type) -> Option<A> {
+        let [scalar, vector] = self.by_offset.get(offset as usize)?;
+        match ty {
+            Type::Vector => *vector,
+            _ => scalar.filter(|addr| addr.type_().typeck(&ty)),
+        }
+    }
+}
+
+impl<A: Address + Copy> Default for AddrTable<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// A type-erased entity handle.
 pub type ErasedEntityHandle = NonZeroU64;
@@ -1350,20 +1412,28 @@ impl TryFrom<&str> for FunctionRef {
 }
 
 impl QCVm {
-    /// Load the runtime from a `progs.dat` file, with the default (strict) [`VmOptions`].
-    pub fn load<R>(bytes: R) -> anyhow::Result<Self>
+    /// Load the runtime from a `progs.dat` file compiled against the defs `D`, with the default
+    /// (strict) [`VmOptions`].
+    ///
+    /// This fails if the `progs.dat`'s CRC isn't [`QCDefs::CRC`].
+    pub fn load<D, R>(bytes: R) -> anyhow::Result<Self>
     where
+        D: QCDefs,
         R: std::io::Read + std::io::Seek,
     {
-        Self::load_with_options(bytes, VmOptions::default())
+        Self::load_with_options::<D, R>(bytes, VmOptions::default())
     }
 
-    /// Load the runtime from a `progs.dat` file, with the given options.
-    pub fn load_with_options<R>(bytes: R, options: VmOptions) -> anyhow::Result<Self>
+    /// Load the runtime from a `progs.dat` file compiled against the defs `D`, with the given
+    /// options.
+    ///
+    /// This fails if the `progs.dat`'s CRC isn't [`QCDefs::CRC`].
+    pub fn load_with_options<D, R>(bytes: R, options: VmOptions) -> anyhow::Result<Self>
     where
+        D: QCDefs,
         R: std::io::Read + std::io::Seek,
     {
-        Ok(Self::from_progs(Progs::load(bytes)?, options))
+        Ok(Self::from_progs(Progs::load(bytes, D::CRC)?, options))
     }
 
     fn from_progs(progs: Progs, options: VmOptions) -> Self {

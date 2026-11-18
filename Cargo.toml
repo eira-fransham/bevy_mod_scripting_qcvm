@@ -1,6 +1,6 @@
 [package]
 name = "bevy_mod_scripting_qcvm"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "A QuakeC runtime for scripting Bevy games"
 readme = "README.md"
@@ -11,7 +11,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [workspace]
-members = ["crates/qcvm"]
+members = ["crates/qcvm", "crates/qcvm-defs-quake1"]
 
 [workspace.package]
 authors = ["Eira Fransham <eira.fransham@gmail.com>"]
@@ -49,7 +49,7 @@ hashbrown.workspace = true
 itertools.workspace = true
 num.workspace = true
 bevy_reflect.workspace = true
-qcvm = { version = "0.4", path = "crates/qcvm" }
+qcvm = { version = "0.5", path = "crates/qcvm" }
 
 bevy_ecs = "0.20"
 bevy_asset = "0.20"
@@ -67,4 +67,3 @@ bevy_mod_scripting_world = "0.24"
 
 [features]
 default = []
-quake1 = ["qcvm/quake1"]

@@ -1,0 +1,16 @@
+[package]
+name = "qcvm-defs-quake1"
+version = "0.5.0"
+edition = "2024"
+description = "Quake 1 global, field and builtin definitions for qcvm"
+readme = "README.md"
+
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+num.workspace = true
+strum = { workspace = true, features = ["derive"] }
+qcvm = { version = "0.5", path = "../qcvm" }

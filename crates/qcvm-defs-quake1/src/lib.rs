@@ -1,49 +1,29 @@
-//! # Quake 1 field, global and builtin definitions
+//! # Quake 1 field, global and builtin definitions for `qcvm`
 //!
-//! This module contains Quake-compatible global and field addresses, and builtin numbers
+//! This crate contains Quake-compatible global and field addresses, and builtin numbers
 //! (see [`BuiltinAddr`]), which should be implemented if writing a host that can load
-//! unmodified `progs.dat` files designed for the vanilla Quake engine.
+//! unmodified `progs.dat` files designed for the vanilla Quake engine. They are bundled together
+//! as the [`Quake1`] [`QCDefs`].
 //!
 //! This is compatible with [`progdefs.q1`](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 
+#![deny(missing_docs)]
+
 pub use self::{builtins::BuiltinAddr, fields::FieldAddr, globals::GlobalAddr};
 
-use crate::{Address, Type};
+use qcvm::QCDefs;
 
-/// For each offset, the scalar and vector addresses at that offset (if any).
-///
-/// [`Address::from_u16_typed`] is called for every operand of every instruction, so this replaces
-/// a linear search of [`strum::VariantArray::VARIANTS`] with an index.
-struct AddrTable<A: 'static> {
-    by_offset: Box<[[Option<A>; 2]]>,
-}
+/// The defs of the Quake GPL release (`progdefs.q1`), for `progs.dat`s compiled against id1's
+/// `defs.qc`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum Quake1 {}
 
-impl<A: Address + Copy> AddrTable<A> {
-    fn new() -> Self {
-        let len = A::VARIANTS
-            .iter()
-            .map(|addr| addr.to_u16() as usize + 1)
-            .max()
-            .unwrap_or_default();
-        let mut by_offset = vec![[None, None]; len];
-        for addr in A::VARIANTS.iter().copied() {
-            let slot = usize::from(addr.type_() == Type::Vector);
-            by_offset[addr.to_u16() as usize][slot] = Some(addr);
-        }
+impl QCDefs for Quake1 {
+    type GlobalAddr = GlobalAddr;
+    type FieldAddr = FieldAddr;
+    type BuiltinAddr = BuiltinAddr;
 
-        Self {
-            by_offset: by_offset.into(),
-        }
-    }
-
-    #[inline]
-    fn get(&self, offset: u16, ty: Type) -> Option<A> {
-        let [scalar, vector] = self.by_offset.get(offset as usize)?;
-        match ty {
-            Type::Vector => *vector,
-            _ => scalar.filter(|addr| addr.type_().typeck(&ty)),
-        }
-    }
+    const CRC: i32 = 5927;
 }
 
 /// The builtins of the Quake GPL release, by builtin number.
@@ -52,12 +32,12 @@ pub mod builtins {
 
     use strum::{EnumIter, VariantArray};
 
-    use crate::BuiltinAddress;
+    use qcvm::BuiltinAddress;
 
     /// Builtin numbers of the Quake GPL release, named as declared in id1's `defs.qc`.
     ///
-    /// Hosts should dispatch builtins by number (see [`crate::FunctionDef::builtin_number`] and
-    /// [`crate::FunctionDef::builtin_addr`]) rather than by name, as `progs.dat`s can rename or
+    /// Hosts should dispatch builtins by number (see [`qcvm::FunctionDef::builtin_number`] and
+    /// [`qcvm::FunctionDef::builtin_addr`]) rather than by name, as `progs.dat`s can rename or
     /// alias builtins (e.g. LibreQuake's `bprint_e = #23`). Unused numbers (e.g. `#5`) and
     /// extension builtins have no variant.
     #[derive(VariantArray, EnumIter, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -437,7 +417,9 @@ pub mod builtins {
     mod test {
         use strum::IntoEnumIterator;
 
-        use crate::{BuiltinAddress as _, quake1::builtins::BuiltinAddr};
+        use qcvm::BuiltinAddress as _;
+
+        use crate::builtins::BuiltinAddr;
 
         #[test]
         fn check_to_from_parity() {
@@ -456,7 +438,7 @@ pub mod globals {
     use num::FromPrimitive;
     use strum::{EnumIter, VariantArray};
 
-    use crate::{Address, Type, VectorField};
+    use qcvm::{Address, Type, VectorField};
 
     // int      pad[28];
     // int      self;
@@ -679,8 +661,8 @@ pub mod globals {
         }
     }
 
-    static TABLE: std::sync::LazyLock<super::AddrTable<GlobalAddr>> =
-        std::sync::LazyLock::new(super::AddrTable::new);
+    static TABLE: std::sync::LazyLock<qcvm::AddrTable<GlobalAddr>> =
+        std::sync::LazyLock::new(qcvm::AddrTable::new);
 
     impl Address for GlobalAddr {
         #[inline]
@@ -1020,7 +1002,9 @@ pub mod globals {
     mod test {
         use strum::IntoEnumIterator;
 
-        use crate::{Address as _, quake1::globals::GlobalAddr};
+        use qcvm::Address as _;
+
+        use crate::globals::GlobalAddr;
 
         #[test]
         fn check_to_from_parity() {
@@ -1043,7 +1027,7 @@ pub mod fields {
     use std::fmt;
     use strum::{EnumIter, VariantArray};
 
-    use crate::{Address, Type, VectorField};
+    use qcvm::{Address, Type, VectorField};
 
     // float    modelindex;
     // vec3_t   absmin;
@@ -1386,8 +1370,8 @@ pub mod fields {
         }
     }
 
-    static TABLE: std::sync::LazyLock<super::AddrTable<FieldAddr>> =
-        std::sync::LazyLock::new(super::AddrTable::new);
+    static TABLE: std::sync::LazyLock<qcvm::AddrTable<FieldAddr>> =
+        std::sync::LazyLock::new(qcvm::AddrTable::new);
 
     impl Address for FieldAddr {
         #[inline]

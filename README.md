@@ -15,11 +15,11 @@ for basic usage of that library.
 The namespaces used are:
 
 - `QCBuiltin` - builtin functions will be looked up here. If the builtin number
-  (`#n`) is known to the `BuiltinAddr` type parameter of `QCScriptingPlugin` (e.g.
-  `qcvm::quake1::BuiltinAddr`), the canonical name from that type is used, so
-  renamed or aliased builtins still resolve. Otherwise (e.g. extension builtins, or
-  any builtin when using `qcvm::EmptyAddress`), the name defined in the loaded
-  `progs.dat` is used.
+  (`#n`) is known to the `BuiltinAddr` of the `QCDefs` type parameter of
+  `QCScriptingPlugin` (e.g. `qcvm_defs_quake1::Quake1`), the canonical name from
+  that type is used, so renamed or aliased builtins still resolve. Otherwise (e.g.
+  extension builtins, or any builtin when the defs' `BuiltinAddr` is
+  `qcvm::EmptyAddress`), the name defined in the loaded `progs.dat` is used.
 - `QCWorldspawn` - globals will be looked up here using the `get` and `set` magic
   functions, by name. The intention is that the world is an entity with the script
   attached, rather than a resource, although this may change in the future.

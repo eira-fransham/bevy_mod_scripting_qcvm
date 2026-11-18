@@ -1,6 +1,6 @@
 [package]
 name = "qcvm"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "A QuakeC runtime designed to be embedded"
 readme = "README.md"
@@ -36,4 +36,3 @@ bevy_reflect = { workspace = true, optional = true }
 [features]
 default = []
 reflect = ["dep:bevy_reflect"]
-quake1 = []

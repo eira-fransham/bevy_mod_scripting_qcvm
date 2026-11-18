@@ -14,11 +14,17 @@ use snafu::Snafu;
 
 use crate::{
     Address, AsErasedContext, BuiltinDef, EntityRef, EntityTypeDef, ErasedEntityHandle,
-    ExecutionCtx, FieldDef, FunctionRef, MAX_ARGS, QCMemory, QCParams, ReturnValue, Type, Value,
-    VectorField, VmType, function_args, progs::VmValue,
+    ExecutionCtx, FieldDef, FunctionRef, MAX_ARGS, QCDefs, QCMemory, QCParams, ReturnValue, Type,
+    Value, VectorField, VmType, function_args, progs::VmValue,
 };
 
 type ErasedAddr = u16;
+
+/// The global address type of the defs of context `C`.
+pub type GlobalAddrOf<C> = <<C as Context>::Defs as QCDefs>::GlobalAddr;
+
+/// The field address type of the defs of the context of entity handle `E`.
+pub type FieldAddrOf<E> = <<<E as EntityHandle>::Context as Context>::Defs as QCDefs>::FieldAddr;
 
 /// An error when getting/setting an address
 #[derive(Snafu, Debug, Copy, Clone, PartialEq, Eq)]
@@ -64,14 +70,14 @@ pub trait Context {
     type Function: ?Sized + Function<Context = Self>;
     /// The error that is returned by [`Context::builtin`].
     type Error: std::error::Error;
-    /// The type representing valid globals
-    type GlobalAddr: Address;
+    /// The globals, fields and builtins that the host knows about (see [`QCDefs`]).
+    type Defs: QCDefs;
 
     /// Given a function definition, get the builtin that it corresponds to (if one exists).
     fn builtin(&self, def: &BuiltinDef) -> Result<Arc<Self::Function>, Self::Error>;
 
     /// Get a global with the given definition
-    fn global(&self, def: Self::GlobalAddr) -> Result<Value, AddrError<Self::Error>>;
+    fn global(&self, def: GlobalAddrOf<Self>) -> Result<Value, AddrError<Self::Error>>;
 
     /// Implement the `OP_STATE` opcode.
     ///
@@ -90,7 +96,7 @@ pub trait Context {
     /// Set a global with the given definition
     fn set_global(
         &mut self,
-        def: Self::GlobalAddr,
+        def: GlobalAddrOf<Self>,
         value: Value,
     ) -> Result<(), AddrError<Self::Error>>;
 }
@@ -202,16 +208,17 @@ where
         ty: Type,
         entity_def: &EntityTypeDef,
     ) -> anyhow::Result<Value, AddrError<anyhow::Error>> {
-        let result = <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| {
-            match <<T::Entity as EntityHandle>::FieldAddr as Address>::from_u16_typed(field, ty) {
-                Some(field_addr) => ent.get(self, field_addr),
-                None => match dynamic_field(entity_def, field, ty) {
-                    Some((def, component)) => ent.get_dynamic(self, def, component),
-                    None => Err(AddrError::OutOfRange),
-                },
-            }
-        })
-        .map_err(|e| anyhow::format_err!("{e}"))?;
+        let result =
+            <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| {
+                match <FieldAddrOf<T::Entity> as Address>::from_u16_typed(field, ty) {
+                    Some(field_addr) => ent.get(self, field_addr),
+                    None => match dynamic_field(entity_def, field, ty) {
+                        Some((def, component)) => ent.get_dynamic(self, def, component),
+                        None => Err(AddrError::OutOfRange),
+                    },
+                }
+            })
+            .map_err(|e| anyhow::format_err!("{e}"))?;
 
         result.map_err(|e| match e {
             AddrError::OutOfRange => AddrError::OutOfRange,
@@ -234,24 +241,23 @@ where
             ty => ty,
         };
 
-        let result = <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| {
-            match <<T::Entity as EntityHandle>::FieldAddr as Address>::from_u16_typed(
-                field, lookup_ty,
-            ) {
-                Some(field_addr) => {
-                    let value = value.or_zero(field_addr.type_());
-                    ent.set(self, field_addr, value)
-                }
-                None => match dynamic_field(entity_def, field, lookup_ty) {
-                    Some((def, component)) => {
-                        let value = value.or_zero(dynamic_field_type(def, component));
-                        ent.set_dynamic(self, def, component, value)
+        let result =
+            <T::Entity as EntityHandle>::from_erased(erased_ent, |ent| {
+                match <FieldAddrOf<T::Entity> as Address>::from_u16_typed(field, lookup_ty) {
+                    Some(field_addr) => {
+                        let value = value.or_zero(field_addr.type_());
+                        ent.set(self, field_addr, value)
                     }
-                    None => Err(AddrError::OutOfRange),
-                },
-            }
-        })
-        .map_err(|e| anyhow::format_err!("{e}"))?;
+                    None => match dynamic_field(entity_def, field, lookup_ty) {
+                        Some((def, component)) => {
+                            let value = value.or_zero(dynamic_field_type(def, component));
+                            ent.set_dynamic(self, def, component, value)
+                        }
+                        None => Err(AddrError::OutOfRange),
+                    },
+                }
+            })
+            .map_err(|e| anyhow::format_err!("{e}"))?;
 
         result.map_err(|e| match e {
             AddrError::OutOfRange => AddrError::OutOfRange,
@@ -262,10 +268,8 @@ where
     }
 
     fn dyn_global(&self, def: ErasedAddr, ty: Type) -> Result<Value, AddrError<anyhow::Error>> {
-        self.global(
-            <T as Context>::GlobalAddr::from_u16_typed(def, ty).ok_or(AddrError::OutOfRange)?,
-        )
-        .map_err(AddrError::into_anyhow)
+        self.global(GlobalAddrOf::<T>::from_u16_typed(def, ty).ok_or(AddrError::OutOfRange)?)
+            .map_err(AddrError::into_anyhow)
     }
 
     fn dyn_set_global(
@@ -277,15 +281,15 @@ where
             Type::Void => Type::AnyScalar,
             ty => ty,
         };
-        let addr = <T as Context>::GlobalAddr::from_u16_typed(def, lookup_ty)
-            .ok_or(AddrError::OutOfRange)?;
+        let addr =
+            GlobalAddrOf::<T>::from_u16_typed(def, lookup_ty).ok_or(AddrError::OutOfRange)?;
         let value = value.or_zero(addr.type_());
 
         self.set_global(addr, value).map_err(AddrError::into_anyhow)
     }
 
     fn dyn_global_type(&self, def: ErasedAddr) -> Option<Type> {
-        <T as Context>::GlobalAddr::from_u16_typed(def, Type::AnyScalar).map(|addr| addr.type_())
+        GlobalAddrOf::<T>::from_u16_typed(def, Type::AnyScalar).map(|addr| addr.type_())
     }
 }
 
@@ -331,9 +335,6 @@ pub trait EntityHandle: QCType {
     type Context: ?Sized + Context<Entity = Self>;
     /// The error returned from this
     type Error: std::error::Error;
-    /// The type representing fields
-    type FieldAddr: Address;
-
     /// Convert from an opaque handle to a reference to this type (must be a reference in order to allow unsized handles)
     fn from_erased<F, O>(erased: EntityRef, callback: F) -> Result<O, Self::Error>
     where
@@ -354,18 +355,18 @@ pub trait EntityHandle: QCType {
     fn get(
         &self,
         context: &Self::Context,
-        field: Self::FieldAddr,
+        field: FieldAddrOf<Self>,
     ) -> Result<Value, AddrError<Self::Error>>;
 
     /// Set a field given this handle and a mutable reference to the context.
     fn set(
         &self,
         context: &mut Self::Context,
-        field: Self::FieldAddr,
+        field: FieldAddrOf<Self>,
         value: Value,
     ) -> Result<(), AddrError<Self::Error>>;
 
-    /// Get a field that isn't one of [`EntityHandle::FieldAddr`], i.e. one defined by the
+    /// Get a field that isn't one of the context's [`QCDefs::FieldAddr`], i.e. one defined by the
     /// `progs.dat` itself. `component` is `Some` to get a single component of a vector field.
     ///
     /// By default, this returns [`AddrError::OutOfRange`].
@@ -378,7 +379,7 @@ pub trait EntityHandle: QCType {
         Err(AddrError::OutOfRange)
     }
 
-    /// Set a field that isn't one of [`EntityHandle::FieldAddr`], see [`EntityHandle::get_dynamic`].
+    /// Set a field that isn't one of the context's [`QCDefs::FieldAddr`], see [`EntityHandle::get_dynamic`].
     ///
     /// By default, this returns [`AddrError::OutOfRange`].
     fn set_dynamic(

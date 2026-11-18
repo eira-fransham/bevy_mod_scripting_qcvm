@@ -12,7 +12,7 @@ use strum::VariantArray;
 
 use crate::{
     Address, EmptyAddress, EntityRef, EntityTypeDef, FieldDef, FieldRef, FunctionIndex, GlobalDef,
-    MAX_ARGS, MissingArguments, QCVm, ReturnValue, Type, Value, VectorField, VmOptions,
+    MAX_ARGS, MissingArguments, QCDefs, QCVm, ReturnValue, Type, Value, VectorField, VmOptions,
     load::{LoadFn, Progs, def_type, parse_arg_sizes},
     ops::Opcode,
     progs::{
@@ -313,6 +313,17 @@ impl fmt::Display for TestError {
 
 impl std::error::Error for TestError {}
 
+/// The defs of [`TestContext`]. The CRC is Quake's, as [`real_progs_vm`] loads id1's `progs.dat`.
+enum TestDefs {}
+
+impl QCDefs for TestDefs {
+    type GlobalAddr = EmptyAddress;
+    type FieldAddr = TestFieldAddr;
+    type BuiltinAddr = EmptyAddress;
+
+    const CRC: i32 = 5927;
+}
+
 /// Fields known to the host at compile time. Other fields go through
 /// [`EntityHandle::get_dynamic`].
 #[derive(VariantArray, Debug, Copy, Clone, PartialEq, Eq)]
@@ -419,7 +430,6 @@ fn set_field(
 impl EntityHandle for TestEnt {
     type Context = TestContext;
     type Error = TestError;
-    type FieldAddr = TestFieldAddr;
 
     fn get(
         &self,
@@ -567,7 +577,7 @@ impl Context for TestContext {
     type Entity = TestEnt;
     type Function = TestFn;
     type Error = TestError;
-    type GlobalAddr = EmptyAddress;
+    type Defs = TestDefs;
 
     fn builtin(&self, def: &crate::BuiltinDef) -> Result<Arc<TestFn>, TestError> {
         Ok(match def.name.to_bytes() {
@@ -1581,7 +1591,7 @@ fn real_progs_vm() -> Option<QCVm> {
         return None;
     };
     let bytes = std::fs::read(path).unwrap();
-    Some(QCVm::load(std::io::Cursor::new(bytes)).unwrap())
+    Some(QCVm::load::<TestDefs, _>(std::io::Cursor::new(bytes)).unwrap())
 }
 
 /// Loads a real `progs.dat` (see [`real_progs_vm`]) and runs `main`.
@@ -1846,44 +1856,25 @@ fn builtins_are_identified_by_number() {
     assert_eq!(ctx.recorded, [1., 23., 23., 14.].map(Value::from).to_vec());
 }
 
-#[cfg(feature = "quake1")]
+/// `progs.dat`s whose CRC isn't the defs' [`QCDefs::CRC`] are rejected.
 #[test]
-fn quake1_builtin_names_are_by_number() {
-    use crate::{BuiltinAddress as _, quake1::BuiltinAddr};
-
-    let builtin_name = |n| BuiltinAddr::from_number(n).map(|b| b.name());
-
-    assert_eq!(builtin_name(1), Some("makevectors"));
-    assert_eq!(builtin_name(5), None);
-    assert_eq!(builtin_name(13), Some("vectoyaw"));
-    assert_eq!(builtin_name(14), Some("spawn"));
-    assert_eq!(builtin_name(45), Some("cvar"));
-    assert_eq!(builtin_name(48), Some("particle"));
-    assert_eq!(builtin_name(0), None);
-    assert_eq!(builtin_name(83), None);
-}
-
-/// Every builtin in a real `progs.dat` (see [`real_progs_vm`]) must be known to
-/// [`quake1::BuiltinAddr`](crate::quake1::BuiltinAddr), as optimizing compilers strip builtin
-/// names so builtins can only be resolved by number.
-#[cfg(feature = "quake1")]
-#[test]
-fn real_progs_builtins_are_known() {
-    use crate::{BuiltinAddress as _, quake1::BuiltinAddr};
-
-    let Some(vm) = real_progs_vm() else {
-        return;
+fn progs_crc_must_match_defs() {
+    let header = |crc: i32| {
+        let mut bytes = 6i32.to_le_bytes().to_vec();
+        bytes.extend(crc.to_le_bytes());
+        std::io::Cursor::new(bytes)
     };
 
-    let mut unknown = vm
-        .functions()
-        .iter()
-        .filter_map(|def| def.builtin_number())
-        .filter(|&n| BuiltinAddr::from_number(n).is_none())
-        .collect::<Vec<_>>();
-    unknown.sort_unstable();
-    unknown.dedup();
-    assert!(unknown.is_empty(), "unknown builtin numbers: {unknown:?}");
+    let err = QCVm::load::<TestDefs, _>(header(TestDefs::CRC + 1)).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("does not match the expected CRC 5927"),
+        "{err}"
+    );
+
+    // With the right CRC, loading gets past the header (and then fails as there are no lumps).
+    let err = QCVm::load::<TestDefs, _>(header(TestDefs::CRC)).unwrap_err();
+    assert!(!err.to_string().contains("CRC"), "{err}");
 }
 
 /// `fteqcc` writes 0 for the argument sizes of builtins, which Quake ignores.
