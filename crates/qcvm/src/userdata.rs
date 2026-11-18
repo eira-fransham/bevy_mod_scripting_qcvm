@@ -447,7 +447,9 @@ where
             }
             _ => {
                 let value = self.execution.memory.get(i.addr as _)?.into();
-                self.execution.to_value(value)
+                // The zero word is the zero of any type, so a `Void` argument (e.g. a global
+                // that's initialized to 0) is resolved to the zero of the expected type.
+                Ok(self.execution.to_value(value)?.or_zero(*ty))
             }
         })
     }

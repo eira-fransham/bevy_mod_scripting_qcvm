@@ -17,7 +17,7 @@ use crate::{
     ops::Opcode,
     progs::{
         StringRef, StringTable, VmScalar, VmScalarType, VmType,
-        functions::{ArgSize, FunctionRegistry, Statement},
+        functions::{ArgSize, FunctionBody, FunctionRegistry, Statement},
         globals::GlobalRegistry,
     },
     userdata::{AddrError, Context, EntityHandle, FnCall, Function, QCType},
@@ -261,7 +261,7 @@ impl Program {
         let raw = self.values.iter().flatten().copied().collect::<Vec<u8>>();
         QCVm::from_progs(
             Progs {
-                globals: GlobalRegistry::new(self.globals, &raw).unwrap(),
+                globals: GlobalRegistry::new(self.globals, &raw, self.strings.len()).unwrap(),
                 entity_def: EntityTypeDef::new(self.fields),
                 string_table: StringTable::new(self.strings).unwrap(),
                 functions: FunctionRegistry::new(self.statements.into(), &self.functions).unwrap(),
@@ -570,6 +570,11 @@ impl Context for TestContext {
                 (a + b).into()
             }),
             b"record" => builtin(&[Type::AnyScalar], |ctx, mut args| {
+                ctx.recorded.push(args.remove(0));
+                Value::Void
+            }),
+            // Records its argument, which must be a float.
+            b"record_float" => builtin(&[Type::Float], |ctx, mut args| {
                 ctx.recorded.push(args.remove(0));
                 Value::Void
             }),
@@ -1589,6 +1594,131 @@ fn real_progs() {
     );
 }
 
+/// Optimizing compilers strip the defs of immediates, so globals without a typed def are
+/// classified by their value: 0 is `Void`, a positive denormal inside the strings lump is a
+/// string and anything else is a float.
+#[test]
+fn undefined_globals_are_classified() {
+    let def = |name: &CStr, type_: VmType, offset: u16| GlobalDef {
+        save: false,
+        type_,
+        offset,
+        name: name.into(),
+    };
+    let raw = [
+        0.5f32.to_le_bytes(),
+        10i32.to_le_bytes(),
+        [0; 4],
+        // Covered by a string def, so stays a string even though it would be a float.
+        1.5f32.to_le_bytes(),
+        // Covered by a `void` def, which is classified like an undefined global.
+        0.25f32.to_le_bytes(),
+        // A positive denormal past the end of the strings lump.
+        200i32.to_le_bytes(),
+        // Covered by a float def, so stays a float even though it looks like a string.
+        10i32.to_le_bytes(),
+    ]
+    .concat();
+    let globals = GlobalRegistry::new(
+        [
+            def(c"s", VmScalarType::String.into(), 3),
+            def(c"v", VmScalarType::Void.into(), 4),
+            def(c"f", VmScalarType::Float.into(), 6),
+        ],
+        &raw,
+        100,
+    )
+    .unwrap();
+
+    let initial = |i| globals.initial(i).unwrap().clone();
+    assert_eq!(initial(0), VmScalar::Float(0.5));
+    assert_eq!(initial(1), VmScalar::String(StringRef::Id(10)));
+    assert_eq!(initial(2), VmScalar::Void);
+    assert_eq!(
+        initial(3),
+        VmScalar::String(StringRef::Id(i32::from_le_bytes(1.5f32.to_le_bytes())))
+    );
+    assert_eq!(initial(4), VmScalar::Float(0.25));
+    assert_eq!(
+        initial(5),
+        VmScalar::Float(f32::from_le_bytes(200i32.to_le_bytes()))
+    );
+    assert_eq!(
+        initial(6),
+        VmScalar::Float(f32::from_le_bytes(10i32.to_le_bytes()))
+    );
+}
+
+/// Every statement that reads an operand with a fixed type must find a value of that type in the
+/// initial value of a global without a typed def, i.e. [`undefined_globals_are_classified`]'s rule
+/// agrees with how the real `progs.dat` (see [`real_progs_vm`]) uses those globals. With an
+/// optimized `progs.dat`, there are many such globals (immediates).
+#[test]
+fn real_progs_undefined_globals_are_consistent() {
+    let Some(vm) = real_progs_vm() else {
+        return;
+    };
+    let globals = &vm.progs.globals;
+
+    let mut covered = std::collections::HashSet::new();
+    for def in globals.defs() {
+        let len = match def.type_ {
+            VmType::Scalar(VmScalarType::Void) => 0,
+            VmType::Scalar(_) => 1,
+            VmType::Vector => 3,
+        };
+        covered.extend((0..len).map(|i| usize::from(def.offset) + i));
+    }
+
+    let mut conflicts = Vec::new();
+    let mut checked = std::collections::HashSet::new();
+    for function in vm.functions().iter() {
+        let FunctionBody::Progs(body) = &function.body else {
+            continue;
+        };
+        for statement in body.statements.iter() {
+            let (s, f) = (VmScalarType::String, VmScalarType::Float);
+            let reads: &[(i16, VmScalarType)] = match statement.opcode {
+                O::EqS | O::NeS => &[(statement.arg1, s), (statement.arg2, s)],
+                O::NotS | O::StoreS | O::StorePS => &[(statement.arg1, s)],
+                O::MulF
+                | O::Div
+                | O::AddF
+                | O::SubF
+                | O::EqF
+                | O::NeF
+                | O::Le
+                | O::Ge
+                | O::Lt
+                | O::Gt
+                | O::BitAnd
+                | O::BitOr => &[(statement.arg1, f), (statement.arg2, f)],
+                O::MulFV | O::NotF | O::StorePF | O::State => &[(statement.arg1, f)],
+                O::MulVF => &[(statement.arg2, f)],
+                _ => &[],
+            };
+
+            for &(addr, expected) in reads {
+                let addr = addr as u16 as usize;
+                if covered.contains(&addr) {
+                    continue;
+                }
+                let Ok(value) = globals.initial(addr) else {
+                    continue;
+                };
+                checked.insert(addr);
+                let found = value.type_();
+                if found != VmScalarType::Void && found != expected {
+                    conflicts.push((function.name.clone(), statement.opcode, addr, value.clone()));
+                }
+            }
+        }
+    }
+
+    eprintln!("Checked {} undefined globals", checked.len());
+    assert!(conflicts.is_empty(), "conflicts: {conflicts:#?}");
+}
+
 /// `qcc` copies arguments of any type into the parameter slots with `STORE_V`.
 #[test]
 fn store_v_into_parameters_is_untyped() {
@@ -1608,6 +1738,28 @@ fn store_v_into_parameters_is_untyped() {
     let mut ctx = TestContext::default();
     run(&vm, &mut ctx, main).unwrap();
     assert_eq!(ctx.recorded, [Value::try_from("hello").unwrap()]);
+}
+
+/// A global initialized to 0 is `Void`, which is resolved to the zero of the builtin's parameter
+/// type, as in Quake (e.g. `lightstyle(0, "m")` where the `0` is a shared zero global).
+#[test]
+fn void_builtin_argument_is_zero_of_parameter_type() {
+    let mut p = Program::new();
+    let record = p.builtin("record_float", &[ArgSize::Scalar]);
+    let record_ptr = p.function_ptr(record);
+    let zero = p.global("zero", VmScalarType::Void, &[[0; 4]]);
+    let main = p.function("main", &[], 0, |_| {
+        vec![
+            stmt(O::StoreF, zero, 4, 0),
+            stmt(O::Call1, record_ptr, 0, 0),
+            stmt(O::Done, 0, 0, 0),
+        ]
+    });
+    let vm = p.build();
+
+    let mut ctx = TestContext::default();
+    run(&vm, &mut ctx, main).unwrap();
+    assert_eq!(ctx.recorded, [Value::Float(0.)]);
 }
 
 /// Outside of the parameter slots, `STORE_V` copies a vector, so it can't copy other types.

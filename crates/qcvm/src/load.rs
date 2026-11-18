@@ -301,7 +301,7 @@ impl Progs {
         let mut global_values = vec![0; globals_lump.count * 4];
         src.read_exact(&mut global_values)?;
 
-        let globals = GlobalRegistry::new(global_defs, &global_values)?;
+        let globals = GlobalRegistry::new(global_defs, &global_values, string_lump.count)?;
 
         let entity_def = EntityTypeDef::new(field_defs);
 
