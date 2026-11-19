@@ -9,7 +9,7 @@ use arc_slice::ArcSlice;
 use arrayvec::ArrayVec;
 use byteorder::{LittleEndian, ReadBytesExt};
 use num::FromPrimitive as _;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     entity::EntityTypeDef,
@@ -98,15 +98,22 @@ pub(crate) fn parse_arg_sizes(
         .ok_or_else(|| anyhow::format_err!("Function {name:?} has {argc} arguments"))?;
 
     if offset < 0 {
+        // Builtins don't use argument sizes at all. Vanilla quake's progs.dat sets
+        // them anyway, but bytecode emitted by FTEQW's toolchain (in its most-common
+        // configuration) does not.
         return Ok(ArrayVec::new());
     }
 
     arg_sizes[..argc]
         .iter()
         .map(|byte| {
-            ArgSize::from_u8(*byte).ok_or_else(|| {
-                anyhow::format_err!("Function {name:?} has an invalid argument size ({byte})")
-            })
+            Ok(ArgSize::from_u8(*byte).unwrap_or_else(|| {
+                warn!("Function {name:?} has an invalid argument size ({byte})");
+                // TODO: Quake seems to just ignore zero-sized arguments, but it's
+                // not totally clear why we receive any zero-sized args at all.
+                // Arcane Dimensions' `progs.dat` seems to include them.
+                ArgSize::Scalar
+            }))
         })
         .collect()
 }
