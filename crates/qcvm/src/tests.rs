@@ -1856,6 +1856,20 @@ fn builtins_are_identified_by_number() {
     assert_eq!(ctx.recorded, [1., 23., 23., 14.].map(Value::from).to_vec());
 }
 
+/// `fteqcc` gives builtins declared as `#0` an offset of 0. They are builtins without a number,
+/// which engines look up by name.
+#[test]
+fn zero_offset_functions_are_unnumbered_builtins() {
+    let mut p = Program::new();
+    let by_name = p.numbered_builtin("by_name", 0);
+    let vm = p.build();
+
+    let def = vm.functions().get_by_index(by_name).unwrap();
+    assert!(def.is_builtin());
+    assert_eq!(def.builtin_number(), None);
+    assert!(!vm.functions().get_by_index(0).unwrap().is_builtin());
+}
+
 /// `progs.dat`s whose CRC isn't the defs' [`QCDefs::CRC`] are rejected.
 #[test]
 fn progs_crc_must_match_defs() {

@@ -1722,6 +1722,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "qcvm-defs-csqc"
+version = "0.5.0"
+dependencies = [
+ "qcvm",
+ "qcvm-defs-quake1",
+ "strum",
+]
+
+[[package]]
 name = "qcvm-defs-quake1"
 version = "0.5.0"
 dependencies = [

@@ -12,25 +12,40 @@ own games outside of the context of Seismon is a bad idea.
 See [the `bevy_mod_scripting` docs](https://makspll.github.io/bevy_mod_scripting/)
 for basic usage of that library.
 
-The namespaces used are:
+Add `QCScriptingPlugin::default()`. Each QuakeC VM is a `progs.dat` attached
+(with `AttachScript`) to its own worldspawn entity, which must have a
+`QCVmConfig`. Several VMs can run in the same world, e.g. a server's `progs.dat`
+and a client's `csprogs.dat`. The config says:
 
-- `QCBuiltin` - builtin functions will be looked up here. If the builtin number
-  (`#n`) is known to the `BuiltinAddr` of the `QCDefs` type parameter of
-  `QCScriptingPlugin` (e.g. `qcvm_defs_quake1::Quake1`), the canonical name from
-  that type is used, so renamed or aliased builtins still resolve. Otherwise (e.g.
-  extension builtins, or any builtin when the defs' `BuiltinAddr` is
-  `qcvm::EmptyAddress`), the name defined in the loaded `progs.dat` is used.
-- `QCWorldspawn` - globals will be looked up here using the `get` and `set` magic
-  functions, by name. The intention is that the world is an entity with the script
-  attached, rather than a resource, although this may change in the future.
-- `QCEntity` - globals will be looked up here using the `get` and `set` magic
-  functions, by name. The intention is that different fields will access different
+- `defs` - the `QCDefs` that the `progs.dat` is compiled against, type-erased as
+  an `&dyn qcvm::ErasedDefs`.
+  `progs.dat`s with a different CRC fail to load.
+- `builtin_namespace` - the `NamespaceBuilder` namespace that builtin functions
+  are looked up in. If the builtin number (`#n`) is known to the defs, the
+  canonical name from the defs is used, so renamed or aliased builtins still
+  resolve. Otherwise (e.g. extension builtins), the name defined in the loaded
+  `progs.dat` is used. Builtins shared between VMs can be registered in each
+  VM's namespace.
+- `options` - the `qcvm::VmOptions` that the `progs.dat` is loaded with.
+
+Globals and fields are accessed with the `get` and `set` magic functions, by
+name:
+
+- `QCWorldspawn` - globals are looked up on references to this component of the
+  VM's worldspawn.
+- `QCEntity` - fields are looked up on references to this component of an
+  entity. The intention is that different fields will access different
   components, for example the `origin` field can access the [`Transform`](https://docs.rs/bevy/latest/bevy/transform/components/struct.Transform.html)
   component.
 
-`qcvm` uses a separate mechanism for `OP_STATE`, intended to be implemented by the
-host. At this time, `bevy_mod_scripting_qcvm` does not provide any way to configure
-this implementation, so any use of that opcode will simply cause an error.
+Entities belong to a single VM: every entity other than worldspawn has a
+`QCOwnedBy` relationship to its VM's worldspawn, and QuakeC can't access
+entities of other VMs. Despawning a worldspawn despawns all of its VM's
+entities. Builtins and magic functions can find the VM that called them with
+`current_vm()`, and the VM that an entity belongs to with `vm_root()`.
+
+`OP_STATE` is implemented as Quake does, by setting the `nextthink`, `frame` and
+`think` fields of `self`.
 
 ## Sources
 

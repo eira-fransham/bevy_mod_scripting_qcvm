@@ -189,8 +189,12 @@ pub struct FunctionDef<T = FunctionBody> {
 
 impl<T> FunctionDef<T> {
     /// Whether this function is provided by the host.
+    ///
+    /// Builtins usually have a negative offset (`-n` for builtin `#n`), but `fteqcc` gives
+    /// builtins declared as `#0` an offset of 0, and engines look them up by name (as for FTEQW's
+    /// extensions). Function 0 (the null function) isn't a builtin.
     pub fn is_builtin(&self) -> bool {
-        self.offset < 0
+        self.offset < 0 || (self.offset == 0 && self.index != 0)
     }
 
     /// For builtins, the builtin number (`#n` in QuakeC), which is what Quake dispatches on.
@@ -198,7 +202,7 @@ impl<T> FunctionDef<T> {
     /// This is not the same as [`Self::index`]: builtin numbers can have gaps, and several
     /// functions can alias the same builtin (e.g. LibreQuake's `bprint_e = #23`).
     pub fn builtin_number(&self) -> Option<u32> {
-        if self.is_builtin() {
+        if self.offset < 0 {
             self.offset
                 .checked_neg()
                 .and_then(|n| u32::try_from(n).ok())
@@ -304,7 +308,8 @@ impl FunctionRegistry {
             .iter()
             .enumerate()
             .map(|(index, def)| -> anyhow::Result<FunctionDef> {
-                let body = if def.offset < 0 {
+                // See `FunctionDef::is_builtin` for builtins with offset 0.
+                let body = if def.offset < 0 || (def.offset == 0 && index != 0) {
                     FunctionBody::Builtin
                 } else {
                     let start = usize::try_from(def.offset)?;

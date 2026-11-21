@@ -15,8 +15,11 @@ use qcvm::QCDefs;
 
 /// The defs of the Quake GPL release (`progdefs.q1`), for `progs.dat`s compiled against id1's
 /// `defs.qc`.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum Quake1 {}
+///
+/// This is a unit struct rather than an uninhabited enum so that it can be type-erased as an
+/// `Arc<dyn qcvm::ErasedDefs>`.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct Quake1;
 
 impl QCDefs for Quake1 {
     type GlobalAddr = GlobalAddr;

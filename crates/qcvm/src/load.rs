@@ -97,8 +97,8 @@ pub(crate) fn parse_arg_sizes(
         .filter(|argc| *argc <= MAX_ARGS)
         .ok_or_else(|| anyhow::format_err!("Function {name:?} has {argc} arguments"))?;
 
-    if offset < 0 {
-        // Builtins don't use argument sizes at all. Vanilla quake's progs.dat sets
+    if offset <= 0 {
+        // Builtins (including `#0` builtins, which have offset 0) don't use argument sizes at all. Vanilla quake's progs.dat sets
         // them anyway, but bytecode emitted by FTEQW's toolchain (in its most-common
         // configuration) does not.
         return Ok(ArrayVec::new());

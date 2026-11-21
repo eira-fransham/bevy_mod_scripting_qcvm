@@ -73,6 +73,100 @@ pub trait QCDefs: Send + Sync + 'static {
     const CRC: i32;
 }
 
+/// A global or field address known to an [`ErasedDefs`], with the information that
+/// [`Address`] provides for typed addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErasedAddrInfo {
+    /// The offset of the address (see [`Address::to_u16`]).
+    pub offset: u16,
+    /// The name of the address (see [`Address::name`]).
+    pub name: &'static str,
+    /// The type of values at the address (see [`Address::type_`]).
+    pub type_: Type,
+    /// For components of vectors, the offset of the vector, and otherwise `offset` (see
+    /// [`Address::vector_field_or_scalar`]).
+    pub vector_root: u16,
+    /// For components of vectors, which component this is, and otherwise
+    /// [`VectorField::XOrScalar`] (see [`Address::vector_field_or_scalar`]).
+    pub vector_field: VectorField,
+}
+
+impl ErasedAddrInfo {
+    /// The information about the typed address `addr`.
+    pub fn new<A: Address>(addr: &A) -> Self {
+        let (root, field) = addr.vector_field_or_scalar();
+        Self {
+            offset: addr.to_u16(),
+            name: addr.name(),
+            type_: addr.type_(),
+            vector_root: root.to_u16(),
+            vector_field: field,
+        }
+    }
+}
+
+/// A type-erased [`QCDefs`], so that hosts can choose the defs of each VM at runtime.
+///
+/// This is implemented for every [`QCDefs`], so e.g. `Arc::new(qcvm_defs_quake1::Quake1)` can be
+/// used as an `&dyn ErasedDefs`.
+pub trait ErasedDefs: Send + Sync + 'static {
+    /// The CRC of the defs (see [`QCDefs::CRC`]).
+    fn crc(&self) -> i32;
+
+    /// The global at `offset` that has type `ty` (see [`Address::from_u16_typed`]).
+    fn global(&self, offset: u16, ty: Type) -> Option<ErasedAddrInfo>;
+
+    /// The global named `name` (see [`Address::from_name`]).
+    fn global_by_name(&self, name: &str) -> Option<ErasedAddrInfo>;
+
+    /// The entity field at `offset` that has type `ty` (see [`Address::from_u16_typed`]).
+    fn field(&self, offset: u16, ty: Type) -> Option<ErasedAddrInfo>;
+
+    /// The entity field named `name` (see [`Address::from_name`]).
+    fn field_by_name(&self, name: &str) -> Option<ErasedAddrInfo>;
+
+    /// The canonical name of builtin number `number`, if it is known to the defs (see
+    /// [`BuiltinAddress::from_number`]).
+    fn builtin_name(&self, number: u32) -> Option<&'static str>;
+}
+
+impl<D> ErasedDefs for D
+where
+    D: QCDefs,
+{
+    fn crc(&self) -> i32 {
+        D::CRC
+    }
+
+    fn global(&self, offset: u16, ty: Type) -> Option<ErasedAddrInfo> {
+        D::GlobalAddr::from_u16_typed(offset, ty).map(|addr| ErasedAddrInfo::new(&addr))
+    }
+
+    fn global_by_name(&self, name: &str) -> Option<ErasedAddrInfo> {
+        D::GlobalAddr::from_name(name).map(|addr| ErasedAddrInfo::new(&addr))
+    }
+
+    fn field(&self, offset: u16, ty: Type) -> Option<ErasedAddrInfo> {
+        D::FieldAddr::from_u16_typed(offset, ty).map(|addr| ErasedAddrInfo::new(&addr))
+    }
+
+    fn field_by_name(&self, name: &str) -> Option<ErasedAddrInfo> {
+        D::FieldAddr::from_name(name).map(|addr| ErasedAddrInfo::new(&addr))
+    }
+
+    fn builtin_name(&self, number: u32) -> Option<&'static str> {
+        D::BuiltinAddr::from_number(number).map(|addr| addr.name())
+    }
+}
+
+impl fmt::Debug for dyn ErasedDefs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ErasedDefs")
+            .field("crc", &self.crc())
+            .finish_non_exhaustive()
+    }
+}
+
 /// For each offset, the scalar and vector addresses at that offset (if any).
 ///
 /// [`Address::from_u16_typed`] is called for every operand of every instruction, so
@@ -1436,6 +1530,21 @@ impl QCVm {
         Ok(Self::from_progs(Progs::load(bytes, D::CRC)?, options))
     }
 
+    /// Load the runtime from a `progs.dat` file compiled against the type-erased defs `defs`,
+    /// with the given options.
+    ///
+    /// This fails if the `progs.dat`'s CRC isn't [`ErasedDefs::crc`].
+    pub fn load_with_defs<R>(
+        bytes: R,
+        defs: &dyn ErasedDefs,
+        options: VmOptions,
+    ) -> anyhow::Result<Self>
+    where
+        R: std::io::Read + std::io::Seek,
+    {
+        Ok(Self::from_progs(Progs::load(bytes, defs.crc())?, options))
+    }
+
     fn from_progs(progs: Progs, options: VmOptions) -> Self {
         Self {
             progs,
@@ -1501,6 +1610,37 @@ impl QCVm {
     pub fn global(&self, addr: u16) -> anyhow::Result<Value> {
         let scalar = self.progs.globals.get_value(addr.into())?;
         self.scalar_to_value(scalar)
+    }
+
+    /// The value of a vector global stored in the VM (see [`QCVm::global`]).
+    pub fn global_vector(&self, addr: u16) -> anyhow::Result<Vec3> {
+        let addr = usize::from(addr);
+        let [x, y, z] = [addr, addr + 1, addr + 2].map(|addr| {
+            Ok::<_, anyhow::Error>(f32::try_from(self.progs.globals.get_value(addr)?)?)
+        });
+
+        Ok(Vec3::new(x?, y?, z?))
+    }
+
+    /// Sets a global stored in the VM (i.e. not provided by the host). A vector sets the three
+    /// globals starting at `addr`.
+    pub fn set_global(&self, addr: u16, value: Value) -> anyhow::Result<()> {
+        let addr = usize::from(addr);
+        match value {
+            Value::Vector(vec) => {
+                for (i, component) in vec.to_array().into_iter().enumerate() {
+                    self.progs
+                        .globals
+                        .set_value(addr + i, VmScalar::Float(component))?;
+                }
+                Ok(())
+            }
+            value => {
+                let scalar = VmScalar::try_from(value)
+                    .map_err(|_| anyhow::format_err!("Can't store a vector in a scalar global"))?;
+                self.progs.globals.set_value(addr, scalar)
+            }
+        }
     }
 
     fn scalar_to_value(&self, scalar: VmScalar) -> anyhow::Result<Value> {

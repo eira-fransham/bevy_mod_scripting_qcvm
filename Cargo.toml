@@ -11,7 +11,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [workspace]
-members = ["crates/qcvm", "crates/qcvm-defs-quake1"]
+members = ["crates/qcvm", "crates/qcvm-defs-quake1", "crates/qcvm-defs-csqc"]
 
 [workspace.package]
 authors = ["Eira Fransham <eira.fransham@gmail.com>"]

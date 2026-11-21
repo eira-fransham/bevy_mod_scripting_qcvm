@@ -161,8 +161,10 @@ impl fmt::Debug for &'_ dyn ErasedContext {
 }
 
 /// Finds the dynamic field (see [`EntityHandle::get_dynamic`]) to use for an access of type `ty`
-/// at `offset`.
-fn dynamic_field(
+/// at `offset`, i.e. a field defined by the `progs.dat` rather than the host's defs.
+///
+/// Returns the field and, for an access to a single component of a vector field, the component.
+pub fn dynamic_field(
     entity_def: &EntityTypeDef,
     offset: ErasedAddr,
     ty: Type,
@@ -181,7 +183,8 @@ fn dynamic_field(
     }
 }
 
-fn dynamic_field_type(def: &FieldDef, component: Option<VectorField>) -> Type {
+/// The type of the value at a dynamic field returned by [`dynamic_field`].
+pub fn dynamic_field_type(def: &FieldDef, component: Option<VectorField>) -> Type {
     match component {
         Some(_) => Type::Float,
         None => Type::try_from(def.type_).unwrap_or_default(),
@@ -436,6 +439,24 @@ impl<T: ?Sized> FnCall<'_, T> {
     /// is also available via the `Deref`/`DerefMut` implementation
     pub fn context_mut(&mut self) -> &mut T {
         self.execution.context
+    }
+
+    /// The number of arguments that the builtin was called with (Quake's `pr_argc`). Arguments
+    /// past this are `void`.
+    pub fn num_args(&self) -> usize {
+        self.execution.memory.local.0.len()
+    }
+
+    /// Argument `index` read as a vector, if it was passed and its scalars are floats. This is for
+    /// untyped arguments (e.g. of variadic builtins like `sprintf`), which are otherwise read as
+    /// a single scalar.
+    pub fn vector_arg(&self, index: usize) -> Option<glam::Vec3> {
+        let [x, y, z] = self.execution.memory.local.0.get(index)?.clone();
+        Some(glam::Vec3::new(
+            x.try_into().ok()?,
+            y.try_into().ok()?,
+            z.try_into().ok()?,
+        ))
     }
 }
 

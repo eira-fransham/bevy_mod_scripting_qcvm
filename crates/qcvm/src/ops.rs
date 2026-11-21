@@ -222,10 +222,18 @@ where
         let params = function_args()
             .take(num_args)
             .zip(sig)
-            .map(|(ArgAddr { addr, .. }, ty)| self.get_typed(addr, ty))
-            .map(|value| match value {
-                Ok(value) => Ok(<[VmScalar; 3]>::from(value)),
-                Err(e) => Err(e),
+            .map(|(ArgAddr { addr, .. }, ty)| {
+                let mut scalars = <[VmScalar; 3]>::from(self.get_typed(addr, ty)?);
+                // The type of an untyped argument isn't known, so keep all of its scalars in case
+                // it's a vector (see `FnCall::vector_arg`).
+                if ty == Type::AnyScalar {
+                    for (i, scalar) in scalars.iter_mut().enumerate().skip(1) {
+                        *scalar = self
+                            .get_scalar::<_, VmScalar>(usize::from(addr) + i)
+                            .unwrap_or_default();
+                    }
+                }
+                Ok(scalars)
             })
             .collect::<anyhow::Result<ArrayVec<[VmScalar; 3], MAX_ARGS>>>()?;
 
