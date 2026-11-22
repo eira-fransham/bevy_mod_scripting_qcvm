@@ -119,6 +119,10 @@ pub trait ErasedDefs: Send + Sync + 'static {
     /// The global named `name` (see [`Address::from_name`]).
     fn global_by_name(&self, name: &str) -> Option<ErasedAddrInfo>;
 
+    /// Every global in the defs, including the components of vectors (see
+    /// [`strum::VariantArray::VARIANTS`]).
+    fn globals(&self) -> Vec<ErasedAddrInfo>;
+
     /// The entity field at `offset` that has type `ty` (see [`Address::from_u16_typed`]).
     fn field(&self, offset: u16, ty: Type) -> Option<ErasedAddrInfo>;
 
@@ -144,6 +148,13 @@ where
 
     fn global_by_name(&self, name: &str) -> Option<ErasedAddrInfo> {
         D::GlobalAddr::from_name(name).map(|addr| ErasedAddrInfo::new(&addr))
+    }
+
+    fn globals(&self) -> Vec<ErasedAddrInfo> {
+        <D::GlobalAddr as strum::VariantArray>::VARIANTS
+            .iter()
+            .map(ErasedAddrInfo::new)
+            .collect()
     }
 
     fn field(&self, offset: u16, ty: Type) -> Option<ErasedAddrInfo> {
