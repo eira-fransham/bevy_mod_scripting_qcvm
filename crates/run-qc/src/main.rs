@@ -408,7 +408,11 @@ fn main() -> anyhow::Result<()> {
         bail!("`{name}` is a builtin, which run-qc doesn't support");
     }
 
-    if let Some(i) = function.args.iter().position(|ty| *ty != Type::Float) {
+    if let Some(i) = function
+        .args
+        .iter()
+        .position(|ty| !matches!(ty, Type::Float | Type::AnyScalar))
+    {
         let invalid_type = function.args[i];
 
         bail!(
