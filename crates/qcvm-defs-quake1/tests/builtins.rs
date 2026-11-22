@@ -1,4 +1,4 @@
-use qcvm::{BuiltinAddress as _, QCVm};
+use qcvm::{BuiltinAddress as _, QcVm};
 use qcvm_defs_quake1::{BuiltinAddr, Quake1};
 
 #[test]
@@ -15,14 +15,14 @@ fn quake1_builtin_names_are_by_number() {
     assert_eq!(builtin_name(83), None);
 }
 
-/// Loads the real `progs.dat` from the path in `QCVM_PROGS`. If it isn't set, the test is skipped.
-fn real_progs_vm() -> Option<QCVm> {
-    let Some(path) = std::env::var_os("QCVM_PROGS") else {
-        eprintln!("Skipping test: `QCVM_PROGS` isn't set");
+/// Loads the real `progs.dat` from the path in `QcVM_PROGS`. If it isn't set, the test is skipped.
+fn real_progs_vm() -> Option<QcVm> {
+    let Some(path) = std::env::var_os("QcVM_PROGS") else {
+        eprintln!("Skipping test: `QcVM_PROGS` isn't set");
         return None;
     };
     let bytes = std::fs::read(path).unwrap();
-    Some(QCVm::load::<Quake1, _>(std::io::Cursor::new(bytes)).unwrap())
+    Some(QcVm::load::<Quake1, _>(std::io::Cursor::new(bytes)).unwrap())
 }
 
 /// Every builtin in a real `progs.dat` (see [`real_progs_vm`]) must be known to [`BuiltinAddr`],

@@ -3,7 +3,7 @@
 //! This crate contains Quake-compatible global and field addresses, and builtin numbers
 //! (see [`BuiltinAddr`]), which should be implemented if writing a host that can load
 //! unmodified `progs.dat` files designed for the vanilla Quake engine. They are bundled together
-//! as the [`Quake1`] [`QCDefs`].
+//! as the [`Quake1`] [`QcDefs`].
 //!
 //! This is compatible with [`progdefs.q1`](https://github.com/id-Software/Quake/blob/master/WinQuake/progdefs.q1).
 
@@ -11,7 +11,7 @@
 
 pub use self::{builtins::BuiltinAddr, fields::FieldAddr, globals::GlobalAddr};
 
-use qcvm::QCDefs;
+use qcvm::QcDefs;
 
 /// The defs of the Quake GPL release (`progdefs.q1`), for `progs.dat`s compiled against id1's
 /// `defs.qc`.
@@ -21,7 +21,7 @@ use qcvm::QCDefs;
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Quake1;
 
-impl QCDefs for Quake1 {
+impl QcDefs for Quake1 {
     type GlobalAddr = GlobalAddr;
     type FieldAddr = FieldAddr;
     type BuiltinAddr = BuiltinAddr;

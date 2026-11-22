@@ -135,7 +135,7 @@ impl Progs {
     ///
     /// This returns objects representing the necessary context to execute QuakeC bytecode.
     /// `expected_crc` is the CRC of the `progdefs.h` the host expects (see
-    /// [`QCDefs::CRC`](crate::QCDefs::CRC)).
+    /// [`QcDefs::CRC`](crate::QcDefs::CRC)).
     pub fn load<R>(mut src: R, expected_crc: i32) -> anyhow::Result<Progs>
     where
         R: Read + Seek,

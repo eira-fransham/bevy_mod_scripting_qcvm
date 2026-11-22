@@ -10,7 +10,7 @@ use bump_scope::{BumpAllocatorScopeExt, FixedBumpVec};
 use num::FromPrimitive as _;
 use num_derive::FromPrimitive;
 
-use crate::QCMemory;
+use crate::QcMemory;
 use crate::load::LoadFn;
 use crate::ops::Opcode;
 use crate::progs::VmScalar;
@@ -69,7 +69,7 @@ impl std::fmt::Display for ArgSize {
 
 /// A QuakeC function's call frame.
 ///
-/// Only the function's locals (including its arguments, see [`QCFunctionDef::frame_range`]) are
+/// Only the function's locals (including its arguments, see [`QcFunctionDef::frame_range`]) are
 /// stored per frame. Everything else, including the parameter slots that arguments are passed in,
 /// is global memory.
 #[derive(Debug)]
@@ -102,7 +102,7 @@ impl FunctionExecutionCtx<'_> {
 const LOCAL_STORAGE_ERR: &str =
     "Programmer error: `local_storage` was too small for `local_range`. This is a bug!";
 
-impl QCMemory for FunctionExecutionCtx<'_> {
+impl QcMemory for FunctionExecutionCtx<'_> {
     type Scalar = Option<VmScalar>;
 
     fn get(&self, index: usize) -> anyhow::Result<Option<VmScalar>> {
@@ -143,7 +143,7 @@ impl FunctionExecutionCtx<'_> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QCFunctionBody {
+pub struct QcFunctionBody {
     /// `arg_start` + `locals` fields - we do not conflate locals and globals,
     /// so every access needs to check the locals first.
     pub locals: Range<usize>,
@@ -152,12 +152,12 @@ pub struct QCFunctionBody {
 
 #[derive(Debug, Clone)]
 pub enum FunctionBody {
-    Progs(QCFunctionBody),
+    Progs(QcFunctionBody),
     Builtin,
 }
 
 impl FunctionBody {
-    pub fn try_into_qc(self) -> Result<QCFunctionBody, Builtin> {
+    pub fn try_into_qc(self) -> Result<QcFunctionBody, Builtin> {
         match self {
             Self::Progs(quakec) => Ok(quakec),
             Self::Builtin => Err(Builtin),
@@ -165,7 +165,7 @@ impl FunctionBody {
     }
 }
 
-pub type QCFunctionDef = FunctionDef<QCFunctionBody>;
+pub type QcFunctionDef = FunctionDef<QcFunctionBody>;
 
 /// Definition for a QuakeC function.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,9 +225,9 @@ pub struct Builtin;
 pub type BuiltinDef = FunctionDef<Builtin>;
 
 impl FunctionDef {
-    pub(crate) fn try_into_qc(self) -> Result<QCFunctionDef, FunctionDef<Builtin>> {
+    pub(crate) fn try_into_qc(self) -> Result<QcFunctionDef, FunctionDef<Builtin>> {
         match self.body.try_into_qc() {
-            Ok(quakec) => Ok(QCFunctionDef {
+            Ok(quakec) => Ok(QcFunctionDef {
                 index: self.index,
                 offset: self.offset,
                 name: self.name,
@@ -247,7 +247,7 @@ impl FunctionDef {
     }
 }
 
-impl QCFunctionDef {
+impl QcFunctionDef {
     /// The addresses stored in this function's call frame.
     pub(crate) fn frame_range(&self) -> Range<usize> {
         let locals = &self.body.locals;
@@ -327,7 +327,7 @@ impl FunctionRegistry {
                         );
                     }
 
-                    FunctionBody::Progs(QCFunctionBody {
+                    FunctionBody::Progs(QcFunctionBody {
                         locals: def.locals.clone(),
                         statements: statements.subslice(start..end),
                     })

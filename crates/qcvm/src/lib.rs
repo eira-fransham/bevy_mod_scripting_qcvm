@@ -25,10 +25,10 @@ use crate::{
     load::Progs,
     progs::{
         StringRef, StringTable, VmFunctionRef, VmScalar, VmValue,
-        functions::{ArgSize, FunctionExecutionCtx, QCFunctionDef, Statement},
+        functions::{ArgSize, FunctionExecutionCtx, QcFunctionDef, Statement},
         globals::GlobalRegistry,
     },
-    userdata::{AddrError, ErasedContext, ErasedFunction, QCType},
+    userdata::{AddrError, ErasedContext, ErasedFunction, QcType},
 };
 
 mod entity;
@@ -57,9 +57,9 @@ pub use crate::{
 /// The globals, fields and builtins defined by a `defs.qc` (e.g. Quake 1's `progdefs.q1`).
 ///
 /// This is implemented by a marker type (usually an uninhabited enum) in a `qcvm-defs-*` crate,
-/// such as `qcvm_defs_quake1::Quake1`. Hosts are generic over a single `QCDefs` type rather than
+/// such as `qcvm_defs_quake1::Quake1`. Hosts are generic over a single `QcDefs` type rather than
 /// the three address types separately, as they always come from the same `defs.qc`.
-pub trait QCDefs: Send + Sync + 'static {
+pub trait QcDefs: Send + Sync + 'static {
     /// The globals that the host accesses directly.
     type GlobalAddr: Address;
     /// The entity fields that the host accesses directly.
@@ -105,12 +105,12 @@ impl ErasedAddrInfo {
     }
 }
 
-/// A type-erased [`QCDefs`], so that hosts can choose the defs of each VM at runtime.
+/// A type-erased [`QcDefs`], so that hosts can choose the defs of each VM at runtime.
 ///
-/// This is implemented for every [`QCDefs`], so e.g. `Arc::new(qcvm_defs_quake1::Quake1)` can be
+/// This is implemented for every [`QcDefs`], so e.g. `Arc::new(qcvm_defs_quake1::Quake1)` can be
 /// used as an `&dyn ErasedDefs`.
 pub trait ErasedDefs: Send + Sync + 'static {
-    /// The CRC of the defs (see [`QCDefs::CRC`]).
+    /// The CRC of the defs (see [`QcDefs::CRC`]).
     fn crc(&self) -> i32;
 
     /// The global at `offset` that has type `ty` (see [`Address::from_u16_typed`]).
@@ -136,7 +136,7 @@ pub trait ErasedDefs: Send + Sync + 'static {
 
 impl<D> ErasedDefs for D
 where
-    D: QCDefs,
+    D: QcDefs,
 {
     fn crc(&self) -> i32 {
         D::CRC
@@ -494,7 +494,7 @@ fn scalar_to_value(scalar: VmScalar, strings: &StringTable) -> anyhow::Result<Va
         VmScalar::Function(func) => Value::Function(func.into()),
         VmScalar::Field(ptr) => Value::Field(FieldRef::from_ptr(ptr)?),
         // This is only reached when no type is known (`AnyScalar` builtin parameters,
-        // `ReturnValue::scalar`, `QCVm::global`, etc.), so fall back to a float that
+        // `ReturnValue::scalar`, `QcVm::global`, etc.), so fall back to a float that
         // preserves the bits.
         VmScalar::Bits(b) => Value::Float(f32::from_bits(b)),
         other @ (VmScalar::Global(_) | VmScalar::EntityField(..)) => {
@@ -506,7 +506,7 @@ fn scalar_to_value(scalar: VmScalar, strings: &StringTable) -> anyhow::Result<Va
     })
 }
 
-/// The value returned by a function, e.g. from [`QCVm::run`].
+/// The value returned by a function, e.g. from [`QcVm::run`].
 ///
 /// QuakeC always returns 3 values, but those values are untyped and aren't
 /// even guaranteed to be valid.
@@ -962,8 +962,8 @@ impl From<Value> for VmValue {
 /// The type of values that can be used as arguments to a QuakeC function. Implemented
 /// for tuples up to 8 elements (the maximum number of arguments supported by the
 /// vanilla Quake engine).
-pub trait QCParams: fmt::Debug {
-    /// The error returned by [`QCParams::nth`].
+pub trait QcParams: fmt::Debug {
+    /// The error returned by [`QcParams::nth`].
     type Error: Into<anyhow::Error>;
 
     /// Get the number of parameters available
@@ -998,7 +998,7 @@ impl<E> From<E> for ArgError<E> {
 
 macro_rules! impl_memory_tuple {
     ($first:ident $(, $rest:ident)*) => {
-        impl<$first, $($rest),*> crate::QCParams for ($first, $($rest),*)
+        impl<$first, $($rest),*> crate::QcParams for ($first, $($rest),*)
         where
         $first: Clone + fmt::Debug + TryInto<Value>,
         $first::Error: Into<anyhow::Error>,
@@ -1051,7 +1051,7 @@ macro_rules! impl_memory_tuple {
         }
     };
     () => {
-        impl crate::QCParams for () {
+        impl crate::QcParams for () {
             type Error = std::convert::Infallible;
 
             fn count(&self) -> usize {
@@ -1068,7 +1068,7 @@ macro_rules! impl_memory_tuple {
 
 impl_memory_tuple!(A, B, C, D, E, F, G, H);
 
-impl<T, const COUNT: usize> crate::QCParams for ArrayVec<T, COUNT>
+impl<T, const COUNT: usize> crate::QcParams for ArrayVec<T, COUNT>
 where
     T: Clone + fmt::Debug + TryInto<Value>,
     <T as TryInto<Value>>::Error: Into<anyhow::Error>,
@@ -1093,7 +1093,7 @@ where
     }
 }
 
-impl<T> crate::QCParams for Vec<T>
+impl<T> crate::QcParams for Vec<T>
 where
     T: Clone + fmt::Debug + TryInto<Value>,
     <T as TryInto<Value>>::Error: Into<anyhow::Error>,
@@ -1118,7 +1118,7 @@ where
     }
 }
 
-impl<T> crate::QCParams for VecDeque<T>
+impl<T> crate::QcParams for VecDeque<T>
 where
     T: Clone + fmt::Debug + TryInto<Value>,
     <T as TryInto<Value>>::Error: Into<anyhow::Error>,
@@ -1143,7 +1143,7 @@ where
     }
 }
 
-impl<T> crate::QCParams for bump_scope::FixedBumpVec<'_, T>
+impl<T> crate::QcParams for bump_scope::FixedBumpVec<'_, T>
 where
     T: Clone + fmt::Debug + TryInto<Value>,
     <T as TryInto<Value>>::Error: Into<anyhow::Error>,
@@ -1168,9 +1168,9 @@ where
     }
 }
 
-impl<T> QCMemory for CallArgs<T>
+impl<T> QcMemory for CallArgs<T>
 where
-    T: QCParams,
+    T: QcParams,
 {
     type Scalar = Option<VmScalar>;
 
@@ -1198,7 +1198,7 @@ where
 #[derive(Debug)]
 pub(crate) struct RawArgs(pub ArrayVec<[VmScalar; 3], MAX_ARGS>);
 
-impl QCMemory for RawArgs {
+impl QcMemory for RawArgs {
     type Scalar = Option<VmScalar>;
 
     fn num_args(&self) -> Option<usize> {
@@ -1224,7 +1224,7 @@ impl QCMemory for RawArgs {
     }
 }
 
-impl QCType for QCFunctionDef {
+impl QcType for QcFunctionDef {
     fn type_(&self) -> Type {
         Type::Function
     }
@@ -1354,7 +1354,7 @@ impl fmt::Display for Type {
 ///
 /// This is how functions defined by the `progs.dat` (both QuakeC functions and builtins) are passed
 /// to the host (as [`Function::Index`]), e.g. when QuakeC sets an entity's `think`. To call it from
-/// the host, pass it to [`QCVm::run`] or [`userdata::FnCall::call`].
+/// the host, pass it to [`QcVm::run`] or [`userdata::FnCall::call`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct FunctionIndex(pub i32);
 
@@ -1368,7 +1368,7 @@ impl FunctionIndex {
     }
 }
 
-impl QCType for FunctionIndex {
+impl QcType for FunctionIndex {
     fn type_(&self) -> Type {
         Type::Function
     }
@@ -1385,7 +1385,7 @@ pub const MAX_OPS_SINGLE_CALL: u32 = 100_000;
 /// The maximum depth of nested QuakeC function calls (see `MAX_STACK_DEPTH` in Quake).
 pub const MAX_CALL_DEPTH: usize = 32;
 
-/// Options chosen when the VM is initialized, see [`QCVm::load_with_options`].
+/// Options chosen when the VM is initialized, see [`QcVm::load_with_options`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VmOptions {
     /// What happens when a QuakeC function is called with fewer arguments than it takes.
@@ -1455,7 +1455,7 @@ impl Default for Limits {
 
 /// The core QuakeC runtime.
 #[derive(Debug)]
-pub struct QCVm {
+pub struct QcVm {
     progs: Progs,
     compat: Compat,
 }
@@ -1516,14 +1516,14 @@ impl TryFrom<&str> for FunctionRef {
     }
 }
 
-impl QCVm {
+impl QcVm {
     /// Load the runtime from a `progs.dat` file compiled against the defs `D`, with the default
     /// (strict) [`VmOptions`].
     ///
-    /// This fails if the `progs.dat`'s CRC isn't [`QCDefs::CRC`].
+    /// This fails if the `progs.dat`'s CRC isn't [`QcDefs::CRC`].
     pub fn load<D, R>(bytes: R) -> anyhow::Result<Self>
     where
-        D: QCDefs,
+        D: QcDefs,
         R: std::io::Read + std::io::Seek,
     {
         Self::load_with_options::<D, R>(bytes, VmOptions::default())
@@ -1532,10 +1532,10 @@ impl QCVm {
     /// Load the runtime from a `progs.dat` file compiled against the defs `D`, with the given
     /// options.
     ///
-    /// This fails if the `progs.dat`'s CRC isn't [`QCDefs::CRC`].
+    /// This fails if the `progs.dat`'s CRC isn't [`QcDefs::CRC`].
     pub fn load_with_options<D, R>(bytes: R, options: VmOptions) -> anyhow::Result<Self>
     where
-        D: QCDefs,
+        D: QcDefs,
         R: std::io::Read + std::io::Seek,
     {
         Ok(Self::from_progs(Progs::load(bytes, D::CRC)?, options))
@@ -1599,7 +1599,7 @@ impl QCVm {
         self.scalar_to_value(scalar)
     }
 
-    /// The initial value of a vector global (see [`QCVm::initial_global`]).
+    /// The initial value of a vector global (see [`QcVm::initial_global`]).
     pub fn initial_global_vector(&self, addr: u16) -> anyhow::Result<Vec3> {
         let addr = usize::from(addr);
         let [x, y, z] = [addr, addr + 1, addr + 2].map(|addr| {
@@ -1623,7 +1623,7 @@ impl QCVm {
         self.scalar_to_value(scalar)
     }
 
-    /// The value of a vector global stored in the VM (see [`QCVm::global`]).
+    /// The value of a vector global stored in the VM (see [`QcVm::global`]).
     pub fn global_vector(&self, addr: u16) -> anyhow::Result<Vec3> {
         let addr = usize::from(addr);
         let [x, y, z] = [addr, addr + 1, addr + 2].map(|addr| {
@@ -1694,7 +1694,7 @@ impl QCVm {
     ) -> anyhow::Result<ReturnValue<'_>>
     where
         F: Into<FunctionRef>,
-        T: QCParams,
+        T: QcParams,
         C: ErasedContext,
     {
         let limits = Limits::default();
@@ -1712,7 +1712,7 @@ impl QCVm {
         params: T,
     ) -> anyhow::Result<ReturnValue<'_>>
     where
-        T: QCParams,
+        T: QcParams,
         C: ErasedContext,
     {
         let num_params = params.count();
@@ -1755,7 +1755,7 @@ impl ExecutionMemory<'_> {
     }
 }
 
-trait QCMemory {
+trait QcMemory {
     type Scalar;
 
     fn get(&self, index: usize) -> anyhow::Result<Self::Scalar>;
@@ -1770,14 +1770,14 @@ trait QCMemory {
     }
 }
 
-trait QCMemoryMut: QCMemory {
+trait QcMemoryMut: QcMemory {
     fn set(&mut self, index: usize, value: Self::Scalar) -> anyhow::Result<()>;
 }
 
-impl<M> QCMemory for ExecutionMemory<'_, M>
+impl<M> QcMemory for ExecutionMemory<'_, M>
 where
-    M: QCMemory,
-    <M as QCMemory>::Scalar: Into<Option<VmScalar>>,
+    M: QcMemory,
+    <M as QcMemory>::Scalar: Into<Option<VmScalar>>,
 {
     type Scalar = VmScalar;
 
@@ -1798,7 +1798,7 @@ where
     }
 }
 
-impl QCMemoryMut for ExecutionMemory<'_> {
+impl QcMemoryMut for ExecutionMemory<'_> {
     fn set(&mut self, index: usize, value: VmScalar) -> anyhow::Result<()> {
         match self.local.try_set(index, value) {
             Ok(()) => Ok(()),
@@ -1952,7 +1952,7 @@ where
     fn with_args<F, A, O>(&mut self, name: &CStr, params: A, func: F) -> O
     where
         F: FnOnce(ExecutionCtx<'_, dyn ErasedContext, BumpScope<'_>, CallArgs<A>>) -> O,
-        A: QCParams,
+        A: QcParams,
     {
         self.with_memory(name, CallArgs { params }, func)
     }
@@ -2068,7 +2068,7 @@ where
     /// [`VmOptions::missing_arguments`].
     fn check_num_args(
         &self,
-        function: &QCFunctionDef,
+        function: &QcFunctionDef,
         num_args: usize,
         site: CallSite,
     ) -> anyhow::Result<()> {
@@ -2114,7 +2114,7 @@ where
 impl<Alloc, Caller> ExecutionCtx<'_, dyn ErasedContext, Alloc, Caller>
 where
     Alloc: ScopedAlloc,
-    Caller: fmt::Debug + QCMemory<Scalar = Option<VmScalar>>,
+    Caller: fmt::Debug + QcMemory<Scalar = Option<VmScalar>>,
 {
     /// Run a function.
     pub fn execute<F>(&mut self, function: F) -> anyhow::Result<[VmScalar; 3]>
@@ -2143,7 +2143,7 @@ where
 
     /// Run a QuakeC function.
     // TODO: We can use the unsafe checkpoint API if just recursing becomes too slow.
-    pub fn execute_def(&mut self, function: &QCFunctionDef) -> anyhow::Result<[VmScalar; 3]> {
+    pub fn execute_def(&mut self, function: &QcFunctionDef) -> anyhow::Result<[VmScalar; 3]> {
         let Self {
             alloc,
             memory,
@@ -2179,7 +2179,7 @@ where
             };
 
             // Arguments are copied to consecutive addresses starting at the first local, which
-            // are always in the frame (see `QCFunctionDef::frame_range`).
+            // are always in the frame (see `QcFunctionDef::frame_range`).
             let mut dst = function.body.locals.start;
 
             for (src, dst_size) in function_args().zip(&function.args) {
@@ -2245,8 +2245,8 @@ where
 impl<Alloc, Caller> ExecutionCtx<'_, dyn ErasedContext, Alloc, Caller>
 where
     Alloc: ScopedAlloc,
-    Caller: fmt::Debug + QCMemory,
-    <Caller as QCMemory>::Scalar: Into<Option<VmScalar>>,
+    Caller: fmt::Debug + QcMemory,
+    <Caller as QcMemory>::Scalar: Into<Option<VmScalar>>,
 {
     pub fn get_scalar<I, O>(&self, index: I) -> anyhow::Result<O>
     where

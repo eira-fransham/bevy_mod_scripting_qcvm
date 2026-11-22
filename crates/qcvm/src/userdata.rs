@@ -14,17 +14,17 @@ use snafu::Snafu;
 
 use crate::{
     Address, AsErasedContext, BuiltinDef, EntityRef, EntityTypeDef, ErasedEntityHandle,
-    ExecutionCtx, FieldDef, FunctionRef, MAX_ARGS, QCDefs, QCMemory, QCParams, ReturnValue, Type,
+    ExecutionCtx, FieldDef, FunctionRef, MAX_ARGS, QcDefs, QcMemory, QcParams, ReturnValue, Type,
     Value, VectorField, VmType, function_args, progs::VmValue,
 };
 
 type ErasedAddr = u16;
 
 /// The global address type of the defs of context `C`.
-pub type GlobalAddrOf<C> = <<C as Context>::Defs as QCDefs>::GlobalAddr;
+pub type GlobalAddrOf<C> = <<C as Context>::Defs as QcDefs>::GlobalAddr;
 
 /// The field address type of the defs of the context of entity handle `E`.
-pub type FieldAddrOf<E> = <<<E as EntityHandle>::Context as Context>::Defs as QCDefs>::FieldAddr;
+pub type FieldAddrOf<E> = <<<E as EntityHandle>::Context as Context>::Defs as QcDefs>::FieldAddr;
 
 /// An error when getting/setting an address
 #[derive(Snafu, Debug, Copy, Clone, PartialEq, Eq)]
@@ -70,8 +70,8 @@ pub trait Context {
     type Function: ?Sized + Function<Context = Self>;
     /// The error that is returned by [`Context::builtin`].
     type Error: std::error::Error;
-    /// The globals, fields and builtins that the host knows about (see [`QCDefs`]).
-    type Defs: QCDefs;
+    /// The globals, fields and builtins that the host knows about (see [`QcDefs`]).
+    type Defs: QcDefs;
 
     /// Given a function definition, get the builtin that it corresponds to (if one exists).
     fn builtin(&self, def: &BuiltinDef) -> Result<Arc<Self::Function>, Self::Error>;
@@ -299,7 +299,7 @@ where
 /// The type of values that can be used in the QuakeC runtime.
 ///
 /// > *TODO*: Implement proper userdata support.
-pub trait QCType: fmt::Debug {
+pub trait QcType: fmt::Debug {
     /// The QuakeC type of this value.
     fn type_(&self) -> Type;
     /// Whether this value should be considered null.
@@ -333,7 +333,7 @@ where
 /// data. All values in `qcvm` are immutable, the only mutable state is the context. This
 /// should be implemented for a handle to an entity, with the entity data itself being stored
 /// in the context.
-pub trait EntityHandle: QCType {
+pub trait EntityHandle: QcType {
     /// The global context that holds the entity data.
     type Context: ?Sized + Context<Entity = Self>;
     /// The error returned from this
@@ -369,7 +369,7 @@ pub trait EntityHandle: QCType {
         value: Value,
     ) -> Result<(), AddrError<Self::Error>>;
 
-    /// Get a field that isn't one of the context's [`QCDefs::FieldAddr`], i.e. one defined by the
+    /// Get a field that isn't one of the context's [`QcDefs::FieldAddr`], i.e. one defined by the
     /// `progs.dat` itself. `component` is `Some` to get a single component of a vector field.
     ///
     /// By default, this returns [`AddrError::OutOfRange`].
@@ -382,7 +382,7 @@ pub trait EntityHandle: QCType {
         Err(AddrError::OutOfRange)
     }
 
-    /// Set a field that isn't one of the context's [`QCDefs::FieldAddr`], see [`EntityHandle::get_dynamic`].
+    /// Set a field that isn't one of the context's [`QcDefs::FieldAddr`], see [`EntityHandle::get_dynamic`].
     ///
     /// By default, this returns [`AddrError::OutOfRange`].
     fn set_dynamic(
@@ -398,7 +398,7 @@ pub trait EntityHandle: QCType {
 
 /// A function callable from QuakeC code. This may call further internal functions, and is
 /// passed a configurable context type.
-pub trait Function: QCType {
+pub trait Function: QcType {
     /// The user-provided context.
     type Context: ?Sized + Context<Function = Self>;
     /// The error returned by the methods in this trait.
@@ -502,7 +502,7 @@ where
     pub fn call<A, F>(&mut self, function_ref: F, args: A) -> anyhow::Result<ReturnValue<'a>>
     where
         F: Into<FunctionRef>,
-        A: QCParams,
+        A: QcParams,
     {
         let function_def = self
             .execution
@@ -526,7 +526,7 @@ where
 }
 
 /// Type-erased version of [`Function`], for dynamic dispatch.
-pub trait ErasedFunction: QCType + Send + Sync + DynEq {
+pub trait ErasedFunction: QcType + Send + Sync + DynEq {
     /// Dynamic version of [`Function::signature`].
     fn dyn_signature(&self) -> anyhow::Result<ArrayVec<Type, MAX_ARGS>>;
 
@@ -540,7 +540,7 @@ impl PartialEq for dyn ErasedFunction {
     }
 }
 
-impl QCType for ErasedEntityHandle {
+impl QcType for ErasedEntityHandle {
     fn type_(&self) -> Type {
         Type::Entity
     }

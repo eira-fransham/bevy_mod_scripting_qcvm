@@ -8,7 +8,7 @@ use std::{ffi::CStr, fmt, num::NonZeroIsize};
 use tracing::debug;
 
 use crate::{
-    ArgAddr, CallSite, ExecutionCtx, OpResult, QCMemory, RawArgs, ScopedAlloc, Type, VectorField,
+    ArgAddr, CallSite, ExecutionCtx, OpResult, QcMemory, RawArgs, ScopedAlloc, Type, VectorField,
     function_args,
     progs::{
         EntityField, EntityRef, FieldPtr, StringRef, VmFunctionRef, VmScalar, VmValue,
@@ -181,8 +181,8 @@ impl fmt::Display for Opcode {
 impl<Alloc, Caller> ExecutionCtx<'_, dyn ErasedContext, Alloc, Caller>
 where
     Alloc: ScopedAlloc,
-    Caller: fmt::Debug + QCMemory,
-    <Caller as QCMemory>::Scalar: Into<Option<VmScalar>>,
+    Caller: fmt::Debug + QcMemory,
+    <Caller as QcMemory>::Scalar: Into<Option<VmScalar>>,
 {
     /// Reads the value at `addr` as type `ty`. A null of any type (e.g. fteqcc's `__NULL__`,
     /// a float `0`) reads as the null of `ty`; any other type mismatch is an error.

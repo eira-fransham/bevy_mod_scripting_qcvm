@@ -12,7 +12,7 @@ use strum::VariantArray;
 
 use crate::{
     Address, EmptyAddress, EntityRef, EntityTypeDef, FieldDef, FieldRef, FunctionIndex, GlobalDef,
-    MAX_ARGS, MissingArguments, QCDefs, QCVm, ReturnValue, Type, Value, VectorField, VmOptions,
+    MAX_ARGS, MissingArguments, QcDefs, QcVm, ReturnValue, Type, Value, VectorField, VmOptions,
     load::{LoadFn, Progs, def_type, parse_arg_sizes},
     ops::Opcode,
     progs::{
@@ -20,7 +20,7 @@ use crate::{
         functions::{ArgSize, FunctionBody, FunctionRegistry, Statement},
         globals::GlobalRegistry,
     },
-    userdata::{AddrError, Context, EntityHandle, FnCall, Function, QCType},
+    userdata::{AddrError, Context, EntityHandle, FnCall, Function, QcType},
 };
 
 use Opcode as O;
@@ -257,18 +257,18 @@ impl Program {
         index
     }
 
-    fn build(self) -> QCVm {
+    fn build(self) -> QcVm {
         self.build_with(VmOptions::default())
     }
 
-    fn build_with(mut self, options: VmOptions) -> QCVm {
+    fn build_with(mut self, options: VmOptions) -> QcVm {
         // Make sure that the locals (and the arguments of functions without locals, which come
         // after them) are inside the globals lump.
         let end = self.next_local + 3 * MAX_ARGS as u16;
         self.set_value(end, [0; 4]);
 
         let raw = self.values.iter().flatten().copied().collect::<Vec<u8>>();
-        QCVm::from_progs(
+        QcVm::from_progs(
             Progs {
                 globals: GlobalRegistry::new(self.globals, &raw).unwrap(),
                 entity_def: EntityTypeDef::new(self.fields),
@@ -281,7 +281,7 @@ impl Program {
 }
 
 /// Reads a float global from the VM.
-fn read_float(vm: &QCVm, addr: u16) -> f32 {
+fn read_float(vm: &QcVm, addr: u16) -> f32 {
     match vm.global(addr).unwrap() {
         Value::Float(f) => f,
         Value::Void => 0.,
@@ -289,11 +289,11 @@ fn read_float(vm: &QCVm, addr: u16) -> f32 {
     }
 }
 
-fn read_vector(vm: &QCVm, addr: u16) -> [f32; 3] {
+fn read_vector(vm: &QcVm, addr: u16) -> [f32; 3] {
     [0, 1, 2].map(|i| read_float(vm, addr + i))
 }
 
-fn set_entity(vm: &QCVm, addr: u16, id: u64) {
+fn set_entity(vm: &QcVm, addr: u16, id: u64) {
     vm.progs
         .globals
         .set_value(addr.into(), VmScalar::Entity(NonZero::new(id)))
@@ -316,7 +316,7 @@ impl std::error::Error for TestError {}
 /// The defs of [`TestContext`]. The CRC is Quake's, as [`real_progs_vm`] loads id1's `progs.dat`.
 enum TestDefs {}
 
-impl QCDefs for TestDefs {
+impl QcDefs for TestDefs {
     type GlobalAddr = EmptyAddress;
     type FieldAddr = TestFieldAddr;
     type BuiltinAddr = EmptyAddress;
@@ -391,7 +391,7 @@ struct TestEnt {
     id: u64,
 }
 
-impl QCType for TestEnt {
+impl QcType for TestEnt {
     fn type_(&self) -> Type {
         Type::Entity
     }
@@ -536,7 +536,7 @@ impl fmt::Debug for TestFn {
     }
 }
 
-impl QCType for TestFn {
+impl QcType for TestFn {
     fn type_(&self) -> Type {
         Type::Function
     }
@@ -649,7 +649,7 @@ impl Context for TestContext {
 }
 
 fn run<'vm>(
-    vm: &'vm QCVm,
+    vm: &'vm QcVm,
     ctx: &mut TestContext,
     function: i32,
 ) -> anyhow::Result<ReturnValue<'vm>> {
@@ -661,7 +661,7 @@ fn run_main(
     program: Program,
     body: Vec<Statement>,
     ctx: &mut TestContext,
-) -> (QCVm, anyhow::Result<()>) {
+) -> (QcVm, anyhow::Result<()>) {
     let mut program = program;
     let main = program.function("main", &[], 0, |_| body);
     let vm = program.build();
@@ -1584,14 +1584,14 @@ fn float_return_values_next_to_floats() {
     assert_eq!(value.vector().unwrap(), glam::Vec3::new(3., 2., 4.));
 }
 
-/// Loads the real `progs.dat` from the path in `QCVM_PROGS`. If it isn't set, the test is skipped.
-fn real_progs_vm() -> Option<QCVm> {
-    let Some(path) = std::env::var_os("QCVM_PROGS") else {
-        eprintln!("Skipping test: `QCVM_PROGS` isn't set");
+/// Loads the real `progs.dat` from the path in `QcVM_PROGS`. If it isn't set, the test is skipped.
+fn real_progs_vm() -> Option<QcVm> {
+    let Some(path) = std::env::var_os("QcVM_PROGS") else {
+        eprintln!("Skipping test: `QcVM_PROGS` isn't set");
         return None;
     };
     let bytes = std::fs::read(path).unwrap();
-    Some(QCVm::load::<TestDefs, _>(std::io::Cursor::new(bytes)).unwrap())
+    Some(QcVm::load::<TestDefs, _>(std::io::Cursor::new(bytes)).unwrap())
 }
 
 /// Loads a real `progs.dat` (see [`real_progs_vm`]) and runs `main`.
@@ -1686,7 +1686,7 @@ fn arguments_without_locals() {
 
 /// Builds a program where `call_without_args` calls `store` (which takes an argument) without any
 /// arguments, after `set_param` has left a value in the first parameter slot.
-fn missing_arguments_program(options: VmOptions) -> (QCVm, [i32; 2], u16) {
+fn missing_arguments_program(options: VmOptions) -> (QcVm, [i32; 2], u16) {
     let mut p = Program::new();
     let three = p.float("three", 3.);
     let out = p.float("out", 0.);
@@ -1799,7 +1799,7 @@ fn real_progs_missing_arguments() {
     assert_eq!(found, ["ogre_smash12 -> ai_charge (0 of 1)"]);
 }
 
-/// Functions that `qcc` says have no locals (see [`QCFunctionDef::frame_range`]) still get their own
+/// Functions that `qcc` says have no locals (see [`QcFunctionDef::frame_range`]) still get their own
 /// copy of their arguments, so a recursive call doesn't overwrite them.
 #[test]
 fn arguments_without_locals_are_per_frame() {
@@ -1870,7 +1870,7 @@ fn zero_offset_functions_are_unnumbered_builtins() {
     assert!(!vm.functions().get_by_index(0).unwrap().is_builtin());
 }
 
-/// `progs.dat`s whose CRC isn't the defs' [`QCDefs::CRC`] are rejected.
+/// `progs.dat`s whose CRC isn't the defs' [`QcDefs::CRC`] are rejected.
 #[test]
 fn progs_crc_must_match_defs() {
     let header = |crc: i32| {
@@ -1879,7 +1879,7 @@ fn progs_crc_must_match_defs() {
         std::io::Cursor::new(bytes)
     };
 
-    let err = QCVm::load::<TestDefs, _>(header(TestDefs::CRC + 1)).unwrap_err();
+    let err = QcVm::load::<TestDefs, _>(header(TestDefs::CRC + 1)).unwrap_err();
     assert!(
         err.to_string()
             .contains("does not match the expected CRC 5927"),
@@ -1887,7 +1887,7 @@ fn progs_crc_must_match_defs() {
     );
 
     // With the right CRC, loading gets past the header (and then fails as there are no lumps).
-    let err = QCVm::load::<TestDefs, _>(header(TestDefs::CRC)).unwrap_err();
+    let err = QcVm::load::<TestDefs, _>(header(TestDefs::CRC)).unwrap_err();
     assert!(!err.to_string().contains("CRC"), "{err}");
 }
 

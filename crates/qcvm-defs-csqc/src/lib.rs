@@ -20,14 +20,14 @@ pub mod builtins;
 pub use self::builtins::BuiltinAddr;
 pub use qcvm_defs_quake1::{FieldAddr, GlobalAddr};
 
-use qcvm::QCDefs;
+use qcvm::QcDefs;
 
 /// The defs of "simple CSQC" `csprogs.dat`s: the Quake 1 system globals and fields, with the core
 /// CSQC builtins.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Csqc;
 
-impl QCDefs for Csqc {
+impl QcDefs for Csqc {
     type GlobalAddr = GlobalAddr;
     type FieldAddr = FieldAddr;
     type BuiltinAddr = BuiltinAddr;

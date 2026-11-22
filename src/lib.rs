@@ -4,29 +4,29 @@
 //!
 //! Several QuakeC VMs can run in the same world (e.g. a server's `progs.dat` and a client's
 //! `csprogs.dat`). Each VM is a script attached to its own worldspawn entity, which must have a
-//! [`QCVmConfig`] saying which defs (e.g. `qcvm_defs_quake1::Quake1`) the `progs.dat` is compiled
+//! [`QcVmConfig`] saying which defs (e.g. `qcvm_defs_quake1::Quake1`) the `progs.dat` is compiled
 //! against and which namespace its builtins are registered in. Entities belong to a single VM,
-//! through the [`QCOwnedBy`] relationship to its worldspawn, and VMs can't access each other's
+//! through the [`QcOwnedBy`] relationship to its worldspawn, and VMs can't access each other's
 //! entities.
 //!
 //! To add builtins to a VM, register callbacks with `NamespaceBuilder` in its
-//! [`QCVmConfig::builtin_namespace`]. Builtins whose number is known to the defs (see
+//! [`QcVmConfig::builtin_namespace`]. Builtins whose number is known to the defs (see
 //! [`qcvm::ErasedDefs::builtin_name`]) are looked up by their canonical name, and other builtins
 //! are looked up by the name in the `progs.dat`. Fields are accessed using the `get` and `set` of
-//! `MagicFunctions`, where globals are accessed using `QCWorldspawn` reflect references and fields
-//! are accessed using `QCEntity`. In the rare case that fields need to be accessed on worldspawn
-//! (which, unfortunately, is allowed by Quake), `QCEntity` is still used. Builtins and magic
+//! `MagicFunctions`, where globals are accessed using `QcWorldspawn` reflect references and fields
+//! are accessed using `QcEntity`. In the rare case that fields need to be accessed on worldspawn
+//! (which, unfortunately, is allowed by Quake), `QcEntity` is still used. Builtins and magic
 //! functions can find the VM that is running with [`current_vm`].
 //!
 //! Values are passed to and from the magic functions and builtins as follows:
 //!
 //! - Floats are [`ScriptValue::Float`].
 //! - Vectors are a [`ScriptValue::List`] of three floats.
-//! - Entities are references to their [`QCEntity`] component (including worldspawn).
-//! - Strings are references to a [`QCString`], which keeps QuakeC's (not necessarily UTF-8) bytes
+//! - Entities are references to their [`QcEntity`] component (including worldspawn).
+//! - Strings are references to a [`QcString`], which keeps QuakeC's (not necessarily UTF-8) bytes
 //!   and distinguishes the null string from other empty strings.
-//! - Functions defined by the `progs.dat` are references to a [`QCFunction`].
-//! - Field references are references to a [`QCField`].
+//! - Functions defined by the `progs.dat` are references to a [`QcFunction`].
+//! - Field references are references to a [`QcField`].
 
 #![deny(missing_docs)]
 
@@ -62,9 +62,9 @@ use bevy_mod_scripting_script::ScriptAttachment;
 use bevy_reflect::{PartialReflect, Reflect, std_traits::ReflectDefault};
 use qcvm::{
     ArgError, EntityRef, EntityTypeDef, ErasedDefs, ErasedEntityHandle, FieldDef, FunctionIndex,
-    FunctionRef, QCParams, Type, VectorField, anyhow,
+    FunctionRef, QcParams, Type, VectorField, anyhow,
     arrayvec::ArrayVec,
-    userdata::{AddrError, ErasedContext, ErasedFunction, FnCall, QCType},
+    userdata::{AddrError, ErasedContext, ErasedFunction, FnCall, QcType},
 };
 
 pub use qcvm;
@@ -81,13 +81,13 @@ const QC_LANGUAGE: Language = Language::External {
 /// The main "entry point" plugin for adding QC Scripting.
 ///
 /// The configuration of each VM (its defs, builtins and [`qcvm::VmOptions`]) is the
-/// [`QCVmConfig`] of the entity its `progs.dat` is attached to.
-pub struct QCScriptingPlugin {
+/// [`QcVmConfig`] of the entity its `progs.dat` is attached to.
+pub struct QcScriptingPlugin {
     /// The inner config for the plugin
-    pub scripting_plugin: ScriptingPlugin<QCScriptingPlugin>,
+    pub scripting_plugin: ScriptingPlugin<QcScriptingPlugin>,
 }
 
-impl Default for QCScriptingPlugin {
+impl Default for QcScriptingPlugin {
     /// Loads `.dat` files as QuakeC, with a separate context (i.e. VM) for each entity that a
     /// `progs.dat` is attached to.
     fn default() -> Self {
@@ -109,7 +109,7 @@ impl Default for QCScriptingPlugin {
 /// The configuration of a QuakeC VM, which must be on the worldspawn entity that a `progs.dat` is
 /// attached to before it is loaded.
 #[derive(Component, Clone)]
-pub struct QCVmConfig {
+pub struct QcVmConfig {
     /// The defs that the `progs.dat` is compiled against, e.g. `qcvm_defs_quake1::Quake1`.
     /// `progs.dat`s with a different CRC fail to load.
     pub defs: &'static dyn ErasedDefs,
@@ -121,15 +121,15 @@ pub struct QCVmConfig {
     pub options: qcvm::VmOptions,
     /// Globals that the `progs.dat` may define for itself (i.e. that aren't in [`Self::defs`]) but
     /// that are stored by the host, like the globals in the defs. These are accessed by name, as
-    /// they are at whatever address the `progs.dat` puts them (see [`QCVmContext::host_globals`]).
+    /// they are at whatever address the `progs.dat` puts them (see [`QcVmContext::host_globals`]).
     /// This is for engine extension globals, e.g. CSQC's `cltime`, which mods compiled against
     /// older defs declare themselves.
     pub host_globals: &'static [&'static str],
 }
 
-impl fmt::Debug for QCVmConfig {
+impl fmt::Debug for QcVmConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("QCVmConfig")
+        f.debug_struct("QcVmConfig")
             .field("defs", &self.defs)
             .field("builtin_namespace", &self.builtin_namespace)
             .field("options", &self.options)
@@ -138,7 +138,7 @@ impl fmt::Debug for QCVmConfig {
     }
 }
 
-impl QCVmConfig {
+impl QcVmConfig {
     /// A configuration for `progs.dat`s compiled against `defs`, with builtins registered in the
     /// namespace `N` and the default (strict) options.
     pub fn new<N: 'static>(defs: &'static dyn ErasedDefs) -> Self {
@@ -157,22 +157,22 @@ impl QCVmConfig {
     }
 
     /// Sets the globals that the host stores even though they aren't in the defs (see
-    /// [`QCVmConfig::host_globals`]).
+    /// [`QcVmConfig::host_globals`]).
     pub fn with_host_globals(mut self, host_globals: &'static [&'static str]) -> Self {
         self.host_globals = host_globals;
         self
     }
 }
 
-/// The [`QCVmConfig`] of `worldspawn`, in the world that a context is being loaded in.
-fn vm_config(worldspawn: Entity) -> Result<QCVmConfig, InteropError> {
+/// The [`QcVmConfig`] of `worldspawn`, in the world that a context is being loaded in.
+fn vm_config(worldspawn: Entity) -> Result<QcVmConfig, InteropError> {
     thread_context()?
         .world
-        .with_world_access(|world| world.get::<QCVmConfig>(worldspawn).cloned())?
+        .with_world_access(|world| world.get::<QcVmConfig>(worldspawn).cloned())?
         .ok_or_else(|| {
             InteropError::external_boxed(
                 format!(
-                    "QuakeC scripts must be attached to an entity with a `QCVmConfig`, but                      {worldspawn} has none"
+                    "QuakeC scripts must be attached to an entity with a `QcVmConfig`, but                      {worldspawn} has none"
                 )
                 .into(),
             )
@@ -186,9 +186,9 @@ fn vm_config(worldspawn: Entity) -> Result<QCVmConfig, InteropError> {
 /// the null string.
 #[derive(Reflect, Clone, PartialEq, Eq, Hash)]
 #[reflect(opaque, Clone, Debug, PartialEq, Hash, Default)]
-pub struct QCString(pub Arc<CStr>);
+pub struct QcString(pub Arc<CStr>);
 
-impl QCString {
+impl QcString {
     /// The null string.
     pub fn null() -> Self {
         Self(qcvm::null_string())
@@ -220,13 +220,13 @@ impl QCString {
     }
 }
 
-impl Default for QCString {
+impl Default for QcString {
     fn default() -> Self {
         Self::null()
     }
 }
 
-impl fmt::Debug for QCString {
+impl fmt::Debug for QcString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_null() {
             f.write_str("null")
@@ -236,13 +236,13 @@ impl fmt::Debug for QCString {
     }
 }
 
-impl From<&str> for QCString {
+impl From<&str> for QcString {
     fn from(value: &str) -> Self {
         Self::from_bytes(value.as_bytes())
     }
 }
 
-impl From<Arc<CStr>> for QCString {
+impl From<Arc<CStr>> for QcString {
     fn from(value: Arc<CStr>) -> Self {
         Self(value)
     }
@@ -252,9 +252,9 @@ impl From<Arc<CStr>> for QCString {
 /// function table. Index 0 is the null function.
 #[derive(Reflect, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[reflect(Clone, Debug, PartialEq, Hash, Default)]
-pub struct QCFunction(pub i32);
+pub struct QcFunction(pub i32);
 
-impl QCFunction {
+impl QcFunction {
     /// The null function.
     pub const NULL: Self = Self(0);
 
@@ -268,22 +268,22 @@ impl QCFunction {
 /// [`qcvm::FieldRef`]). This is e.g. the field argument of Quake's `find`.
 #[derive(Reflect, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[reflect(Clone, Debug, PartialEq, Hash, Default)]
-pub struct QCField(pub u16);
+pub struct QcField(pub u16);
 
-impl From<QCField> for qcvm::FieldRef {
-    fn from(value: QCField) -> Self {
+impl From<QcField> for qcvm::FieldRef {
+    fn from(value: QcField) -> Self {
         Self { offset: value.0 }
     }
 }
 
-impl From<qcvm::FieldRef> for QCField {
+impl From<qcvm::FieldRef> for QcField {
     fn from(value: qcvm::FieldRef) -> Self {
         Self(value.offset)
     }
 }
 
-impl From<QCFunction> for FunctionRef {
-    fn from(value: QCFunction) -> Self {
+impl From<QcFunction> for FunctionRef {
+    fn from(value: QcFunction) -> Self {
         FunctionRef::Index(value.0)
     }
 }
@@ -292,11 +292,11 @@ impl From<QCFunction> for FunctionRef {
 struct BevyScriptContext {
     /// Per-execution globals such as `self` and `other`
     special_args: hashbrown::HashMap<u16, qcvm::Value>,
-    context: QCVmContext,
+    context: QcVmContext,
 }
 
 impl BevyScriptContext {
-    fn new(context: QCVmContext) -> Self {
+    fn new(context: QcVmContext) -> Self {
         Self {
             special_args: Default::default(),
             context,
@@ -313,28 +313,28 @@ impl BevyScriptContext {
 
 /// Marker component for individual entities controlled by QC
 #[derive(Component, Reflect, Default)]
-pub struct QCEntity;
+pub struct QcEntity;
 
 /// Marker component for the worldspawn entity of a QuakeC VM, where globals will be stored.
 ///
-/// Worldspawn is the root of its VM: every other entity of the VM is [`QCOwnedBy`] it.
+/// Worldspawn is the root of its VM: every other entity of the VM is [`QcOwnedBy`] it.
 #[derive(Component, Reflect, Default)]
-pub struct QCWorldspawn;
+pub struct QcWorldspawn;
 
 /// The QuakeC VM that an entity belongs to, by its worldspawn.
 ///
-/// Every [`QCEntity`] other than worldspawn itself must have this, and QuakeC can only access
+/// Every [`QcEntity`] other than worldspawn itself must have this, and QuakeC can only access
 /// entities that belong to its own VM. Despawning a worldspawn despawns every entity that it owns.
 #[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
-#[relationship(relationship_target = QCVmEntities)]
-pub struct QCOwnedBy(pub Entity);
+#[relationship(relationship_target = QcVmEntities)]
+pub struct QcOwnedBy(pub Entity);
 
-/// The entities owned by a QuakeC VM's worldspawn (see [`QCOwnedBy`]).
+/// The entities owned by a QuakeC VM's worldspawn (see [`QcOwnedBy`]).
 #[derive(Component, Debug, Default)]
-#[relationship_target(relationship = QCOwnedBy, linked_spawn)]
-pub struct QCVmEntities(Vec<Entity>);
+#[relationship_target(relationship = QcOwnedBy, linked_spawn)]
+pub struct QcVmEntities(Vec<Entity>);
 
-impl QCVmEntities {
+impl QcVmEntities {
     /// The entities owned by the VM, in no particular order.
     pub fn iter(&self) -> impl Iterator<Item = Entity> + '_ {
         self.0.iter().copied()
@@ -342,13 +342,13 @@ impl QCVmEntities {
 }
 
 /// The worldspawn of the QuakeC VM that `entity` belongs to: `entity` itself for worldspawns, and
-/// the target of [`QCOwnedBy`] for other entities. Entities that don't belong to a VM return `None`.
+/// the target of [`QcOwnedBy`] for other entities. Entities that don't belong to a VM return `None`.
 pub fn vm_root(world: &World, entity: Entity) -> Option<Entity> {
     let entity_ref = world.get_entity(entity).ok()?;
-    if entity_ref.contains::<QCWorldspawn>() {
+    if entity_ref.contains::<QcWorldspawn>() {
         Some(entity)
     } else {
-        entity_ref.get::<QCOwnedBy>().map(|owner| owner.0)
+        entity_ref.get::<QcOwnedBy>().map(|owner| owner.0)
     }
 }
 
@@ -432,7 +432,7 @@ pub fn builtin_vector_arg(index: usize) -> Option<Vec3> {
 }
 
 /// Checks that `entity` belongs to the VM of `context`.
-fn check_owner(entity: Entity, context: &QCVmContext) -> Result<(), InteropError> {
+fn check_owner(entity: Entity, context: &QcVmContext) -> Result<(), InteropError> {
     if entity == context.worldspawn {
         return Ok(());
     }
@@ -560,7 +560,7 @@ impl BevyScriptContext {
     }
 
     /// The key and type of the host global at `addr` that isn't in the defs (see
-    /// [`QCVmConfig::host_globals`]).
+    /// [`QcVmConfig::host_globals`]).
     fn host_global(&self, addr: u16, ty: Type) -> Option<(ScriptValue, Type)> {
         let globals = read(&self.context.host_globals);
         let global = globals.get(addr, ty)?;
@@ -570,7 +570,7 @@ impl BevyScriptContext {
     fn get_global(&self, addr: u16, ty: Type) -> Result<qcvm::Value, AddrError<InteropError>> {
         let Some(info) = self.context.defs.global(addr, ty) else {
             let (key, _) = self.host_global(addr, ty).ok_or(AddrError::OutOfRange)?;
-            let value = interop_error_to_addr_error(magic_get::<QCWorldspawn>(
+            let value = interop_error_to_addr_error(magic_get::<QcWorldspawn>(
                 self.context.worldspawn,
                 key,
             ))?;
@@ -584,7 +584,7 @@ impl BevyScriptContext {
 
         let key = ScriptValue::String(info.name.into());
         let value =
-            interop_error_to_addr_error(magic_get::<QCWorldspawn>(self.context.worldspawn, key))?;
+            interop_error_to_addr_error(magic_get::<QcWorldspawn>(self.context.worldspawn, key))?;
 
         interop_error_to_addr_error(bms_to_qcvm(&value, &self.context))
     }
@@ -595,7 +595,7 @@ impl BevyScriptContext {
                 .host_global(addr, lookup_type(&value))
                 .ok_or(AddrError::OutOfRange)?;
             let value = qcvm_to_bms(&value.or_zero(ty), &self.context)?;
-            return interop_error_to_addr_error(magic_set::<QCWorldspawn>(
+            return interop_error_to_addr_error(magic_set::<QcWorldspawn>(
                 self.context.worldspawn,
                 key,
                 value,
@@ -621,7 +621,7 @@ impl BevyScriptContext {
         let key = ScriptValue::String(info.name.into());
         let value = qcvm_to_bms(&value, &self.context)?;
 
-        interop_error_to_addr_error(magic_set::<QCWorldspawn>(
+        interop_error_to_addr_error(magic_set::<QcWorldspawn>(
             self.context.worldspawn,
             key,
             value,
@@ -635,7 +635,7 @@ impl BevyScriptContext {
         value: qcvm::Value,
     ) -> Result<(), AddrError<InteropError>> {
         let value = qcvm_to_bms(&value, &self.context)?;
-        interop_error_to_addr_error(magic_set::<QCEntity>(
+        interop_error_to_addr_error(magic_set::<QcEntity>(
             entity,
             ScriptValue::String(name.to_owned().into()),
             value,
@@ -731,7 +731,7 @@ impl ErasedContext for BevyScriptContext {
             .field_key(field, ty, entity_def)
             .map_err(anyhow_addr_error)?;
         let value =
-            interop_error_to_addr_error(magic_get::<QCEntity>(self.entity(erased_ent), key))
+            interop_error_to_addr_error(magic_get::<QcEntity>(self.entity(erased_ent), key))
                 .map_err(anyhow_addr_error)?;
 
         bms_to_qcvm(&value, &self.context).map_err(|e| AddrError::Other {
@@ -754,7 +754,7 @@ impl ErasedContext for BevyScriptContext {
                 error: anyhow::format_err!("{e}"),
             })?;
 
-        interop_error_to_addr_error(magic_set::<QCEntity>(self.entity(erased_ent), key, value))
+        interop_error_to_addr_error(magic_set::<QcEntity>(self.entity(erased_ent), key, value))
             .map_err(anyhow_addr_error)
     }
 
@@ -789,7 +789,7 @@ where
     A: ?Sized,
 {
     args: &'a A,
-    context: QCVmContext,
+    context: QcVmContext,
 }
 
 impl<A> fmt::Debug for BevyScriptArgs<'_, A>
@@ -803,7 +803,7 @@ where
     }
 }
 
-impl<'a> QCParams for BevyScriptArgs<'a, [ScriptValue]> {
+impl<'a> QcParams for BevyScriptArgs<'a, [ScriptValue]> {
     type Error = InteropError;
 
     fn nth(&self, index: usize) -> Result<qcvm::Value, ArgError<Self::Error>> {
@@ -823,7 +823,7 @@ impl<'a> QCParams for BevyScriptArgs<'a, [ScriptValue]> {
     }
 }
 
-impl<'a> QCParams for BevyScriptArgs<'a, VecDeque<ScriptValue>> {
+impl<'a> QcParams for BevyScriptArgs<'a, VecDeque<ScriptValue>> {
     type Error = InteropError;
 
     fn nth(&self, index: usize) -> Result<qcvm::Value, ArgError<Self::Error>> {
@@ -861,7 +861,7 @@ impl fmt::Debug for BevyBuiltin {
     }
 }
 
-impl QCType for BevyBuiltin {
+impl QcType for BevyBuiltin {
     fn type_(&self) -> qcvm::Type {
         qcvm::Type::Function
     }
@@ -894,11 +894,11 @@ fn param_type(type_id: TypeId) -> qcvm::Type {
         qcvm::Type::Vector
     } else if is::<f32>(type_id) || is::<f64>(type_id) {
         qcvm::Type::Float
-    } else if is::<QCString>(type_id) {
+    } else if is::<QcString>(type_id) {
         qcvm::Type::String
-    } else if is::<QCFunction>(type_id) || is::<DynamicScriptFunction>(type_id) {
+    } else if is::<QcFunction>(type_id) || is::<DynamicScriptFunction>(type_id) {
         qcvm::Type::Function
-    } else if is::<QCField>(type_id) {
+    } else if is::<QcField>(type_id) {
         qcvm::Type::Field
     } else if is::<ReflectReference>(type_id) {
         qcvm::Type::Entity
@@ -973,14 +973,14 @@ impl ErasedFunction for BevyBuiltin {
     }
 }
 
-/// The default [`ReflectToValue`], which handles [`QCString`], [`QCFunction`], [`QCField`],
+/// The default [`ReflectToValue`], which handles [`QcString`], [`QcFunction`], [`QcField`],
 /// [`Vec3`], `[f32; 3]`, `f32`, `f64` and `bool`.
 pub fn default_reflect_to_value(value: &dyn PartialReflect) -> Result<qcvm::Value, InteropError> {
-    if let Some(s) = value.try_downcast_ref::<QCString>() {
+    if let Some(s) = value.try_downcast_ref::<QcString>() {
         Ok(qcvm::Value::String(s.0.clone()))
-    } else if let Some(f) = value.try_downcast_ref::<QCFunction>() {
+    } else if let Some(f) = value.try_downcast_ref::<QcFunction>() {
         Ok(FunctionIndex(f.0).to_value())
-    } else if let Some(f) = value.try_downcast_ref::<QCField>() {
+    } else if let Some(f) = value.try_downcast_ref::<QcField>() {
         Ok(qcvm::Value::Field((*f).into()))
     } else if let Some(v) = value.try_downcast_ref::<Vec3>() {
         Ok(qcvm::Value::Vector(v.to_array().into()))
@@ -1008,7 +1008,7 @@ pub fn default_reflect_to_value(value: &dyn PartialReflect) -> Result<qcvm::Valu
 
 fn bms_to_qcvm(
     bms_value: &ScriptValue,
-    context: &QCVmContext,
+    context: &QcVmContext,
 ) -> Result<qcvm::Value, InteropError> {
     let as_f32 = |value: &ScriptValue| match *value {
         ScriptValue::Float(f) => Some(f as f32),
@@ -1042,7 +1042,7 @@ fn bms_to_qcvm(
         }
         ScriptValue::Reference(r)
             if let ReflectBase::Component(ent, _) = r.base.base_id()
-                && r.base.type_id() == TypeId::of::<QCEntity>() =>
+                && r.base.type_id() == TypeId::of::<QcEntity>() =>
         {
             check_owner(*ent, context)?;
             Ok(qcvm::Value::Entity(if *ent == context.worldspawn {
@@ -1053,11 +1053,11 @@ fn bms_to_qcvm(
         }
         ScriptValue::Reference(r)
             if matches!(r.base.base_id(), ReflectBase::Component(..))
-                && r.base.type_id() == TypeId::of::<QCWorldspawn>() =>
+                && r.base.type_id() == TypeId::of::<QcWorldspawn>() =>
         {
             Err(InteropError::external_boxed(
-                "Tried to convert a `QCWorldspawn` reference to a qcvm entity. If this is what \
-                you intended, add a `QCEntity` component to the worldspawn entity and pass a \
+                "Tried to convert a `QcWorldspawn` reference to a qcvm entity. If this is what \
+                you intended, add a `QcEntity` component to the worldspawn entity and pass a \
                 `ReflectReference` to that component instead"
                     .into(),
             ))
@@ -1068,7 +1068,7 @@ fn bms_to_qcvm(
         }
         ScriptValue::Function(func) => Ok(qcvm::Value::Function(
             match context.function_index(func) {
-                // One of this VM's own function values (see `QCVmContext::function_value`).
+                // One of this VM's own function values (see `QcVmContext::function_value`).
                 Some(index) => qcvm::Function::Index(FunctionIndex(index)),
                 None => qcvm::Function::Host(Arc::new(BevyBuiltin { func: func.clone() })),
             },
@@ -1080,7 +1080,7 @@ fn bms_to_qcvm(
 
 fn qcvm_to_bms(
     qcvm_value: &qcvm::Value,
-    root_ctx: &QCVmContext,
+    root_ctx: &QcVmContext,
 ) -> Result<ScriptValue, InteropError> {
     match qcvm_value {
         qcvm::Value::Void => Ok(ScriptValue::Unit),
@@ -1091,7 +1091,7 @@ fn qcvm_to_bms(
             let world = thread_context()?.world;
 
             Ok(ScriptValue::Reference(
-                ReflectReference::new_component_ref::<QCEntity>(entity, world)?,
+                ReflectReference::new_component_ref::<QcEntity>(entity, world)?,
             ))
         }
         qcvm::Value::Function(qcvm::Function::Index(index)) => root_ctx.function_value(index.0),
@@ -1114,10 +1114,10 @@ fn qcvm_to_bms(
             ScriptValue::Float(vec3.z as f64),
         ]))),
         qcvm::Value::String(cstr) => Ok(ScriptValue::Reference(ReflectReference::new_allocated(
-            QCString(cstr.clone()),
+            QcString(cstr.clone()),
         ))),
         qcvm::Value::Field(field) => Ok(ScriptValue::Reference(ReflectReference::new_allocated(
-            QCField::from(*field),
+            QcField::from(*field),
         ))),
     }
 }
@@ -1146,7 +1146,7 @@ fn write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The function values of a VM (see [`QCVmContext::function_value`]), one per function index so
+/// The function values of a VM (see [`QcVmContext::function_value`]), one per function index so
 /// that QuakeC's `==` on functions still works after a function has been passed out of the VM and
 /// back in.
 #[derive(Default)]
@@ -1164,7 +1164,7 @@ impl FunctionCache {
     }
 }
 
-/// A global that the `progs.dat` defines and the host stores (see [`QCVmConfig::host_globals`]).
+/// A global that the `progs.dat` defines and the host stores (see [`QcVmConfig::host_globals`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostGlobal {
     /// The name that the host stores it under. Vectors are stored both as a whole (under their
@@ -1186,7 +1186,7 @@ struct HostGlobals {
 }
 
 impl HostGlobals {
-    fn new(vm: &qcvm::QCVm, defs: &dyn ErasedDefs, names: &[&str]) -> Self {
+    fn new(vm: &qcvm::QcVm, defs: &dyn ErasedDefs, names: &[&str]) -> Self {
         let mut out = Self::default();
         if names.is_empty() {
             return out;
@@ -1250,13 +1250,13 @@ impl HostGlobals {
 /// Running QuakeC holds a read lock for as long as it runs. Calls from inside a call (e.g. a
 /// builtin calling a function value) take the lock again with
 /// [`parking_lot::RwLock::read_recursive`], which doesn't wait for writers, so they can't
-/// deadlock. Replacing the VM (see [`QCVmContext::replace_vm`]) takes the write lock, so it waits
+/// deadlock. Replacing the VM (see [`QcVmContext::replace_vm`]) takes the write lock, so it waits
 /// until no QuakeC from this VM is running.
-type VmCell = Arc<parking_lot::RwLock<qcvm::QCVm>>;
+type VmCell = Arc<parking_lot::RwLock<qcvm::QcVm>>;
 
-/// Wrapper around `qcvm::QCVm` that adds extra configuration for converting values
+/// Wrapper around `qcvm::QcVm` that adds extra configuration for converting values
 #[derive(Clone)]
-pub struct QCVmContext {
+pub struct QcVmContext {
     vm: VmCell,
     /// A conversion function for arbitrary reflect values. By default, this is
     /// [`default_reflect_to_value`].
@@ -1265,9 +1265,9 @@ pub struct QCVmContext {
     pub worldspawn: Entity,
     /// If `true`, special arguments (see the callback handler) can't be written by QuakeC.
     pub special_args_immutable: bool,
-    /// The defs that the `progs.dat` is compiled against (see [`QCVmConfig::defs`]).
+    /// The defs that the `progs.dat` is compiled against (see [`QcVmConfig::defs`]).
     pub defs: &'static dyn ErasedDefs,
-    /// The namespace that builtins are looked up in (see [`QCVmConfig::builtin_namespace`]).
+    /// The namespace that builtins are looked up in (see [`QcVmConfig::builtin_namespace`]).
     pub builtin_namespace: TypeId,
     /// The script attachment that this context was loaded for, if it was loaded by
     /// `bevy_mod_scripting`. Calling a function value of this VM makes this the current
@@ -1280,9 +1280,9 @@ pub struct QCVmContext {
     host_globals: Arc<RwLock<HostGlobals>>,
 }
 
-/// A [`QCVmContext`] that doesn't keep its function values alive, for the function values
+/// A [`QcVmContext`] that doesn't keep its function values alive, for the function values
 /// themselves to hold (which would otherwise be a reference cycle through [`FunctionCache`]).
-struct WeakQCVmContext {
+struct WeakQcVmContext {
     vm: VmCell,
     reflect_to_value: ReflectToValue,
     worldspawn: Entity,
@@ -1296,9 +1296,9 @@ struct WeakQCVmContext {
     host_globals: Arc<RwLock<HostGlobals>>,
 }
 
-impl WeakQCVmContext {
-    fn upgrade(&self) -> Option<QCVmContext> {
-        Some(QCVmContext {
+impl WeakQcVmContext {
+    fn upgrade(&self) -> Option<QcVmContext> {
+        Some(QcVmContext {
             vm: self.vm.clone(),
             reflect_to_value: self.reflect_to_value,
             worldspawn: self.worldspawn,
@@ -1340,9 +1340,9 @@ impl Drop for AttachmentGuard<'_> {
     }
 }
 
-impl fmt::Debug for QCVmContext {
+impl fmt::Debug for QcVmContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("QCVmContext")
+        f.debug_struct("QcVmContext")
             .field("vm", &*self.vm())
             .field("worldspawn", &self.worldspawn)
             .field("special_args_immutable", &self.special_args_immutable)
@@ -1352,10 +1352,10 @@ impl fmt::Debug for QCVmContext {
     }
 }
 
-impl QCVmContext {
+impl QcVmContext {
     /// Creates a context for `vm`, with globals stored on `worldspawn` and the defs and builtins of
     /// `config`.
-    pub fn new(vm: qcvm::QCVm, worldspawn: Entity, config: &QCVmConfig) -> Self {
+    pub fn new(vm: qcvm::QcVm, worldspawn: Entity, config: &QcVmConfig) -> Self {
         let host_globals = HostGlobals::new(&vm, config.defs, config.host_globals);
         Self {
             vm: Arc::new(parking_lot::RwLock::new(vm)),
@@ -1373,10 +1373,10 @@ impl QCVmContext {
     }
 
     /// The VM. This locks it for reading, which keeps hot reloading (see
-    /// [`QCVmContext::replace_vm`]) from replacing it until the guard is dropped, so don't hold
+    /// [`QcVmContext::replace_vm`]) from replacing it until the guard is dropped, so don't hold
     /// on to it for longer than needed. It can be called while the VM is already locked on this
     /// thread (e.g. from a builtin).
-    pub fn vm(&self) -> parking_lot::RwLockReadGuard<'_, qcvm::QCVm> {
+    pub fn vm(&self) -> parking_lot::RwLockReadGuard<'_, qcvm::QcVm> {
         self.vm.read_recursive()
     }
 
@@ -1386,10 +1386,10 @@ impl QCVmContext {
     ///
     /// This waits until no QuakeC from this VM is running (on any thread), so that a reload never
     /// happens in the middle of a call. It deadlocks if it is called while this thread is running
-    /// QuakeC from this VM (e.g. from a builtin) or holds the guard from [`QCVmContext::vm`]:
+    /// QuakeC from this VM (e.g. from a builtin) or holds the guard from [`QcVmContext::vm`]:
     /// reloads requested from inside a call have to be deferred until the call returns (e.g. by
     /// sending a message that is handled by a system).
-    pub fn replace_vm(&self, vm: qcvm::QCVm) {
+    pub fn replace_vm(&self, vm: qcvm::QcVm) {
         let mut current = self.vm.write();
         *write(&self.host_globals) = HostGlobals::new(&vm, self.defs, self.host_global_names);
         *current = vm;
@@ -1397,8 +1397,8 @@ impl QCVmContext {
         self.functions.clear();
     }
 
-    fn downgrade(&self) -> WeakQCVmContext {
-        WeakQCVmContext {
+    fn downgrade(&self) -> WeakQcVmContext {
+        WeakQcVmContext {
             vm: self.vm.clone(),
             reflect_to_value: self.reflect_to_value,
             worldspawn: self.worldspawn,
@@ -1414,7 +1414,7 @@ impl QCVmContext {
     }
 
     /// The globals that the `progs.dat` defines and the host stores (see
-    /// [`QCVmConfig::host_globals`]), in no particular order. Vectors are listed both as a whole
+    /// [`QcVmConfig::host_globals`]), in no particular order. Vectors are listed both as a whole
     /// and as their components.
     pub fn host_globals(&self) -> Vec<HostGlobal> {
         let globals = read(&self.host_globals);
@@ -1497,7 +1497,7 @@ impl QCVmContext {
     }
 
     /// The function index of `func`, if it is a function value of this VM (see
-    /// [`QCVmContext::function_value`]).
+    /// [`QcVmContext::function_value`]).
     pub fn function_index(&self, func: &DynamicScriptFunction) -> Option<i32> {
         read(&self.functions.by_identity).get(&func.identity()).copied()
     }
@@ -1553,7 +1553,7 @@ impl QCVmContext {
         &self,
         world: &mut World,
         function: impl Into<FunctionRef>,
-        args: impl QCParams,
+        args: impl QcParams,
     ) -> Result<R, InteropError>
     where
         R: qcvm::FromReturnValue,
@@ -1582,12 +1582,12 @@ impl QCVmContext {
         self.vm().field_defs().to_vec()
     }
 
-    /// The initial value of a global (see [`qcvm::QCVm::initial_global`]).
+    /// The initial value of a global (see [`qcvm::QcVm::initial_global`]).
     pub fn initial_global(&self, addr: u16) -> anyhow::Result<qcvm::Value> {
         self.vm().initial_global(addr)
     }
 
-    /// The initial value of a vector global (see [`qcvm::QCVm::initial_global_vector`]).
+    /// The initial value of a vector global (see [`qcvm::QcVm::initial_global_vector`]).
     pub fn initial_global_vector(&self, addr: u16) -> anyhow::Result<Vec3> {
         self.vm()
             .initial_global_vector(addr)
@@ -1633,7 +1633,7 @@ impl QCVmContext {
     }
 
     /// The definition of the global called `name` in the `progs.dat`, if it's stored in the VM
-    /// rather than by the host (i.e. it isn't in [`QCVmContext::defs`]). These are globals that
+    /// rather than by the host (i.e. it isn't in [`QcVmContext::defs`]). These are globals that
     /// the `progs.dat` defines for itself, including engine extension globals that the host's
     /// defs don't cover.
     pub fn vm_global_def(&self, name: &str) -> Option<qcvm::GlobalDef> {
@@ -1650,7 +1650,7 @@ impl QCVmContext {
             .cloned()
     }
 
-    /// The value of a global stored in the VM by name (see [`QCVmContext::vm_global_def`]).
+    /// The value of a global stored in the VM by name (see [`QcVmContext::vm_global_def`]).
     pub fn vm_global(&self, name: &str) -> Option<anyhow::Result<qcvm::Value>> {
         let def = self.vm_global_def(name)?;
         let vm = self.vm();
@@ -1661,7 +1661,7 @@ impl QCVmContext {
         })
     }
 
-    /// Sets a global stored in the VM by name (see [`QCVmContext::vm_global_def`]). Returns
+    /// Sets a global stored in the VM by name (see [`QcVmContext::vm_global_def`]). Returns
     /// `Ok(false)` if the `progs.dat` doesn't define it.
     pub fn set_vm_global(&self, name: &str, value: qcvm::Value) -> anyhow::Result<bool> {
         let Some(def) = self.vm_global_def(name) else {
@@ -1672,10 +1672,10 @@ impl QCVmContext {
     }
 }
 
-impl IntoScriptPluginParams for QCScriptingPlugin {
+impl IntoScriptPluginParams for QcScriptingPlugin {
     const LANGUAGE: Language = QC_LANGUAGE;
 
-    type C = QCVmContext;
+    type C = QcVmContext;
     type R = ();
 
     fn build_runtime() -> Self::R {}
@@ -1685,10 +1685,10 @@ impl IntoScriptPluginParams for QCScriptingPlugin {
             mut args: Vec<ScriptValue>,
             context_key: &ScriptAttachment,
             callback: &CallbackLabel,
-            context: &mut QCVmContext,
+            context: &mut QcVmContext,
             world_id: WorldId,
         ) -> Result<ScriptValue, InteropError> {
-            let config = QCScriptingPlugin::readonly_configuration(world_id);
+            let config = QcScriptingPlugin::readonly_configuration(world_id);
             for callback in config.pre_handling_callbacks {
                 callback(context_key, context)?;
             }
@@ -1736,7 +1736,7 @@ impl IntoScriptPluginParams for QCScriptingPlugin {
             let _vm = VmStackGuard::push(context.worldspawn);
 
             // The progs don't say what type callbacks return, so the return value is read as a
-            // scalar (see `QCVmContext::return_value`).
+            // scalar (see `QcVmContext::return_value`).
             let ret = vm
                 .run(
                     &mut script_context,
@@ -1759,8 +1759,8 @@ impl IntoScriptPluginParams for QCScriptingPlugin {
             context_key: &ScriptAttachment,
             content: &[u8],
             world_id: WorldId,
-        ) -> Result<QCVmContext, InteropError> {
-            let config = QCScriptingPlugin::readonly_configuration(world_id);
+        ) -> Result<QcVmContext, InteropError> {
+            let config = QcScriptingPlugin::readonly_configuration(world_id);
             // Globals are stored on the entity the script is attached to, which also has the
             // configuration of the VM.
             let worldspawn = context_key.entity().ok_or_else(|| {
@@ -1769,13 +1769,13 @@ impl IntoScriptPluginParams for QCScriptingPlugin {
                 )
             })?;
             let vm_config = vm_config(worldspawn)?;
-            let vm = qcvm::QCVm::load_with_defs(
+            let vm = qcvm::QcVm::load_with_defs(
                 std::io::Cursor::new(content),
                 &*vm_config.defs,
                 vm_config.options.clone(),
             )
             .map_err(qc_interop_error)?;
-            let mut out = QCVmContext::new(vm, worldspawn, &vm_config);
+            let mut out = QcVmContext::new(vm, worldspawn, &vm_config);
             out.attachment = Some(context_key.clone());
 
             for init in config.context_initialization_callbacks {
@@ -1794,15 +1794,15 @@ impl IntoScriptPluginParams for QCScriptingPlugin {
         fn qc_context_reloader(
             context_key: &ScriptAttachment,
             content: &[u8],
-            previous_context: &mut QCVmContext,
+            previous_context: &mut QcVmContext,
             world_id: WorldId,
         ) -> Result<(), InteropError> {
-            let config = QCScriptingPlugin::readonly_configuration(world_id);
+            let config = QcScriptingPlugin::readonly_configuration(world_id);
             // Keep the defs and options that the context was loaded with.
             // The read guard has to be dropped before `replace_vm`, which would otherwise wait
             // for it forever.
             let options = previous_context.vm().options().clone();
-            let vm = qcvm::QCVm::load_with_defs(
+            let vm = qcvm::QcVm::load_with_defs(
                 std::io::Cursor::new(content),
                 &*previous_context.defs,
                 options,
@@ -1825,12 +1825,12 @@ impl IntoScriptPluginParams for QCScriptingPlugin {
     }
 }
 
-/// The plugin configuration of [`QCScriptingPlugin`], by world.
-type PluginConfigs = Vec<Option<ScriptingPluginConfiguration<QCScriptingPlugin>>>;
+/// The plugin configuration of [`QcScriptingPlugin`], by world.
+type PluginConfigs = Vec<Option<ScriptingPluginConfiguration<QcScriptingPlugin>>>;
 
 static PLUGIN_CONFIGS: RwLock<PluginConfigs> = RwLock::new(Vec::new());
 
-impl GetPluginThreadConfig<QCScriptingPlugin> for QCScriptingPlugin {
+impl GetPluginThreadConfig<QcScriptingPlugin> for QcScriptingPlugin {
     fn readonly_configuration(world: WorldId) -> ScriptingPluginConfiguration<Self> {
         PLUGIN_CONFIGS
             .read()
@@ -1856,11 +1856,11 @@ impl GetPluginThreadConfig<QCScriptingPlugin> for QCScriptingPlugin {
     }
 }
 
-impl bevy_app::Plugin for QCScriptingPlugin {
+impl bevy_app::Plugin for QcScriptingPlugin {
     fn build(&self, app: &mut bevy_app::App) {
-        app.register_type::<QCEntity>()
-            .register_type::<QCWorldspawn>()
-            .register_type::<QCOwnedBy>();
+        app.register_type::<QcEntity>()
+            .register_type::<QcWorldspawn>()
+            .register_type::<QcOwnedBy>();
         self.scripting_plugin.build(app);
     }
 
@@ -1869,7 +1869,7 @@ impl bevy_app::Plugin for QCScriptingPlugin {
     }
 }
 
-impl AsMut<ScriptingPlugin<Self>> for QCScriptingPlugin {
+impl AsMut<ScriptingPlugin<Self>> for QcScriptingPlugin {
     fn as_mut(&mut self) -> &mut ScriptingPlugin<Self> {
         &mut self.scripting_plugin
     }
@@ -1882,7 +1882,7 @@ mod tests {
     /// Defs with no globals, fields or builtins.
     struct EmptyDefs;
 
-    impl qcvm::QCDefs for EmptyDefs {
+    impl qcvm::QcDefs for EmptyDefs {
         type GlobalAddr = qcvm::EmptyAddress;
         type FieldAddr = qcvm::EmptyAddress;
         type BuiltinAddr = qcvm::EmptyAddress;
@@ -1895,7 +1895,7 @@ mod tests {
         const HEADER_SIZE: i32 = 4 + 4 + 6 * 8 + 4;
         let mut bytes = Vec::new();
         bytes.extend(6i32.to_le_bytes());
-        bytes.extend(<EmptyDefs as qcvm::QCDefs>::CRC.to_le_bytes());
+        bytes.extend(<EmptyDefs as qcvm::QcDefs>::CRC.to_le_bytes());
         // Statements, global defs, field defs, functions, strings (just the null string), globals.
         for (offset, count) in [
             (HEADER_SIZE + 1, 0i32),
@@ -1914,15 +1914,15 @@ mod tests {
         bytes
     }
 
-    fn context(worldspawn: Entity) -> QCVmContext {
-        let config = QCVmConfig::new::<QCWorldspawn>(&EmptyDefs);
-        let vm = qcvm::QCVm::load_with_defs(
+    fn context(worldspawn: Entity) -> QcVmContext {
+        let config = QcVmConfig::new::<QcWorldspawn>(&EmptyDefs);
+        let vm = qcvm::QcVm::load_with_defs(
             std::io::Cursor::new(empty_progs()),
             &*config.defs,
             Default::default(),
         )
         .unwrap();
-        QCVmContext::new(vm, worldspawn, &config)
+        QcVmContext::new(vm, worldspawn, &config)
     }
 
     /// Runs `f` with `world` as the thread's world, as builtins are.
@@ -1937,18 +1937,18 @@ mod tests {
     fn entity_value(entity: Entity) -> ScriptValue {
         let world = thread_context().unwrap().world;
         ScriptValue::Reference(
-            ReflectReference::new_component_ref::<QCEntity>(entity, world).unwrap(),
+            ReflectReference::new_component_ref::<QcEntity>(entity, world).unwrap(),
         )
     }
 
     #[test]
     fn vms_only_accept_their_own_entities() {
         let mut world = World::new();
-        let a = world.spawn((QCWorldspawn, QCEntity)).id();
-        let b = world.spawn((QCWorldspawn, QCEntity)).id();
-        let a_ent = world.spawn((QCEntity, QCOwnedBy(a))).id();
-        let b_ent = world.spawn((QCEntity, QCOwnedBy(b))).id();
-        let unowned = world.spawn(QCEntity).id();
+        let a = world.spawn((QcWorldspawn, QcEntity)).id();
+        let b = world.spawn((QcWorldspawn, QcEntity)).id();
+        let a_ent = world.spawn((QcEntity, QcOwnedBy(a))).id();
+        let b_ent = world.spawn((QcEntity, QcOwnedBy(b))).id();
+        let unowned = world.spawn(QcEntity).id();
 
         // Both VMs have the same defs, so only ownership can tell their entities apart.
         let (ctx_a, ctx_b) = (context(a), context(b));
@@ -1974,16 +1974,16 @@ mod tests {
     #[test]
     fn vm_root_follows_ownership() {
         let mut world = World::new();
-        let root = world.spawn((QCWorldspawn, QCEntity)).id();
-        let owned = world.spawn((QCEntity, QCOwnedBy(root))).id();
-        let unowned = world.spawn(QCEntity).id();
+        let root = world.spawn((QcWorldspawn, QcEntity)).id();
+        let owned = world.spawn((QcEntity, QcOwnedBy(root))).id();
+        let unowned = world.spawn(QcEntity).id();
 
         assert_eq!(vm_root(&world, root), Some(root));
         assert_eq!(vm_root(&world, owned), Some(root));
         assert_eq!(vm_root(&world, unowned), None);
         assert_eq!(
             world
-                .get::<QCVmEntities>(root)
+                .get::<QcVmEntities>(root)
                 .unwrap()
                 .iter()
                 .collect::<Vec<_>>(),
@@ -1994,10 +1994,10 @@ mod tests {
     #[test]
     fn despawning_worldspawn_only_despawns_its_entities() {
         let mut world = World::new();
-        let a = world.spawn((QCWorldspawn, QCEntity)).id();
-        let b = world.spawn((QCWorldspawn, QCEntity)).id();
-        let a_ent = world.spawn((QCEntity, QCOwnedBy(a))).id();
-        let b_ent = world.spawn((QCEntity, QCOwnedBy(b))).id();
+        let a = world.spawn((QcWorldspawn, QcEntity)).id();
+        let b = world.spawn((QcWorldspawn, QcEntity)).id();
+        let a_ent = world.spawn((QcEntity, QcOwnedBy(a))).id();
+        let b_ent = world.spawn((QcEntity, QcOwnedBy(b))).id();
 
         world.despawn(a);
 
@@ -2057,7 +2057,7 @@ mod tests {
     #[test]
     fn loading_checks_the_defs_crc() {
         struct OtherDefs;
-        impl qcvm::QCDefs for OtherDefs {
+        impl qcvm::QcDefs for OtherDefs {
             type GlobalAddr = qcvm::EmptyAddress;
             type FieldAddr = qcvm::EmptyAddress;
             type BuiltinAddr = qcvm::EmptyAddress;
@@ -2065,7 +2065,7 @@ mod tests {
         }
 
         assert!(
-            qcvm::QCVm::load_with_defs(
+            qcvm::QcVm::load_with_defs(
                 std::io::Cursor::new(empty_progs()),
                 &OtherDefs,
                 Default::default()
@@ -2188,7 +2188,7 @@ mod tests {
         const HEADER_SIZE: usize = 4 + 4 + 6 * 8 + 4;
         let mut header = Vec::new();
         header.extend(6i32.to_le_bytes());
-        header.extend(<EmptyDefs as qcvm::QCDefs>::CRC.to_le_bytes());
+        header.extend(<EmptyDefs as qcvm::QcDefs>::CRC.to_le_bytes());
         let mut body = Vec::new();
         for (bytes, count) in &lumps {
             header.extend(((HEADER_SIZE + body.len()) as i32).to_le_bytes());
@@ -2212,7 +2212,7 @@ mod tests {
         app.add_plugins((
             bevy_asset::AssetPlugin::default(),
             bevy_mod_scripting_core::BMSScriptingInfrastructurePlugin::default(),
-            QCScriptingPlugin::default(),
+            QcScriptingPlugin::default(),
         ));
         app.finish();
         app.cleanup();
@@ -2230,19 +2230,19 @@ mod tests {
                 },
             );
 
-        let worldspawn = world.spawn((QCWorldspawn, QCEntity)).id();
+        let worldspawn = world.spawn((QcWorldspawn, QcEntity)).id();
         let attachment = ScriptAttachment::EntityScript(worldspawn, bevy_asset::Handle::default());
-        let config = QCVmConfig::new::<TestBuiltins>(&EmptyDefs);
-        let vm = qcvm::QCVm::load_with_defs(
+        let config = QcVmConfig::new::<TestBuiltins>(&EmptyDefs);
+        let vm = qcvm::QcVm::load_with_defs(
             std::io::Cursor::new(function_progs()),
             &*config.defs,
             Default::default(),
         )
         .unwrap();
-        let mut context = QCVmContext::new(vm, worldspawn, &config);
+        let mut context = QcVmContext::new(vm, worldspawn, &config);
         context.attachment = Some(attachment.clone());
         world
-            .resource::<bevy_mod_scripting_core::script::ScriptContexts<QCScriptingPlugin>>()
+            .resource::<bevy_mod_scripting_core::script::ScriptContexts<QcScriptingPlugin>>()
             .write()
             .insert(
                 attachment.clone(),
@@ -2252,9 +2252,9 @@ mod tests {
         (app, attachment)
     }
 
-    fn context_of(world: &World, attachment: &ScriptAttachment) -> QCVmContext {
+    fn context_of(world: &World, attachment: &ScriptAttachment) -> QcVmContext {
         world
-            .resource::<bevy_mod_scripting_core::script::ScriptContexts<QCScriptingPlugin>>()
+            .resource::<bevy_mod_scripting_core::script::ScriptContexts<QcScriptingPlugin>>()
             .read()
             .get_context(attachment)
             .and_then(|context| context.as_loaded().cloned())
@@ -2341,15 +2341,15 @@ mod tests {
 
     #[test]
     fn host_globals_are_found_by_name() {
-        let vm = qcvm::QCVm::load_with_defs(
+        let vm = qcvm::QcVm::load_with_defs(
             std::io::Cursor::new(function_progs()),
             &EmptyDefs,
             Default::default(),
         )
         .unwrap();
-        let config = QCVmConfig::new::<TestBuiltins>(&EmptyDefs)
+        let config = QcVmConfig::new::<TestBuiltins>(&EmptyDefs)
             .with_host_globals(&["fortytwo", "not_defined"]);
-        let context = QCVmContext::new(vm, Entity::PLACEHOLDER, &config);
+        let context = QcVmContext::new(vm, Entity::PLACEHOLDER, &config);
         assert_eq!(
             context.host_globals(),
             [HostGlobal {
@@ -2364,16 +2364,16 @@ mod tests {
     #[test]
     fn replacing_the_vm_waits_for_running_quakec() {
         let load = || {
-            qcvm::QCVm::load_with_defs(
+            qcvm::QcVm::load_with_defs(
                 std::io::Cursor::new(function_progs()),
                 &EmptyDefs,
                 Default::default(),
             )
             .unwrap()
         };
-        let config = QCVmConfig::new::<TestBuiltins>(&EmptyDefs);
-        let context = QCVmContext::new(load(), Entity::PLACEHOLDER, &config);
-        let old: *const qcvm::QCVm = &*context.vm();
+        let config = QcVmConfig::new::<TestBuiltins>(&EmptyDefs);
+        let context = QcVmContext::new(load(), Entity::PLACEHOLDER, &config);
+        let old: *const qcvm::QcVm = &*context.vm();
 
         // Running QuakeC holds the VM like this (and calls from inside it lock it again).
         let running = context.vm();
@@ -2400,7 +2400,7 @@ mod tests {
         let context = context_of(world, &attachment);
         let clone = context.clone();
         let old = with_world(world, || context.function_value(1).unwrap());
-        let vm = qcvm::QCVm::load_with_defs(
+        let vm = qcvm::QcVm::load_with_defs(
             std::io::Cursor::new(function_progs()),
             &EmptyDefs,
             Default::default(),
