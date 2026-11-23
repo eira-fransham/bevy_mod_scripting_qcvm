@@ -564,7 +564,10 @@ impl BevyScriptContext {
     fn host_global(&self, addr: u16, ty: Type) -> Option<(ScriptValue, Type)> {
         let globals = read(&self.context.host_globals);
         let global = globals.get(addr, ty)?;
-        Some((ScriptValue::String(global.name.clone().into()), global.type_))
+        Some((
+            ScriptValue::String(global.name.clone().into()),
+            global.type_,
+        ))
     }
 
     fn get_global(&self, addr: u16, ty: Type) -> Result<qcvm::Value, AddrError<InteropError>> {
@@ -662,7 +665,7 @@ impl ErasedContext for BevyScriptContext {
         let function_registry = world.script_function_registry();
         let function_registry = function_registry.read();
 
-        let def_name = builtin_name(&*self.context.defs, def);
+        let def_name = builtin_name(self.context.defs, def);
 
         let func = function_registry
             .get_function(self.context.builtin_namespace, def_name.clone())
@@ -1066,13 +1069,13 @@ fn bms_to_qcvm(
             let world = thread_context()?.world;
             val.with_reflect(world, context.reflect_to_value)?
         }
-        ScriptValue::Function(func) => Ok(qcvm::Value::Function(
-            match context.function_index(func) {
+        ScriptValue::Function(func) => {
+            Ok(qcvm::Value::Function(match context.function_index(func) {
                 // One of this VM's own function values (see `QcVmContext::function_value`).
                 Some(index) => qcvm::Function::Index(FunctionIndex(index)),
                 None => qcvm::Function::Host(Arc::new(BevyBuiltin { func: func.clone() })),
-            },
-        )),
+            }))
+        }
         ScriptValue::Error(e) => Err(e.clone()),
         _ => Err(InteropError::NotImplemented),
     }
@@ -1323,8 +1326,7 @@ struct AttachmentGuard<'w> {
 
 impl<'w> AttachmentGuard<'w> {
     fn set(world: WorldGuard<'w>, attachment: ScriptAttachment) -> Self {
-        let previous =
-            world.replace_cached_registry(CurrentScriptAttachment(Some(attachment)));
+        let previous = world.replace_cached_registry(CurrentScriptAttachment(Some(attachment)));
         Self {
             world,
             previous: Some(previous),
@@ -1452,17 +1454,15 @@ impl QcVmContext {
             .map_err(|e| InteropError::string(format!("No QuakeC function #{index}: {e}")))?;
 
         let registered = if def.is_builtin() {
-            let name = builtin_name(&*self.defs, def);
-            thread_context()
-                .ok()
-                .and_then(|ctx| {
-                    ctx.world
-                        .script_function_registry()
-                        .read()
-                        .get_function(self.builtin_namespace, name.into_owned())
-                        .ok()
-                        .cloned()
-                })
+            let name = builtin_name(self.defs, def);
+            thread_context().ok().and_then(|ctx| {
+                ctx.world
+                    .script_function_registry()
+                    .read()
+                    .get_function(self.builtin_namespace, name.into_owned())
+                    .ok()
+                    .cloned()
+            })
         } else {
             None
         };
@@ -1471,7 +1471,8 @@ impl QcVmContext {
             Some(func) => func,
             None => {
                 let weak = self.downgrade();
-                let info = FunctionInfo::default().with_name(def.name.to_string_lossy().into_owned());
+                let info =
+                    FunctionInfo::default().with_name(def.name.to_string_lossy().into_owned());
                 DynamicScriptFunction::from(
                     move |_caller: FunctionCallContext, args: VecDeque<ScriptValue>| match weak
                         .upgrade()
@@ -1499,12 +1500,18 @@ impl QcVmContext {
     /// The function index of `func`, if it is a function value of this VM (see
     /// [`QcVmContext::function_value`]).
     pub fn function_index(&self, func: &DynamicScriptFunction) -> Option<i32> {
-        read(&self.functions.by_identity).get(&func.identity()).copied()
+        read(&self.functions.by_identity)
+            .get(&func.identity())
+            .copied()
     }
 
     /// Runs the function with index `index`, with the thread's world. The return value is read as
     /// a scalar, as the progs don't say what type functions return.
-    fn call_index(&self, index: i32, args: &VecDeque<ScriptValue>) -> Result<ScriptValue, InteropError> {
+    fn call_index(
+        &self,
+        index: i32,
+        args: &VecDeque<ScriptValue>,
+    ) -> Result<ScriptValue, InteropError> {
         let world = thread_context()?.world;
         let _attachment = self
             .attachment
@@ -1771,7 +1778,7 @@ impl IntoScriptPluginParams for QcScriptingPlugin {
             let vm_config = vm_config(worldspawn)?;
             let vm = qcvm::QcVm::load_with_defs(
                 std::io::Cursor::new(content),
-                &*vm_config.defs,
+                vm_config.defs,
                 vm_config.options.clone(),
             )
             .map_err(qc_interop_error)?;
@@ -1804,7 +1811,7 @@ impl IntoScriptPluginParams for QcScriptingPlugin {
             let options = previous_context.vm().options().clone();
             let vm = qcvm::QcVm::load_with_defs(
                 std::io::Cursor::new(content),
-                &*previous_context.defs,
+                previous_context.defs,
                 options,
             )
             .map_err(qc_interop_error)?;
@@ -2311,9 +2318,10 @@ mod tests {
         let world = app.world_mut();
         let context = context_of(world, &attachment);
         with_world(world, || {
-            let (ScriptValue::Function(a), ScriptValue::Function(b)) =
-                (context.function_value(2).unwrap(), context.function_value(2).unwrap())
-            else {
+            let (ScriptValue::Function(a), ScriptValue::Function(b)) = (
+                context.function_value(2).unwrap(),
+                context.function_value(2).unwrap(),
+            ) else {
                 panic!("Not functions");
             };
             assert_eq!(a, b);
@@ -2323,7 +2331,10 @@ mod tests {
                 bms_to_qcvm(&ScriptValue::Function(a), &context).unwrap(),
                 FunctionIndex(2).to_value()
             );
-            assert!(matches!(context.function_value(0).unwrap(), ScriptValue::Unit));
+            assert!(matches!(
+                context.function_value(0).unwrap(),
+                ScriptValue::Unit
+            ));
             // Registered builtins are the registered function itself.
             let ScriptValue::Function(builtin) = context.function_value(3).unwrap() else {
                 panic!("Not a function");

@@ -7,21 +7,17 @@ readme = "README.md"
 
 authors.workspace = true
 license.workspace = true
-homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
 arc-slice = { workspace = true, features = ["default-layout-any-buffer"] }
 arrayvec.workspace = true
-bimap.workspace = true
-bitflags.workspace = true
 bump-scope.workspace = true
 byteorder.workspace = true
 hash32.workspace = true
 hashbrown.workspace = true
 glam.workspace = true
-indexmap.workspace = true
 itertools.workspace = true
 num.workspace = true
 num-traits.workspace = true

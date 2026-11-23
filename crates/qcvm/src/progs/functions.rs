@@ -7,6 +7,7 @@ use arrayvec::ArrayVec;
 #[cfg(feature = "reflect")]
 use bevy_reflect::Reflect;
 use bump_scope::{BumpAllocatorScopeExt, FixedBumpVec};
+use itertools::Itertools;
 use num::FromPrimitive as _;
 use num_derive::FromPrimitive;
 
@@ -267,14 +268,24 @@ impl QcFunctionDef {
     pub(crate) fn ctx<'scope>(
         &self,
         mut alloc: impl BumpAllocatorScopeExt<'scope>,
-        initial_locals: &[VmScalar],
+        initial_locals: impl IntoIterator<Item = VmScalar, IntoIter: ExactSizeIterator>,
     ) -> FunctionExecutionCtx<'scope> {
+        let local_range = self.frame_range();
+        let local_storage = FixedBumpVec::from_iter_exact_in(
+            initial_locals
+                .into_iter()
+                // Kinda janky but this is the shortest way to extend to `local_range.len()`
+                .zip_longest(std::iter::repeat_n((), local_range.len()))
+                .map(|either| {
+                    let left = either.left();
+                    left.unwrap_or_default()
+                }),
+            &mut alloc,
+        );
+
         FunctionExecutionCtx {
-            local_storage: FixedBumpVec::from_iter_exact_in(
-                initial_locals.iter().cloned(),
-                &mut alloc,
-            ),
-            local_range: self.frame_range(),
+            local_storage,
+            local_range,
             statements: self.body.statements.clone(),
             first_statement: usize::try_from(self.offset).unwrap_or_default(),
         }

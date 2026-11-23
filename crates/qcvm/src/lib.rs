@@ -2173,7 +2173,7 @@ where
 
         let result = alloc.scoped(move |alloc| {
             let mut new_memory = ExecutionMemory {
-                local: function.ctx(&alloc, initial_locals),
+                local: function.ctx(&alloc, initial_locals.iter().cloned()),
                 global: memory.global,
                 last_ret: None,
             };
