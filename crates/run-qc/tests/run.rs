@@ -220,11 +220,91 @@ fn function_globals() {
 }
 
 #[test]
+fn vector_args() {
+    assert_eq!(run_ok(None, &["vector_sum", "[1, 2, 3.5]"]), "6.5");
+    assert_eq!(run_ok(None, &["vector_arg", "[4, 5, 6]"]), "4");
+}
+
+#[test]
+fn string_args() {
+    assert_eq!(run_ok(None, &["string_identity", "hello"]), "hello");
+    assert_eq!(
+        run_ok(None, &["string_identity", "Hello, world!"]),
+        "Hello, world!"
+    );
+    // Explicit JSON strings, to pass strings that would otherwise be parsed as other types.
+    assert_eq!(run_ok(None, &["string_identity", r#""0""#]), "0");
+    assert_eq!(
+        run_ok(None, &["string_identity", r#""[1, 2, 3]""#]),
+        "[1, 2, 3]"
+    );
+    assert_eq!(run_ok(None, &["string_is_null", r#""0""#]), "0");
+    // Invalid JSON is a string.
+    assert_eq!(run_ok(None, &["string_identity", "[1, 2"]), "[1, 2");
+}
+
+#[test]
+fn null_args() {
+    assert_eq!(run_ok(None, &["string_is_null", "null"]), "1");
+    assert_eq!(run_ok(None, &["entity_is_null", "null"]), "1");
+    assert_eq!(run_ok(None, &["negate", "null"]), "0");
+}
+
+#[test]
+fn entity_args() {
+    assert_eq!(run_ok(None, &["entity_is_null", "{}"]), "0");
+    assert_eq!(run_ok(None, &["get_health", "{}"]), "0");
+    assert_eq!(run_ok(None, &["get_health", r#"{ "health": 50 }"#]), "50");
+    assert_eq!(
+        run_ok(None, &["origin_sum", r#"{ "origin": [1, 2, 3] }"#]),
+        "6"
+    );
+    assert_eq!(run_ok(None, &["origin_sum", r#"{ "origin_y": 5 }"#]), "5");
+    assert_eq!(
+        run_ok(None, &["get_netname", r#"{ "netname": "Ranger" }"#]),
+        "Ranger"
+    );
+    assert_eq!(
+        run_ok(None, &["owner_health", r#"{ "owner": { "health": 7 } }"#]),
+        "7"
+    );
+    assert_eq!(run_ok(None, &["heal", r#"{ "health": 50 }"#, "25"]), "75");
+
+    let offset = load_fixture()
+        .field_defs()
+        .iter()
+        .find(|def| def.name.to_bytes() == b"health")
+        .unwrap()
+        .offset;
+    assert_eq!(
+        run_ok(None, &["get_health", &format!(r#"{{ "{offset}": 12 }}"#)]),
+        "12"
+    );
+}
+
+#[test]
+fn entity_globals() {
+    assert_eq!(
+        run_ok(
+            Some(r#"{ "player": { "health": 99 } }"#),
+            &["player_health"]
+        ),
+        "99"
+    );
+}
+
+#[test]
 fn errors() {
     assert!(run_err(None, &["nope"]).contains("No function named `nope`"));
     assert!(run_err(None, &["print"]).contains("is a builtin"));
     assert!(run_err(None, &["call_builtin"]).contains("doesn't support builtins"));
-    assert!(run_err(None, &["vector_arg"]).contains("only float arguments are supported"));
+    assert!(run_err(None, &["vector_arg", "1"]).contains("is a vector, but `1` isn't"));
+    assert!(run_err(None, &["negate", "[1, 2, 3]"]).contains("is a scalar"));
+    assert!(
+        run_err(None, &["get_health", r#"{ "nope": 1 }"#]).contains("No entity field named `nope`")
+    );
+    assert!(run_err(None, &["get_health", r#"{ "health": "x" }"#]).contains("Expected a number"));
+    assert!(run_err(None, &["owner_health", r#"{ "owner": null }"#]).contains("null entity"));
     assert!(run_err(None, &["add_scaled", "1"]).contains("takes 2"));
     assert!(run_err(None, &[".callback", "1", "2"]).contains("null function"));
     assert!(run_err(None, &[".scale"]).contains("is not a function"));

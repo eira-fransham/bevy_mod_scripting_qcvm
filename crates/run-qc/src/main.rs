@@ -6,13 +6,20 @@
 //!
 //! See `run-qc --help` for the ways that functions and globals can be specified.
 
-use std::{ffi::CString, io::Cursor, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    ffi::{CStr, CString},
+    io::Cursor,
+    num::NonZeroU64,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::{Context as _, bail, format_err};
 use clap::Parser;
 use qcvm::{
-    BuiltinDef, EntityRef, EntityTypeDef, ErasedAddrInfo, ErasedDefs, Function, FunctionDef,
-    FunctionIndex, GlobalDef, QcVm, Type, Value, VmScalarType, VmType,
+    BuiltinDef, EntityRef, EntityTypeDef, ErasedAddrInfo, ErasedDefs, ErasedEntityHandle, FieldDef,
+    Function, FunctionDef, FunctionIndex, GlobalDef, QcVm, Type, Value, VmScalarType, VmType,
     userdata::{AddrError, ErasedContext, ErasedFunction},
 };
 
@@ -40,10 +47,18 @@ struct Args {
     /// (`.40`).
     function: String,
 
-    /// The arguments to pass to the function. Only floats are supported for now.
+    /// The arguments to pass to the function, each as JSON.
+    ///
+    /// Numbers (and bools) are floats, `[x, y, z]` is a vector, `null` is `void` (e.g. a null
+    /// entity or string), and an object is a new entity with the given fields, with the same system
+    /// for specifying keys as for globals, e.g. `{ "foo": 1, "40", "Hello" }` for the field named "foo"
+    /// and the field at offset 40, respectively. Anything that doesn't parse as JSON is interpreted
+    /// as a string. If you want to pass something that would be interpreted as JSON as a string
+    /// instead, wrap it in quotes to turn it into a JSON string, e.g. `run-qc foo.dat some_fn '"0"'`
+    /// to pass `"0"` as a string (it would otherwise be interpreted as a float).
     #[arg(allow_negative_numbers = true)]
     #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<f32>,
+    args: Vec<String>,
 }
 
 /// A function specified on the command line.
@@ -54,26 +69,26 @@ enum FuncSelector {
     /// `#4`
     Index(i32),
     /// `.main` or `.40`
-    Global(GlobalKey),
+    Global(DefKey),
 }
 
-/// A global specified by name or offset.
+/// A global or entity field specified by name or offset.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum GlobalKey {
+enum DefKey {
     Name(String),
     Offset(u16),
 }
 
-impl GlobalKey {
+impl DefKey {
     fn parse(s: &str) -> anyhow::Result<Self> {
         if s.is_empty() {
-            bail!("Empty global name");
+            bail!("Empty name");
         }
 
         Ok(match s.parse::<u16>() {
             Ok(offset) => Self::Offset(offset),
             Err(_) if s.starts_with(|c: char| c.is_ascii_digit()) => {
-                bail!("Invalid global offset `{s}`")
+                bail!("Invalid offset `{s}`")
             }
             Err(_) => Self::Name(s.to_owned()),
         })
@@ -88,7 +103,7 @@ impl FuncSelector {
                 .with_context(|| format!("Invalid function index `{s}`"))?;
             Ok(Self::Index(index))
         } else if let Some(global) = s.strip_prefix('.') {
-            Ok(Self::Global(GlobalKey::parse(global)?))
+            Ok(Self::Global(DefKey::parse(global)?))
         } else if s.is_empty() {
             bail!("Empty function name")
         } else {
@@ -133,10 +148,104 @@ impl ErasedDefs for NoDefs {
     }
 }
 
-/// A host that provides nothing: no builtins, entities or host globals.
-struct NoHost;
+/// The fields of an entity, by offset. Vector fields are stored as their three components.
+type EntityFields = HashMap<u16, Value>;
 
-impl ErasedContext for NoHost {
+/// A host that provides no builtins or host globals, and stores entities created from the
+/// command line.
+#[derive(Default)]
+struct Host {
+    /// Entity `n` has handle `n + 1`, as handle 0 is the null entity.
+    entities: Vec<EntityFields>,
+}
+
+impl Host {
+    /// Creates an entity with no fields set.
+    fn spawn(&mut self) -> ErasedEntityHandle {
+        self.entities.push(EntityFields::default());
+        NonZeroU64::new(self.entities.len() as u64).unwrap()
+    }
+
+    fn fields(&self, ent: EntityRef) -> anyhow::Result<&EntityFields> {
+        let ent = ent.ok_or_else(|| format_err!("Accessed a field of the null entity"))?;
+        self.entities
+            .get(ent.get() as usize - 1)
+            .ok_or_else(|| format_err!("Invalid entity {ent}"))
+    }
+
+    fn fields_mut(&mut self, ent: EntityRef) -> anyhow::Result<&mut EntityFields> {
+        let ent = ent.ok_or_else(|| format_err!("Accessed a field of the null entity"))?;
+        self.entities
+            .get_mut(ent.get() as usize - 1)
+            .ok_or_else(|| format_err!("Invalid entity {ent}"))
+    }
+
+    /// Reads a single scalar of an entity, which is zero if it hasn't been set.
+    fn get_scalar(
+        fields: &EntityFields,
+        offset: u16,
+        entity_def: &EntityTypeDef,
+    ) -> Result<Value, AddrError<anyhow::Error>> {
+        let def = entity_def.get(offset).ok_or(AddrError::OutOfRange)?;
+        Ok(fields
+            .get(&offset)
+            .cloned()
+            .unwrap_or_else(|| Value::zero(Type::try_from(def.type_).unwrap_or(Type::Void))))
+    }
+
+    fn entity_get(
+        &self,
+        ent: EntityRef,
+        offset: u16,
+        ty: Type,
+        entity_def: &EntityTypeDef,
+    ) -> Result<Value, AddrError<anyhow::Error>> {
+        let fields = self.fields(ent)?;
+
+        if ty != Type::Vector {
+            return Self::get_scalar(fields, offset, entity_def);
+        }
+
+        let mut components = [0.; 3];
+        for (i, component) in components.iter_mut().enumerate() {
+            let value = Self::get_scalar(fields, offset + i as u16, entity_def)?;
+            *component = value
+                .or_zero(Type::Float)
+                .try_into()
+                .map_err(|e: anyhow::Error| e.context(format!("Field {offset} isn't a vector")))?;
+        }
+
+        Ok(Value::Vector(components.into()))
+    }
+
+    fn entity_set(
+        &mut self,
+        ent: EntityRef,
+        offset: u16,
+        value: Value,
+        entity_def: &EntityTypeDef,
+    ) -> Result<(), AddrError<anyhow::Error>> {
+        let scalars = match value {
+            Value::Vector(vec) => vec.to_array().map(Value::Float).to_vec(),
+            value => vec![value],
+        };
+
+        let fields = self.fields_mut(ent)?;
+        for (i, value) in scalars.into_iter().enumerate() {
+            let offset = offset + i as u16;
+            entity_def.get(offset).ok_or(AddrError::OutOfRange)?;
+            match value {
+                // `void` is the zero value of whatever it is stored into.
+                Value::Void => fields.remove(&offset),
+                value => fields.insert(offset, value),
+            };
+        }
+
+        Ok(())
+    }
+}
+
+impl ErasedContext for Host {
     fn dyn_builtin(&self, def: &BuiltinDef) -> anyhow::Result<Arc<dyn ErasedFunction>> {
         let name = def.name.to_string_lossy();
         match def.builtin_number() {
@@ -149,22 +258,22 @@ impl ErasedContext for NoHost {
 
     fn dyn_entity_get(
         &self,
-        _erased_ent: EntityRef,
-        _field: u16,
-        _ty: Type,
-        _entity_def: &EntityTypeDef,
+        erased_ent: EntityRef,
+        field: u16,
+        ty: Type,
+        entity_def: &EntityTypeDef,
     ) -> anyhow::Result<Value, AddrError<anyhow::Error>> {
-        Err(format_err!("run-qc doesn't support entities").into())
+        self.entity_get(erased_ent, field, ty, entity_def)
     }
 
     fn dyn_entity_set(
         &mut self,
-        _erased_ent: EntityRef,
-        _field: u16,
-        _value: Value,
-        _entity_def: &EntityTypeDef,
+        erased_ent: EntityRef,
+        field: u16,
+        value: Value,
+        entity_def: &EntityTypeDef,
     ) -> anyhow::Result<(), AddrError<anyhow::Error>> {
-        Err(format_err!("run-qc doesn't support entities").into())
+        self.entity_set(erased_ent, field, value, entity_def)
     }
 
     fn dyn_global(&self, _def: u16, _ty: Type) -> Result<Value, AddrError<anyhow::Error>> {
@@ -188,48 +297,95 @@ fn read_crc(bytes: &[u8]) -> anyhow::Result<i32> {
     Ok(i32::from_le_bytes(crc.try_into().unwrap()))
 }
 
-/// Whether a def is typed, i.e. tells us how to interpret the global.
-fn is_typed(def: &GlobalDef) -> bool {
-    def.type_ != VmType::Scalar(VmScalarType::Void)
+/// A global or entity field definition.
+trait Def {
+    fn type_(&self) -> VmType;
+    fn offset(&self) -> u16;
+    fn name(&self) -> &CStr;
+
+    /// Whether the def is typed, i.e. tells us how to interpret the value.
+    fn is_typed(&self) -> bool {
+        self.type_() != VmType::Scalar(VmScalarType::Void)
+    }
 }
 
-/// Finds the offset and (if known) the definition of a global. If several defs have the same
-/// offset (e.g. a vector and its `_x` component), `prefer_vector` chooses between them.
+impl Def for GlobalDef {
+    fn type_(&self) -> VmType {
+        self.type_
+    }
+
+    fn offset(&self) -> u16 {
+        self.offset
+    }
+
+    fn name(&self) -> &CStr {
+        &self.name
+    }
+}
+
+impl Def for FieldDef {
+    fn type_(&self) -> VmType {
+        self.type_
+    }
+
+    fn offset(&self) -> u16 {
+        self.offset
+    }
+
+    fn name(&self) -> &CStr {
+        &self.name
+    }
+}
+
+/// Finds the definition matching `key`. If several defs match (e.g. a vector and its `_x`
+/// component share an offset), `prefer_vector` chooses between them.
+fn find_def<'a, D: Def>(defs: &'a [D], key: &DefKey, prefer_vector: bool) -> Option<&'a D> {
+    let matching = || {
+        defs.iter().filter(move |def| match key {
+            DefKey::Offset(offset) => def.offset() == *offset,
+            DefKey::Name(name) => def.name().to_bytes() == name.as_bytes(),
+        })
+    };
+    let typed = || matching().filter(|def| def.is_typed());
+
+    typed()
+        .find(|def| (def.type_() == VmType::Vector) == prefer_vector)
+        .or_else(|| typed().next())
+        .or_else(|| matching().next())
+}
+
+/// Finds the offset and (if known) the definition of a global (see [`find_def`]).
 fn resolve_global<'a>(
     vm: &'a QcVm,
-    key: &GlobalKey,
+    key: &DefKey,
     prefer_vector: bool,
 ) -> anyhow::Result<(u16, Option<&'a GlobalDef>)> {
-    let pick = |defs: Vec<&'a GlobalDef>| {
-        let typed = || defs.iter().copied().filter(|def| is_typed(def));
-        typed()
-            .find(|def| (def.type_ == VmType::Vector) == prefer_vector)
-            .or_else(|| typed().next())
-            .or_else(|| defs.first().copied())
-    };
+    let def = find_def(vm.global_defs(), key, prefer_vector);
 
     match key {
-        GlobalKey::Offset(offset) => {
-            let defs = vm
-                .global_defs()
-                .iter()
-                .filter(|def| def.offset == *offset)
-                .collect();
+        DefKey::Offset(offset) => {
             // Check that the offset exists, as `set_global` can't tell us which global was wrong.
             vm.global(*offset)
                 .with_context(|| format!("No global at offset {offset}"))?;
-            Ok((*offset, pick(defs)))
+            Ok((*offset, def))
         }
-        GlobalKey::Name(name) => {
-            let defs = vm
-                .global_defs()
-                .iter()
-                .filter(|def| def.name.to_bytes() == name.as_bytes())
-                .collect();
-            let def = pick(defs).ok_or_else(|| format_err!("No global named `{name}`"))?;
+        DefKey::Name(name) => {
+            let def = def.ok_or_else(|| format_err!("No global named `{name}`"))?;
             Ok((def.offset, Some(def)))
         }
     }
+}
+
+/// Finds the definition of an entity field (see [`find_def`]).
+fn resolve_field<'a>(
+    vm: &'a QcVm,
+    key: &DefKey,
+    prefer_vector: bool,
+) -> anyhow::Result<&'a FieldDef> {
+    find_def(vm.field_defs(), key, prefer_vector).ok_or_else(|| match key {
+        DefKey::Offset(offset) => format_err!("No entity field at offset {offset}"),
+        DefKey::Name(name) => format_err!("No entity field named `{name}`"),
+    })
 }
 
 /// Finds a function by name or index (but not via a global).
@@ -259,7 +415,7 @@ fn resolve_function<'a>(vm: &'a QcVm, selector: &FuncSelector) -> anyhow::Result
     };
 
     let (offset, def) = resolve_global(vm, key, false)?;
-    if let Some(def) = def.filter(|def| is_typed(def))
+    if let Some(def) = def.filter(|def| def.is_typed())
         && def.type_ != VmType::Scalar(VmScalarType::Function)
     {
         bail!("Global {def} is not a function");
@@ -334,28 +490,78 @@ fn json_to_string(json: &serde_json::Value) -> anyhow::Result<Value> {
     }
 }
 
-/// Converts a JSON value to a value for a global of type `ty`, or a type inferred from the JSON if
-/// the global is untyped.
-fn json_to_value(vm: &QcVm, ty: Option<VmType>, json: &serde_json::Value) -> anyhow::Result<Value> {
+/// Creates an entity with the fields specified by the JSON object `fields`.
+fn json_to_entity(
+    vm: &QcVm,
+    host: &mut Host,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<Value> {
+    let ent = host.spawn();
+
+    for (key, json) in fields {
+        (|| {
+            let def = resolve_field(vm, &DefKey::parse(key)?, json.is_array())?;
+            let value = json_to_value(vm, host, Some(def.type_), json)?;
+            host.entity_set(Some(ent), def.offset, value, vm.entity_def())
+                .map_err(|e| match e {
+                    AddrError::OutOfRange => format_err!("Field {} is out of range", def.offset),
+                    AddrError::Other { error } => error,
+                })
+        })()
+        .with_context(|| format!("Couldn't set entity field `{key}`"))?;
+    }
+
+    Ok(Value::Entity(Some(ent)))
+}
+
+/// Converts a JSON value to a value of type `ty`, or a type inferred from the JSON if `ty` is
+/// unknown or untyped.
+///
+/// `null` is the zero value of `ty`, or `void` if the type isn't known.
+fn json_to_value(
+    vm: &QcVm,
+    host: &mut Host,
+    ty: Option<VmType>,
+    json: &serde_json::Value,
+) -> anyhow::Result<Value> {
     use serde_json::Value as Json;
+
+    let ty = ty.filter(|ty| *ty != VmType::Scalar(VmScalarType::Void));
+
+    if json.is_null() {
+        return match ty {
+            Some(ty) => Ok(Value::zero(Type::try_from(ty)?)),
+            None => Ok(Value::Void),
+        };
+    }
 
     match ty {
         Some(VmType::Vector) => json_to_vector(json),
         Some(VmType::Scalar(VmScalarType::Float)) => json_to_float(json).map(Value::Float),
         Some(VmType::Scalar(VmScalarType::String)) => json_to_string(json),
         Some(VmType::Scalar(VmScalarType::Function)) => json_to_function(vm, json),
-        Some(VmType::Scalar(VmScalarType::Void)) | None => match json {
+        Some(VmType::Scalar(VmScalarType::Entity)) => match json {
+            Json::Object(fields) => json_to_entity(vm, host, fields),
+            other => bail!("Expected an entity (a JSON object), found {other}"),
+        },
+        Some(other) => bail!("Values of type {other} aren't supported yet"),
+        None => match json {
+            Json::Null => Ok(Value::Void),
             Json::Number(_) | Json::Bool(_) => json_to_float(json).map(Value::Float),
             Json::Array(_) => json_to_vector(json),
             Json::String(_) => json_to_string(json),
-            other => bail!("Can't infer a type for {other}"),
+            Json::Object(fields) => json_to_entity(vm, host, fields),
         },
-        Some(other) => bail!("Globals of type {other} aren't supported yet"),
     }
 }
 
+/// Parses a command-line argument as JSON, or as a string if it isn't valid JSON.
+fn parse_arg(arg: &str) -> serde_json::Value {
+    serde_json::from_str(arg).unwrap_or_else(|_| serde_json::Value::String(arg.to_owned()))
+}
+
 /// Sets the globals specified by the JSON object `json`.
-fn apply_globals(vm: &QcVm, json: &str) -> anyhow::Result<()> {
+fn apply_globals(vm: &QcVm, host: &mut Host, json: &str) -> anyhow::Result<()> {
     let json: serde_json::Value = serde_json::from_str(json).context("Invalid globals JSON")?;
     let serde_json::Value::Object(globals) = json else {
         bail!("Globals must be a JSON object, found {json}");
@@ -363,9 +569,9 @@ fn apply_globals(vm: &QcVm, json: &str) -> anyhow::Result<()> {
 
     for (key, json) in &globals {
         (|| {
-            let key = GlobalKey::parse(key)?;
+            let key = DefKey::parse(key)?;
             let (offset, def) = resolve_global(vm, &key, json.is_array())?;
-            let value = json_to_value(vm, def.map(|def| def.type_), json)?;
+            let value = json_to_value(vm, host, def.map(|def| def.type_), json)?;
             vm.set_global(offset, value)
         })()
         .with_context(|| format!("Couldn't set global `{key}`"))?;
@@ -397,8 +603,10 @@ fn main() -> anyhow::Result<()> {
     let vm = QcVm::load_with_defs(Cursor::new(bytes), &defs, Default::default())
         .with_context(|| format!("Couldn't load {}", args.progs.display()))?;
 
+    let mut host = Host::default();
+
     if let Some(globals) = &args.globals {
-        apply_globals(&vm, globals)?;
+        apply_globals(&vm, &mut host, globals)?;
     }
 
     let selector = FuncSelector::parse(&args.function)?;
@@ -409,25 +617,27 @@ fn main() -> anyhow::Result<()> {
         bail!("`{name}` is a builtin, which run-qc doesn't support");
     }
 
-    if let Some(i) = function
-        .args
-        .iter()
-        .position(|ty| !matches!(ty, Type::Float | Type::AnyScalar))
-    {
-        let invalid_type = function.args[i];
+    let mut params = Vec::with_capacity(args.args.len());
+    for (i, arg) in args.args.iter().enumerate() {
+        let value = json_to_value(&vm, &mut host, None, &parse_arg(arg))
+            .with_context(|| format!("Invalid argument {i} (`{arg}`)"))?;
 
-        bail!(
-            "Argument {i} of `{name}` is {invalid_type}, but only float arguments are supported for now"
-        );
+        // Only the size of parameters is known, so this is the only check we can do.
+        match (function.args.get(i), &value) {
+            (Some(Type::Vector), Value::Vector(_) | Value::Void) => {}
+            (Some(Type::Vector), _) => {
+                bail!("Argument {i} of `{name}` is a vector, but `{arg}` isn't")
+            }
+            (Some(_), Value::Vector(_)) => {
+                bail!("Argument {i} of `{name}` is a scalar, but `{arg}` is a vector")
+            }
+            _ => {}
+        }
+
+        params.push(value);
     }
 
-    let params = args
-        .args
-        .iter()
-        .copied()
-        .map(Value::Float)
-        .collect::<Vec<_>>();
-    let ret = vm.run(&mut NoHost, function.index, params)?;
+    let ret = vm.run(&mut host, function.index, params)?;
 
     println!("{}", format_value(&ret.scalar()?));
 
@@ -447,11 +657,11 @@ mod tests {
         assert_eq!(FuncSelector::parse("#4").unwrap(), FuncSelector::Index(4));
         assert_eq!(
             FuncSelector::parse(".main").unwrap(),
-            FuncSelector::Global(GlobalKey::Name("main".into()))
+            FuncSelector::Global(DefKey::Name("main".into()))
         );
         assert_eq!(
             FuncSelector::parse(".40").unwrap(),
-            FuncSelector::Global(GlobalKey::Offset(40))
+            FuncSelector::Global(DefKey::Offset(40))
         );
         assert!(FuncSelector::parse("#").is_err());
         assert!(FuncSelector::parse("#foo").is_err());
@@ -462,12 +672,9 @@ mod tests {
 
     #[test]
     fn parse_global_keys() {
-        assert_eq!(GlobalKey::parse("4").unwrap(), GlobalKey::Offset(4));
-        assert_eq!(
-            GlobalKey::parse("foo").unwrap(),
-            GlobalKey::Name("foo".into())
-        );
-        assert!(GlobalKey::parse("99999").is_err());
+        assert_eq!(DefKey::parse("4").unwrap(), DefKey::Offset(4));
+        assert_eq!(DefKey::parse("foo").unwrap(), DefKey::Name("foo".into()));
+        assert!(DefKey::parse("99999").is_err());
     }
 
     #[test]
@@ -476,6 +683,20 @@ mod tests {
         header.extend(1234i32.to_le_bytes());
         assert_eq!(read_crc(&header).unwrap(), 1234);
         assert!(read_crc(&header[..6]).is_err());
+    }
+
+    #[test]
+    fn parse_args() {
+        use serde_json::json;
+
+        assert_eq!(parse_arg("1"), json!(1));
+        assert_eq!(parse_arg("-1.5"), json!(-1.5));
+        assert_eq!(parse_arg("[1, 2, 3]"), json!([1, 2, 3]));
+        assert_eq!(parse_arg("null"), json!(null));
+        assert_eq!(parse_arg(r#"{ "health": 1 }"#), json!({ "health": 1 }));
+        assert_eq!(parse_arg(r#""0""#), json!("0"));
+        assert_eq!(parse_arg("hello"), json!("hello"));
+        assert_eq!(parse_arg("[1, 2"), json!("[1, 2"));
     }
 
     #[test]
