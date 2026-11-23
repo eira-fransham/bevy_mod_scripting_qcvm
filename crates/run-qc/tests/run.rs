@@ -41,9 +41,12 @@ fn run_qc(globals: Option<&str>, args: &[&str]) -> Output {
     if let Some(globals) = globals {
         command.args(["--globals", globals]);
     }
+    // Leading flags (e.g. `--print-globals`) go before the positional arguments.
+    let flags = args.iter().take_while(|arg| arg.starts_with("--")).count();
     command
+        .args(&args[..flags])
         .arg(fixture("test.dat"))
-        .args(args)
+        .args(&args[flags..])
         .output()
         .expect("Couldn't run run-qc")
 }
@@ -128,30 +131,30 @@ fn bytecode_is_fresh() {
 
 #[test]
 fn call_by_name() {
-    assert_eq!(run_ok(None, &["add_scaled", "1", "2"]), "3");
+    assert_eq!(run_ok(None, &["add_scaled", "1", "2"]), "3.0");
     assert_eq!(run_ok(None, &["sum3", "1", "2", "-3.5"]), "-0.5");
-    assert_eq!(run_ok(None, &["negate", "-4"]), "4");
+    assert_eq!(run_ok(None, &["negate", "-4"]), "4.0");
 }
 
 #[test]
 fn call_by_index() {
     let index = function_index("sum3");
-    assert_eq!(run_ok(None, &[&format!("#{index}"), "1", "2", "3"]), "6");
+    assert_eq!(run_ok(None, &[&format!("#{index}"), "1", "2", "3"]), "6.0");
 }
 
 #[test]
 fn call_via_global() {
-    assert_eq!(run_ok(None, &[".main", "1", "2"]), "3");
+    assert_eq!(run_ok(None, &[".main", "1", "2"]), "3.0");
 
     let offset = global_offset("main");
-    assert_eq!(run_ok(None, &[&format!(".{offset}"), "1", "2"]), "3");
+    assert_eq!(run_ok(None, &[&format!(".{offset}"), "1", "2"]), "3.0");
 }
 
 #[test]
 fn float_globals() {
     assert_eq!(
         run_ok(Some(r#"{ "scale": 2 }"#), &["add_scaled", "1", "2"]),
-        "6"
+        "6.0"
     );
 
     let offset = global_offset("scale");
@@ -160,7 +163,7 @@ fn float_globals() {
             Some(&format!(r#"{{ "{offset}": 3 }}"#)),
             &["add_scaled", "1", "2"]
         ),
-        "9"
+        "9.0"
     );
 }
 
@@ -177,7 +180,7 @@ fn vector_globals() {
             Some(&format!(r#"{{ "{offset}": [1, 1, 1] }}"#)),
             &["offset_sum"]
         ),
-        "3"
+        "3.0"
     );
 }
 
@@ -188,7 +191,7 @@ fn string_globals() {
             Some(r#"{ "greeting": "Hello, world!" }"#),
             &["get_greeting"]
         ),
-        "Hello, world!"
+        r#""Hello, world!""#
     );
 }
 
@@ -199,7 +202,7 @@ fn function_globals() {
             Some(r#"{ "callback": "add_scaled" }"#),
             &["call_callback", "1", "2"]
         ),
-        "3"
+        "3.0"
     );
 
     let index = function_index("negate");
@@ -208,67 +211,67 @@ fn function_globals() {
             Some(&format!(r##"{{ "callback": "#{index}" }}"##)),
             &["call_callback", "5", "0"]
         ),
-        "-5"
+        "-5.0"
     );
     assert_eq!(
         run_ok(
             Some(&format!(r#"{{ "main": {index} }}"#)),
             &[".main", "5", "0"]
         ),
-        "-5"
+        "-5.0"
     );
 }
 
 #[test]
 fn vector_args() {
     assert_eq!(run_ok(None, &["vector_sum", "[1, 2, 3.5]"]), "6.5");
-    assert_eq!(run_ok(None, &["vector_arg", "[4, 5, 6]"]), "4");
+    assert_eq!(run_ok(None, &["vector_arg", "[4, 5, 6]"]), "4.0");
 }
 
 #[test]
 fn string_args() {
-    assert_eq!(run_ok(None, &["string_identity", "hello"]), "hello");
+    assert_eq!(run_ok(None, &["string_identity", "hello"]), r#""hello""#);
     assert_eq!(
         run_ok(None, &["string_identity", "Hello, world!"]),
-        "Hello, world!"
+        r#""Hello, world!""#
     );
     // Explicit JSON strings, to pass strings that would otherwise be parsed as other types.
-    assert_eq!(run_ok(None, &["string_identity", r#""0""#]), "0");
+    assert_eq!(run_ok(None, &["string_identity", r#""0""#]), r#""0""#);
     assert_eq!(
         run_ok(None, &["string_identity", r#""[1, 2, 3]""#]),
-        "[1, 2, 3]"
+        r#""[1, 2, 3]""#
     );
-    assert_eq!(run_ok(None, &["string_is_null", r#""0""#]), "0");
+    assert_eq!(run_ok(None, &["string_is_null", r#""0""#]), "0.0");
     // Invalid JSON is a string.
-    assert_eq!(run_ok(None, &["string_identity", "[1, 2"]), "[1, 2");
+    assert_eq!(run_ok(None, &["string_identity", "[1, 2"]), r#""[1, 2""#);
 }
 
 #[test]
 fn null_args() {
-    assert_eq!(run_ok(None, &["string_is_null", "null"]), "1");
-    assert_eq!(run_ok(None, &["entity_is_null", "null"]), "1");
-    assert_eq!(run_ok(None, &["negate", "null"]), "0");
+    assert_eq!(run_ok(None, &["string_is_null", "null"]), "1.0");
+    assert_eq!(run_ok(None, &["entity_is_null", "null"]), "1.0");
+    assert_eq!(run_ok(None, &["negate", "null"]), "0.0");
 }
 
 #[test]
 fn entity_args() {
-    assert_eq!(run_ok(None, &["entity_is_null", "{}"]), "0");
-    assert_eq!(run_ok(None, &["get_health", "{}"]), "0");
-    assert_eq!(run_ok(None, &["get_health", r#"{ "health": 50 }"#]), "50");
+    assert_eq!(run_ok(None, &["entity_is_null", "{}"]), "0.0");
+    assert_eq!(run_ok(None, &["get_health", "{}"]), "0.0");
+    assert_eq!(run_ok(None, &["get_health", r#"{ "health": 50 }"#]), "50.0");
     assert_eq!(
         run_ok(None, &["origin_sum", r#"{ "origin": [1, 2, 3] }"#]),
-        "6"
+        "6.0"
     );
-    assert_eq!(run_ok(None, &["origin_sum", r#"{ "origin_y": 5 }"#]), "5");
+    assert_eq!(run_ok(None, &["origin_sum", r#"{ "origin_y": 5 }"#]), "5.0");
     assert_eq!(
         run_ok(None, &["get_netname", r#"{ "netname": "Ranger" }"#]),
-        "Ranger"
+        r#""Ranger""#
     );
     assert_eq!(
         run_ok(None, &["owner_health", r#"{ "owner": { "health": 7 } }"#]),
-        "7"
+        "7.0"
     );
-    assert_eq!(run_ok(None, &["heal", r#"{ "health": 50 }"#, "25"]), "75");
+    assert_eq!(run_ok(None, &["heal", r#"{ "health": 50 }"#, "25"]), "75.0");
 
     let offset = load_fixture()
         .field_defs()
@@ -278,7 +281,7 @@ fn entity_args() {
         .offset;
     assert_eq!(
         run_ok(None, &["get_health", &format!(r#"{{ "{offset}": 12 }}"#)]),
-        "12"
+        "12.0"
     );
 }
 
@@ -289,8 +292,66 @@ fn entity_globals() {
             Some(r#"{ "player": { "health": 99 } }"#),
             &["player_health"]
         ),
-        "99"
+        "99.0"
     );
+}
+
+#[test]
+fn entity_output() {
+    assert_eq!(run_ok(None, &["entity_identity", "null"]), "null");
+    assert_eq!(run_ok(None, &["entity_identity", "{}"]), "{}");
+    // Fields are in offset order, and vector components are printed as the whole vector.
+    assert_eq!(
+        run_ok(
+            None,
+            &[
+                "entity_identity",
+                r#"{ "owner": { "netname": "Ranger" }, "origin_y": 2, "health": 5 }"#
+            ]
+        ),
+        r#"{"health":5.0,"origin":[0.0,2.0,0.0],"owner":{"netname":"Ranger"}}"#
+    );
+    // `null` sets a field to its zero value, which still counts as set.
+    assert_eq!(
+        run_ok(None, &["entity_identity", r#"{ "health": null }"#]),
+        r#"{"health":0.0}"#
+    );
+    assert!(run_err(None, &["make_cycle", "{}"]).contains("refers to itself"));
+}
+
+#[test]
+fn void_output() {
+    assert_eq!(run_ok(None, &["null_function"]), "null");
+}
+
+#[test]
+fn print_globals() {
+    let output = run_ok(
+        Some(r#"{ "player": { "health": 99 }, "greeting": "hi", "callback": "negate" }"#),
+        &["--print-globals", "hurt_player"],
+    );
+    let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+    assert_eq!(
+        output,
+        serde_json::json!({
+            "globals": {
+                "scale": 1.0,
+                "offset": [0.0, 0.0, 0.0],
+                "greeting": "hi",
+                "print": "print",
+                "main": "add_scaled",
+                "callback": "negate",
+                "player": { "health": 89.0 },
+            },
+            "return": null,
+        })
+    );
+
+    let output = run_ok(None, &["--print-globals", "negate", "2"]);
+    let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(output["return"], serde_json::json!(-2.0));
+    assert_eq!(output["globals"]["player"], serde_json::Value::Null);
 }
 
 #[test]

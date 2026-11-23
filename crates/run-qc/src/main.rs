@@ -39,6 +39,13 @@ struct Args {
     #[arg(long, short)]
     globals: Option<String>,
 
+    /// Print the globals after running the function, as `{ "globals": ..., "return": ... }`.
+    ///
+    /// Globals are keyed by name, or by offset if they have no name or their name is ambiguous.
+    /// Locals and immediates are left out.
+    #[arg(long)]
+    print_globals: bool,
+
     /// The compiled QuakeC bytecode.
     progs: PathBuf,
 
@@ -306,6 +313,12 @@ trait Def {
     /// Whether the def is typed, i.e. tells us how to interpret the value.
     fn is_typed(&self) -> bool {
         self.type_() != VmType::Scalar(VmScalarType::Void)
+    }
+
+    fn same_as(&self, other: &Self) -> bool {
+        self.offset() == other.offset()
+            && self.type_() == other.type_()
+            && self.name() == other.name()
     }
 }
 
@@ -580,16 +593,190 @@ fn apply_globals(vm: &QcVm, host: &mut Host, json: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Formats a value returned from QuakeC.
-fn format_value(value: &Value) -> String {
-    match value {
-        Value::Void => "void".to_owned(),
-        Value::Float(f) => f.to_string(),
-        Value::Vector(v) => format!("'{} {} {}'", v.x, v.y, v.z),
-        Value::String(s) => s.to_string_lossy().into_owned(),
-        Value::Function(Function::Index(FunctionIndex(index))) => format!("#{index}"),
-        other => format!("{other:?}"),
+/// The JSON key for `def`, following the same rules as parsing keys: its name if that refers back
+/// to `def`, and otherwise its offset.
+fn def_key<D: Def>(defs: &[D], def: &D) -> String {
+    let name = def.name().to_string_lossy();
+    let resolves_to_def = matches!(DefKey::parse(&name), Ok(DefKey::Name(_)))
+        && find_def(
+            defs,
+            &DefKey::Name(name.clone().into_owned()),
+            def.type_() == VmType::Vector,
+        )
+        .is_some_and(|found| found.same_as(def));
+
+    if resolves_to_def {
+        name.into_owned()
+    } else {
+        def.offset().to_string()
     }
+}
+
+/// Converts a float to JSON, using the shortest representation that round-trips as an `f32`.
+/// JSON has no NaN or infinity, so those are strings (e.g. `"NaN"`, `"inf"`).
+fn float_to_json(f: f32) -> serde_json::Value {
+    f.to_string()
+        .parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+        .map(serde_json::Value::Number)
+        .unwrap_or_else(|| serde_json::Value::String(f.to_string()))
+}
+
+/// Converts the fields of an entity to a JSON object, in the same format as entity arguments.
+///
+/// Only fields that have been set are included, as the rest are zero. `stack` is the entities
+/// currently being converted, to detect cycles.
+fn entity_to_json(
+    vm: &QcVm,
+    host: &Host,
+    ent: ErasedEntityHandle,
+    stack: &mut Vec<ErasedEntityHandle>,
+) -> anyhow::Result<serde_json::Value> {
+    if stack.contains(&ent) {
+        bail!("Entity {ent} (indirectly) refers to itself, which can't be printed yet");
+    }
+
+    let entity_def = vm.entity_def();
+    let fields = host.fields(Some(ent))?;
+
+    // The whole fields (rather than vector components) that have been set, in offset order.
+    let mut defs = fields
+        .keys()
+        .filter_map(|offset| entity_def.get(*offset))
+        .map(|scalar| &scalar.def)
+        .collect::<Vec<_>>();
+    defs.sort_by_key(|def| def.offset);
+    defs.dedup_by(|a, b| a.same_as(b));
+
+    stack.push(ent);
+    let mut out = serde_json::Map::new();
+    for def in defs {
+        let ty = match def.type_ {
+            VmType::Vector => Type::Vector,
+            _ => Type::AnyScalar,
+        };
+        let value = host
+            .entity_get(Some(ent), def.offset, ty, entity_def)
+            .map_err(|e| match e {
+                AddrError::OutOfRange => format_err!("Field {} is out of range", def.offset),
+                AddrError::Other { error } => error,
+            })?;
+        let json = value_to_json(vm, host, &value, stack)
+            .with_context(|| format!("Couldn't print field {def}"))?;
+        out.insert(def_key(vm.field_defs(), def), json);
+    }
+    stack.pop();
+
+    Ok(serde_json::Value::Object(out))
+}
+
+/// Converts a value to JSON, in the same format as arguments and globals are given in.
+fn value_to_json(
+    vm: &QcVm,
+    host: &Host,
+    value: &Value,
+    stack: &mut Vec<ErasedEntityHandle>,
+) -> anyhow::Result<serde_json::Value> {
+    use serde_json::Value as Json;
+
+    Ok(match value {
+        Value::Void | Value::Entity(None) => Json::Null,
+        Value::Float(f) => float_to_json(*f),
+        Value::Vector(v) => Json::Array(v.to_array().map(float_to_json).into()),
+        Value::String(s) => Json::String(s.to_string_lossy().into_owned()),
+        Value::Entity(Some(ent)) => entity_to_json(vm, host, *ent, stack)?,
+        Value::Function(Function::Index(FunctionIndex(0))) => Json::Null,
+        Value::Function(Function::Index(FunctionIndex(index))) => {
+            // Use the name if it refers back to this function, like `json_to_function` accepts.
+            let name = vm
+                .functions()
+                .get_by_index(*index)
+                .ok()
+                .map(|def| def.name.clone())
+                .filter(|name| {
+                    !name.is_empty()
+                        && vm
+                            .functions()
+                            .get_by_name(name)
+                            .is_ok_and(|def| def.index == *index)
+                });
+            match name {
+                Some(name) => Json::String(name.to_string_lossy().into_owned()),
+                None => Json::String(format!("#{index}")),
+            }
+        }
+        Value::Function(Function::Host(_)) => bail!("Host functions can't be printed"),
+        Value::Field(_) => bail!("Field references can't be printed yet"),
+    })
+}
+
+/// The globals to print with `--print-globals`, and their keys.
+///
+/// This leaves out locals (which are stored per call, so their global slots are meaningless),
+/// immediates, field definitions, vector components and untyped slots.
+fn printed_globals(vm: &QcVm) -> Vec<(String, &GlobalDef)> {
+    let locals = vm
+        .functions()
+        .iter()
+        .filter_map(|def| {
+            let body = def.body.clone().try_into_qc().ok()?;
+            let args_size: usize = def
+                .args
+                .iter()
+                .map(|ty| if *ty == Type::Vector { 3 } else { 1 })
+                .sum();
+            Some(body.locals.start..body.locals.end.max(body.locals.start + args_size))
+        })
+        .collect::<Vec<_>>();
+    let vector_components = vm
+        .global_defs()
+        .iter()
+        .filter(|def| def.type_ == VmType::Vector)
+        .flat_map(|def| [def.offset + 1, def.offset + 2])
+        .collect::<Vec<_>>();
+
+    vm.global_defs()
+        .iter()
+        .filter(|def| {
+            def.is_typed()
+                && !matches!(
+                    def.type_,
+                    VmType::Scalar(
+                        VmScalarType::FieldRef
+                            | VmScalarType::GlobalRef
+                            | VmScalarType::EntityFieldRef
+                    )
+                )
+                && def.name.to_bytes() != b"IMMEDIATE"
+                && !vector_components.contains(&def.offset)
+                && !locals
+                    .iter()
+                    .any(|range| range.contains(&usize::from(def.offset)))
+        })
+        // A vector shares its offset with its `_x` component.
+        .filter(|def| {
+            find_def(vm.global_defs(), &DefKey::Offset(def.offset), true)
+                .is_some_and(|found| found.same_as(def))
+        })
+        .map(|def| (def_key(vm.global_defs(), def), def))
+        .collect()
+}
+
+/// Converts the globals to JSON for `--print-globals`.
+fn globals_to_json(vm: &QcVm, host: &Host) -> anyhow::Result<serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (key, def) in printed_globals(vm) {
+        let value = match def.type_ {
+            VmType::Vector => Value::Vector(vm.global_vector(def.offset)?),
+            _ => vm.global(def.offset)?,
+        };
+        let json = value_to_json(vm, host, &value, &mut Vec::new())
+            .with_context(|| format!("Couldn't print global {def}"))?;
+        out.insert(key, json);
+    }
+
+    Ok(serde_json::Value::Object(out))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -639,7 +826,18 @@ fn main() -> anyhow::Result<()> {
 
     let ret = vm.run(&mut host, function.index, params)?;
 
-    println!("{}", format_value(&ret.scalar()?));
+    let ret = value_to_json(&vm, &host, &ret.scalar()?, &mut Vec::new())
+        .context("Couldn't print the return value")?;
+
+    if args.print_globals {
+        let globals = globals_to_json(&vm, &host)?;
+        println!(
+            "{}",
+            serde_json::json!({ "globals": globals, "return": ret })
+        );
+    } else {
+        println!("{ret}");
+    }
 
     Ok(())
 }
@@ -697,6 +895,17 @@ mod tests {
         assert_eq!(parse_arg(r#""0""#), json!("0"));
         assert_eq!(parse_arg("hello"), json!("hello"));
         assert_eq!(parse_arg("[1, 2"), json!("[1, 2"));
+    }
+
+    #[test]
+    fn float_output() {
+        use serde_json::json;
+
+        assert_eq!(float_to_json(1.), json!(1.0));
+        assert_eq!(float_to_json(0.1), json!(0.1));
+        assert_eq!(float_to_json(-2.5), json!(-2.5));
+        assert_eq!(float_to_json(f32::NAN), json!("NaN"));
+        assert_eq!(float_to_json(f32::INFINITY), json!("inf"));
     }
 
     #[test]

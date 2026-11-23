@@ -96,3 +96,16 @@ var entity player;
 float() player_health = {
 	return player.health;
 };
+
+entity(entity e) entity_identity = {
+	return e;
+};
+
+entity(entity e) make_cycle = {
+	e.owner = e;
+	return e;
+};
+
+void() hurt_player = {
+	player.health = player.health - 10;
+};
