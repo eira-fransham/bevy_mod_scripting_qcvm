@@ -826,7 +826,9 @@ fn main() -> anyhow::Result<()> {
 
     let ret = vm.run(&mut host, function.index, params)?;
 
-    let ret = value_to_json(&vm, &host, &ret.scalar()?, &mut Vec::new())
+    let ret = ret.vector().map(Value::Vector).or_else(|_| ret.scalar())?;
+
+    let ret = value_to_json(&vm, &host, &ret, &mut Vec::new())
         .context("Couldn't print the return value")?;
 
     if args.print_globals {

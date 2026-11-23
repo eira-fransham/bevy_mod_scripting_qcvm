@@ -1616,7 +1616,7 @@ impl QcVmContext {
         else {
             return false;
         };
-        let name = builtin_name(&*self.defs, def).into_owned();
+        let name = builtin_name(self.defs, def).into_owned();
         registry
             .read()
             .get_function(self.builtin_namespace, name)
@@ -1925,7 +1925,7 @@ mod tests {
         let config = QcVmConfig::new::<QcWorldspawn>(&EmptyDefs);
         let vm = qcvm::QcVm::load_with_defs(
             std::io::Cursor::new(empty_progs()),
-            &*config.defs,
+            config.defs,
             Default::default(),
         )
         .unwrap();
@@ -2242,7 +2242,7 @@ mod tests {
         let config = QcVmConfig::new::<TestBuiltins>(&EmptyDefs);
         let vm = qcvm::QcVm::load_with_defs(
             std::io::Cursor::new(function_progs()),
-            &*config.defs,
+            config.defs,
             Default::default(),
         )
         .unwrap();
