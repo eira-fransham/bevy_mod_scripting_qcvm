@@ -42,6 +42,7 @@ struct Args {
 
     /// The arguments to pass to the function. Only floats are supported for now.
     #[arg(allow_negative_numbers = true)]
+    #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<f32>,
 }
 

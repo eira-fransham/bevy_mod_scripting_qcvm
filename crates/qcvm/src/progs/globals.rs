@@ -80,10 +80,14 @@ impl GlobalRegistry {
     }
 
     /// The initial values of a range of globals, used to initialize locals.
-    pub fn initial_range(&self, range: std::ops::Range<usize>) -> anyhow::Result<&[VmScalar]> {
-        self.initial.get(range.clone()).ok_or_else(|| {
-            anyhow::format_err!("Globals {}..{} are out of range", range.start, range.end)
-        })
+    ///
+    /// This will return the range clamped to the initial size if there aren't enough
+    /// globals, instead of returning an error.
+    pub fn maximal_initial_range(&self, range: std::ops::Range<usize>) -> &[VmScalar] {
+        let initial_max_idx = self.initial.len().saturating_sub(1);
+        let clamped_range =
+            range.start.clamp(0, initial_max_idx)..range.end.clamp(0, initial_max_idx);
+        &self.initial[clamped_range]
     }
 
     #[inline]

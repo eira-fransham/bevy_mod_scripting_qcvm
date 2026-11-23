@@ -2165,7 +2165,7 @@ where
             );
         }
 
-        let initial_locals = memory.global.initial_range(function.frame_range())?;
+        let initial_locals = memory.global.maximal_initial_range(function.frame_range());
 
         tracing::debug!(target: "qcvm::calls", "Calling QuakeC function {}", function.name.to_string_lossy());
 
